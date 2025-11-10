@@ -1,25 +1,21 @@
 # GPU Experiments
 
-A collection of CUDA micro-experiments and benchmarks for my own research.
+A collection of GPU experiments and benchmarks for my personal understanding and research.
 
 ## Requirements
 
-- ThunderKittens (included as a Git submodule)
+- ThunderKittens
 - CUDA 12.8+
-- Hopper (H100) or Blackwell (B200) GPUs
-- Python 3 with PyTorch and pybind11
+- NVIDIA Hopper (H100) or Blackwell (B200) GPUs
+- Python 3.11+ with PyTorch 2.8+ and pybind11
 
-Build and execution are solely handled by the Makefiles in each subdirectory.
+## How to Run
+
+1. Run `git submodule update --init --recursive`.
+2. In the desired subdirectory, edit the Makefile to target the correct source file, build configuration, and run settings.
+3. Run `make run`.
 
 ## Organization
 
-- `hopper/`: CUDA experiments targeting H100
-- `blackwell/`: CUDA experiments targeting Blackwell
-
-## Topics
-
-- A lot of random micro-experiments 
-- Multi-GPU
-- MXFP8
-- IPC
-- Attention
+- `hopper/`: Experiments targeting H100
+- `blackwell/`: Experiments targeting B200
