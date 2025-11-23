@@ -19,3 +19,7 @@ A collection of GPU experiments and benchmarks for my personal understanding and
 
 - `hopper/`: Experiments targeting H100
 - `blackwell/`: Experiments targeting B200
+
+## Note
+
+I try my best to keep things organized, but please don’t expect perfect structure / accurate comments / fully working code / etc. Sometimes I make incorrect observations, realize the mistake later, and forget to update the code that led to it.
