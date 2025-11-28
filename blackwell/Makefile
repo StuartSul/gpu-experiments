@@ -74,7 +74,8 @@
 # SRC := 081-tma-load-store-irregular.cu
 # SRC := 083-nvfp4-gemm.cu
 # SRC := 084-smem-swizzle-atom.cu
-SRC := 085-smem-swizzle.cu
+# SRC := 085-smem-swizzle.cu
+SRC := 086-clc.cu
 
 # Binaries
 CC := g++
