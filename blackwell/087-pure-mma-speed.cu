@@ -769,7 +769,7 @@ Achieved performance: 1971.34 TFLOPs
 
 using namespace kittens;
 
-constexpr int NUM_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+constexpr int NUM_THREADS = 1;
 
 static constexpr int Mb = 128;
 static constexpr int Nb = 256;
@@ -779,7 +779,7 @@ constexpr int PIPE_DEPTH = 6;
 
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
-constexpr int CLUSTER_SIZE = 4;
+constexpr int CLUSTER_SIZE = 2;
 
 struct matmul_globals {
     using a_tile = st_bf<Mb, Kb>;
@@ -819,7 +819,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
     using d_tt_t = tt<float, Mb, Nb>;
     everyone::tma::cluster::sync();
 
-    if(cta_rank%2 == 0 && threadIdx.x == 0) {
+    if(cta_rank%2 == 0) {
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
         for(int task_iter=cluster_id; task_iter < num_tasks; task_iter+=gridDim.x/CLUSTER_SIZE) {
             int input_ring = 0;
