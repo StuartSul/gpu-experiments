@@ -1,4 +1,19 @@
 /*
+Amazing observations and learnings here:
+- ** (!!) With cluster size = 4, only 132 SMs can be placed in a single wave (!!) **
+    - If we try 148-block persistent pattern, only 132 will be placed, and the remaining 16 will wait until those 132 completely finish!
+    - This explains many many things
+        - 148-block persistent grid is nearly 2x slow when cluster size is 4 instead of 2; Speed goes up until block=132, and slows down from 136
+        - CLC persistent grid does not slow down as much since the active blocks perform work stealing
+            - But 16 SMs are still not utilized. That's 16/148 ~= 11% of SMs. This correlates with 2207 --> 1971 TFLOPs on 16K GEMM, which is exactly 11% slowdown!
+        - Regardless, 16 SMs are always idle with 4-cluster kernels!
+        - Also explains why CLC + 4-cluster slow down on 4K shapes. 512 / 132 and 512 / 148 are both 4 waves! (512 is the number of tasks for 4096x4096x4096 gemm)
+        - Choosing 4-cluster is a trade-off between SM util & memory bandwidth util
+- And some other learnings:
+    - speedup of 2-CTA matmul is purely from reduced HBM/SMEM traffic (as expected)
+    - this also explains why __cluster_dims__ itself causes harm conditionally (no harm in 1-CTA persistent matmul, harm in many-blocks quantization kernels)
+    - Other than that, only like 1% improvement from CLC on larger shapes with multiple waves. But I assume this would change with HBM traffic. So not sure.
+
 Results (ablation is accumulative)
 
 Original gemm
@@ -769,7 +784,7 @@ Achieved performance: 1971.34 TFLOPs
 
 using namespace kittens;
 
-constexpr int NUM_THREADS = 1;
+constexpr int NUM_THREADS = 32;
 
 static constexpr int Mb = 128;
 static constexpr int Nb = 256;
@@ -779,7 +794,7 @@ constexpr int PIPE_DEPTH = 6;
 
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
-constexpr int CLUSTER_SIZE = 2;
+constexpr int CLUSTER_SIZE = 4;
 
 struct matmul_globals {
     using a_tile = st_bf<Mb, Kb>;
@@ -794,7 +809,7 @@ struct matmul_globals {
     d_gl d;
 
     __host__ __inline__ dim3 grid() {
-        return dim3(148);
+        return dim3(132); // Slows down from 136!
     }
 };
 
@@ -811,7 +826,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     using a_tile = matmul_globals::a_tile;
     using b_tile = matmul_globals::b_tile;
-    
+
     a_tile (&a_smem)[PIPE_DEPTH] = al.allocate<a_tile, PIPE_DEPTH>();
     b_tile (&b_smem)[PIPE_DEPTH] = al.allocate<b_tile, PIPE_DEPTH>();
 
@@ -823,10 +838,10 @@ void matmul(const __grid_constant__ matmul_globals g) {
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
         for(int task_iter=cluster_id; task_iter < num_tasks; task_iter+=gridDim.x/CLUSTER_SIZE) {
             int input_ring = 0;
-            mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
+            if (threadIdx.x == 0) mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
             input_ring=ring_advance<PIPE_DEPTH>(input_ring);
             for(int idx = 1; idx < iters_per_task; idx++) {
-                mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
+                if (threadIdx.x == 0) mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
                 input_ring=ring_advance<PIPE_DEPTH>(input_ring);
             }
         }
@@ -837,7 +852,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
 #include <iostream>
 #include <random>
 
-constexpr int NCU = true;
+constexpr int NCU = false;
 
 void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K) {
     using globals  = matmul_globals;
@@ -886,6 +901,12 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     // Set kernel attributes
     cudaFuncSetAttribute(matmul, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SHARED_MEMORY);
+
+    // This does not save you!
+    // cudaFuncSetAttribute(matmul, cudaFuncAttributeClusterSchedulingPolicyPreference, cudaClusterSchedulingPolicySpread);
+
+    // This does not save you either!
+    // cudaFuncSetAttribute(matmul, cudaFuncAttributeNonPortableClusterSizeAllowed, 1); // enable 16-cluster
 
     // Warmup
     for(int i = 0; i < (NCU ? 0 : 500); i++)
