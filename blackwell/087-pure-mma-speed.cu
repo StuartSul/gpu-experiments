@@ -779,6 +779,8 @@ constexpr int PIPE_DEPTH = 6;
 
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
+constexpr int CLUSTER_SIZE = 4;
+
 struct matmul_globals {
     using a_tile = st_bf<Mb, Kb>;
     using b_tile = st_bf<Nb/2, Kb>;
@@ -792,16 +794,20 @@ struct matmul_globals {
     d_gl d;
 
     __host__ __inline__ dim3 grid() {
-        constexpr int CLUSTER_M = Mb, CLUSTER_N = Nb;
-        return dim3(d.rows() / CLUSTER_M * d.cols() / CLUSTER_N);
+        return dim3(148);
     }
 };
 
-__global__ __cluster_dims__(4, 1, 1) __launch_bounds__(NUM_THREADS, 1)
+__global__ __cluster_dims__(CLUSTER_SIZE, 1, 1) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals g) {
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
+    constexpr int CLUSTER_M = CLUSTER_SIZE*Mb, CLUSTER_N = Nb;
+    const int num_tasks = g.d.rows() / CLUSTER_M * g.d.cols() / CLUSTER_N;
     const int iters_per_task = g.a.cols() / Kb;
+
+    const int cluster_id = clusterIdx().x;
+    const int cta_rank = cluster_ctarank();
 
     using a_tile = matmul_globals::a_tile;
     using b_tile = matmul_globals::b_tile;
@@ -811,48 +817,18 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     tensor_allocator<1, 2> tm_alloc{};
     using d_tt_t = tt<float, Mb, Nb>;
-
-    __shared__ int should_continue[2];
-    __shared__ clc::handle clc_handle;
-    __shared__ semaphore clc_arrived, job_arrived[2], job_finished[2];
-    if (threadIdx.x == 0) { 
-        init_semaphore(clc_arrived, 0, 1);
-        #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            init_semaphore(job_arrived[i], 0, 1);
-            init_semaphore(job_finished[i], 0, 1);
-        }
-    }
     everyone::tma::cluster::sync();
 
-    if(threadIdx.x == 0) {
+    if(cta_rank%2 == 0 && threadIdx.x == 0) {
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
-        for(int task_iter=0; true; task_iter++) {
-            wait(job_arrived[task_iter%2], (task_iter/2)%2);
-            if (!should_continue[task_iter%2]) break;
+        for(int task_iter=cluster_id; task_iter < num_tasks; task_iter+=gridDim.x/CLUSTER_SIZE) {
             int input_ring = 0;
-            if (blockIdx.x%2==0) mm2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
+            mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
             input_ring=ring_advance<PIPE_DEPTH>(input_ring);
             for(int idx = 1; idx < iters_per_task; idx++) {
-                if (blockIdx.x%2==0) mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
+                mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring]);
                 input_ring=ring_advance<PIPE_DEPTH>(input_ring);
             }
-            arrive(job_finished[task_iter%2]);
-        }
-    } else if (threadIdx.x == 32) {
-        should_continue[0] = 1;
-        arrive(job_arrived[0]);
-        for(int task_iter = 1; true; task_iter++) {
-            if (blockIdx.x%4 == 0)
-                clc::schedule(clc_handle, clc_arrived);
-            tma::cluster::expect_bytes(clc_arrived, sizeof(clc_handle));
-            tma::cluster::wait(clc_arrived, (task_iter-1)%2);
-            clc::result clc_result;
-            clc::query(clc_result, clc_handle);
-            wait(job_finished[task_iter%2], ((2+task_iter)/2)%2);
-            should_continue[task_iter%2] = clc_result.success;
-            arrive(job_arrived[task_iter%2]);
-            if (!clc_result.success) break;
         }
     }
 }
@@ -860,6 +836,8 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
 #include <iostream>
 #include <random>
+
+constexpr int NCU = true;
 
 void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K) {
     using globals  = matmul_globals;
@@ -873,6 +851,7 @@ void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K) {
 int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
     std::cout << "Block size: " << Mb*2 << "x" << Nb << "x" << Kb << "\n";
+    std::cout << "Num tasks: " << (M/Mb*N/Nb) << "\n";
 
     // Allocate host memory
     float *h_A = new float[M * K];
@@ -909,7 +888,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     cudaFuncSetAttribute(matmul, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SHARED_MEMORY);
 
     // Warmup
-    for(int i = 0; i < 500; i++)
+    for(int i = 0; i < (NCU ? 0 : 500); i++)
         inner_run(d_A, d_B, d_C, M, N, K);
 
     // Benchmark
@@ -918,7 +897,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     CUDACHECK(cudaEventCreate(&stop));
     CUDACHECK(cudaDeviceSynchronize());
     CUDACHECK(cudaEventRecord(start));
-    constexpr int ITERS = 100;
+    constexpr int ITERS = (NCU ? 1 : 100);
     for(int i = 0; i < ITERS; i++)
         inner_run(d_A, d_B, d_C, M, N, K);
     CUDACHECK(cudaEventRecord(stop));
@@ -949,15 +928,20 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
 int main() {
     int N;
-    N = 1024;
-    run_benchmark(N, N, N);
-    N = 2048;
-    run_benchmark(N, N, N);
-    N = 4096;
-    run_benchmark(N, N, N);
-    N = 8192;
-    run_benchmark(N, N, N);
-    N = 16384;
-    run_benchmark(N, N, N);
+    if (NCU) {
+        N = 4096;
+        run_benchmark(N, N, N);
+    } else {
+        N = 1024;
+        run_benchmark(N, N, N);
+        N = 2048;
+        run_benchmark(N, N, N);
+        N = 4096;
+        run_benchmark(N, N, N);
+        N = 8192;
+        run_benchmark(N, N, N);
+        N = 16384;
+        run_benchmark(N, N, N);
+    }
     return 0;
 }
