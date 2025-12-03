@@ -148,79 +148,73 @@ Allocated device memory
 Copied matrices to device
 Avg Kernel execution time: 40.2656 us
 Achieved performance: 3413.31 TFLOPs
+
+Changed to pure TMA load kernel. Single kernel, 2-cluster, no multicasting, 256x64 per iter, 132-block
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 6.22688 us
+Achieved performance: 5388.64 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 77.4778 us
+Achieved performance: 6929.36 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 295.599 us
+Achieved performance: 7264.85 GB/s
+
+Now, ^ + multicast
+
 */
 
 #include "kittens.cuh"
 
 using namespace kittens;
 
-constexpr int NUM_CONSUMERS = 0;
-constexpr int NUM_PRODUCERS = 1;
-constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;
-constexpr int NUM_THREADS = NUM_WORKERS * WARP_THREADS;
+constexpr int NUM_THREADS = WARPGROUP_WARPS * WARP_THREADS;
 
 static constexpr int Mb = 128;
-static constexpr int Nb = 256;
-static constexpr int Kb = 64;
+static constexpr int Nb = 64;
 
-constexpr int PIPE_DEPTH = 4;
+constexpr int PIPE_DEPTH = 6;
 
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
-constexpr int CLUSTER_SIZE = 4;
+constexpr int CLUSTER_SIZE = 2;
 
 struct matmul_globals {
-    using a_tile = st_bf<Mb, Kb>;
-    using b_tile = st_bf<Nb/2, Kb>;
-
+    using a_tile = st_bf<Mb, Nb>;
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
-    using b_gl = gl<bf16, 1, 1, -1, -1, b_tile>;
-    using d_gl = gl<bf16, 1, 1, -1, -1>;
-
     a_gl a;
-    b_gl b;
-    d_gl d;
 
     __host__ __inline__ dim3 grid() {
         return dim3(132);
     }
 };
 
-template<int SUPER_M> __device__ static inline int2 get_task_idx(const matmul_globals &g, int task_iter) {
-    constexpr int CLUSTER_M = 4*Mb, CLUSTER_N = 2*Nb;
-    int cluster_x = clusterIdx().x;
-    int task_id = task_iter * (gridDim.x/CLUSTER_SIZE) + cluster_x;
-    int Rblocks = g.d.rows() / CLUSTER_M, Cblocks = g.d.cols() / CLUSTER_N;
-    int super_rows = (Rblocks/SUPER_M)*SUPER_M,
-        final_rows = Rblocks - super_rows,
-        super_repeat = SUPER_M*Cblocks;
-    if (task_id < super_rows * Cblocks) {
-        return { (SUPER_M*(task_id/super_repeat) + task_id%SUPER_M), (task_id%super_repeat)/SUPER_M };
-    }
-    else if (task_id < Rblocks*Cblocks) {
-        int remainder_id = task_id - super_rows*Cblocks;
-        return { (super_rows + remainder_id%final_rows), remainder_id/final_rows };
-    }
-    else {
-        return { -1, -1 };
-    }
-}
-
-template<int SUPER_M>
 __global__ __cluster_dims__(CLUSTER_SIZE, 1, 1) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals g) {
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
     const int cta_rank = cluster_ctarank();
-    const int iters_per_task = g.a.cols() / Kb;
+    const int Rblocks = g.a.rows() / (2*Mb);
+    const int Cblocks = g.a.cols() / Nb;
+    const int num_tasks = Rblocks * Cblocks;
 
     using a_tile = matmul_globals::a_tile;
-    using b_tile = matmul_globals::b_tile;
-    
-    static_assert(sizeof(a_tile) * PIPE_DEPTH * 2 +
-                  sizeof(b_tile) * PIPE_DEPTH <= DYNAMIC_SHARED_MEMORY);
     a_tile (&a_smem)[PIPE_DEPTH][2] = al.allocate<a_tile, PIPE_DEPTH, 2>();
-    b_tile (&b_smem)[PIPE_DEPTH]    = al.allocate<b_tile, PIPE_DEPTH>();
 
     __shared__ semaphore inputs_arrived[PIPE_DEPTH];
     __shared__ semaphore inputs_finished[PIPE_DEPTH];
@@ -236,37 +230,30 @@ void matmul(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::sync();
 
     if(warp::laneid() == 0 && warpgroup::warpid() == 3) {
-        const int a_idx = (cta_rank&0b10)>>1;
-        const uint16_t a_mask = 0b101<<(cta_rank&1);
-        // const uint16_t a_mask = 1<<cta_rank;
-        const uint16_t b_mask = 1<<cta_rank;
+        // const int a_idx = (cta_rank&0b10)>>1;
+        // const uint16_t a_mask = 0b101<<(cta_rank&1);
+        const uint16_t a_mask = 1<<cta_rank;
         const int semaphore_cta = cta_rank&(~1);
-        int input_ring = 0; // tracking which input block is being loaded
-        for(int task_iter = 0; true; task_iter++) {
-            int2 rowcol = get_task_idx<SUPER_M>(g, task_iter);
-            if(rowcol.x == -1) break;
-            for (int idx = 0; idx < iters_per_task; idx++) {
-                tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
-                update_phasebit<1>(bitfield, input_ring);
-                tma::cluster::load_async(a_smem[input_ring][a_idx], g.a, {rowcol.x*4+(cta_rank&1)*2+a_idx, idx}, inputs_arrived[input_ring], a_mask, semaphore_cta);
-                tma::cluster::load_async(b_smem[input_ring],        g.b, {rowcol.y*4+cta_rank,             idx}, inputs_arrived[input_ring], b_mask, semaphore_cta);
-                input_ring=ring_advance<PIPE_DEPTH>(input_ring);
-            }
+        int input_ring = 0;
+        for (int idx = blockIdx.x; idx < num_tasks; idx+=gridDim.x) {
+            const int r = idx / Cblocks;
+            const int c = idx % Cblocks;
+            tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
+            update_phasebit<1>(bitfield, input_ring);
+            tma::cluster::load_async(a_smem[input_ring][0], g.a, {r*2+0, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            tma::cluster::load_async(a_smem[input_ring][1], g.a, {r*2+1, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            input_ring=ring_advance<PIPE_DEPTH>(input_ring);
         }
     }
-    else if(cta_rank%2 == 0 && warp::laneid() == 0 && warpgroup::warpid() == 0) { // launch the MMA's
+    else if(cta_rank%2 == 0 && warp::laneid() == 0 && warpgroup::warpid() == 0) {
         constexpr uint16_t cta_mask = (1<<CLUSTER_SIZE) - 1;
         int input_ring = 0; // tracking which input block is being loaded
-        for(int task_iter = 0; true; task_iter++) {
-            int2 rowcol = get_task_idx<SUPER_M>(g, task_iter);
-            if(rowcol.x == -1) break;
-            for(int idx = 0; idx < iters_per_task; idx++) {
-                tma::cluster::expect_bytes(inputs_arrived[input_ring], 4*sizeof(a_tile) + 2*sizeof(b_tile));
-                tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
-                update_phasebit<0>(bitfield, input_ring);
-                detail::tcgen05::commit<2>(inputs_finished[input_ring], cta_mask);
-                input_ring=ring_advance<PIPE_DEPTH>(input_ring);
-            }
+        for (int idx = blockIdx.x; idx < num_tasks; idx+=gridDim.x) {
+            tma::cluster::expect_bytes(inputs_arrived[input_ring], 4*sizeof(a_tile));
+            tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
+            update_phasebit<0>(bitfield, input_ring);
+            detail::tcgen05::commit<2>(inputs_finished[input_ring], cta_mask);
+            input_ring=ring_advance<PIPE_DEPTH>(input_ring);
         }
     }
     everyone::tma::cluster::sync();
@@ -276,27 +263,19 @@ void matmul(const __grid_constant__ matmul_globals g) {
 #include <iostream>
 #include <random>
 
-constexpr int NCU = false;
-
-template<int SUPER_M>
-void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K) {
+void inner_run(bf16 *d_A, size_t M, size_t N) {
     using globals  = matmul_globals;
-    typename globals::a_gl Ag{d_A, nullptr, nullptr, M, K};
-    typename globals::b_gl Bg{d_B, nullptr, nullptr, N, K};
-    typename globals::d_gl Dg{d_C, nullptr, nullptr, M, N};
-    globals G{Ag, Bg, Dg};
-    matmul<SUPER_M><<<G.grid(), NUM_THREADS, DYNAMIC_SHARED_MEMORY>>>(G);
+    typename globals::a_gl Ag{d_A, nullptr, nullptr, M, N};
+    globals G{Ag};
+    matmul<<<G.grid(), NUM_THREADS, DYNAMIC_SHARED_MEMORY>>>(G);
 }
 
-template<int SUPER_M=8>
-int run_benchmark(size_t M, size_t N, size_t K) {
-    std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << " SUPER_M=" << SUPER_M << "  --------------------\n";
-    std::cout << "Block size: " << Mb*2 << "x" << Nb << "x" << Kb << "\n";
-    std::cout << "Num tasks: " << (M/Mb*N/Nb) << "\n";
+int run_benchmark(size_t M, size_t N) {
+    std::cout << "--------------------  M=" << M << " N=" << N << "  --------------------\n";
+    std::cout << "Block stasksize: " << Mb << "x" << Nb << "\n";
 
     // Allocate host memory
-    float *h_A = new float[M * K];
-    float *h_B = new float[K * N];
+    float *h_A = new float[M * N];
     std::cout << "Allocated host memory" << std::endl;
 
     // Initialize random number generator
@@ -305,32 +284,26 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::uniform_real_distribution<> dis(-0.5, 0.5);
 
     // Initialize matrices with random values
-    for (int i = 0; i < M * K; ++i) h_A[i] = dis(gen);
-    for (int i = 0; i < K * N; ++i) h_B[i] = dis(gen);
+    for (int i = 0; i < M * N; ++i) h_A[i] = dis(gen);
     std::cout << "Initialized matrices" << std::endl;
 
     // Allocate device memory
-    __nv_bfloat16 *d_A, *d_B, *d_C;
-    CUDACHECK(cudaMalloc(&d_A, M*K*sizeof(__nv_bfloat16)));
-    CUDACHECK(cudaMalloc(&d_B, K*N*sizeof(__nv_bfloat16)));
-    CUDACHECK(cudaMalloc(&d_C, M*N*sizeof(__nv_bfloat16)));
+    __nv_bfloat16 *d_A;
+    CUDACHECK(cudaMalloc(&d_A, M*N*sizeof(__nv_bfloat16)));
     std::cout << "Allocated device memory" << std::endl;
 
     // Convert to __nv_bfloat16 and copy to device. Otherwise GPU does not truly perform a matmul
-    __nv_bfloat16 *h_A_bf16 = new __nv_bfloat16[M * K];
-    __nv_bfloat16 *h_B_bf16 = new __nv_bfloat16[K * N];
-    for (int i = 0; i < M * K; ++i) h_A_bf16[i] = __float2bfloat16(h_A[i]);
-    for (int i = 0; i < K * N; ++i) h_B_bf16[i] = __float2bfloat16(h_B[i]);
-    CUDACHECK(cudaMemcpy(d_A, h_A_bf16, M*K*2, cudaMemcpyHostToDevice));
-    CUDACHECK(cudaMemcpy(d_B, h_B_bf16, K*N*2, cudaMemcpyHostToDevice));
+    __nv_bfloat16 *h_A_bf16 = new __nv_bfloat16[M * N];
+    for (int i = 0; i < M * N; ++i) h_A_bf16[i] = __float2bfloat16(h_A[i]);
+    CUDACHECK(cudaMemcpy(d_A, h_A_bf16, M*N*2, cudaMemcpyHostToDevice));
     std::cout << "Copied matrices to device" << std::endl;
 
     // Set kernel attributes
-    cudaFuncSetAttribute(matmul<SUPER_M>, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SHARED_MEMORY);
+    cudaFuncSetAttribute(matmul, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SHARED_MEMORY);
 
     // Warmup
-    for(int i = 0; i < (NCU ? 0 : 500); i++)
-        inner_run<SUPER_M>(d_A, d_B, d_C, M, N, K);
+    for(int i = 0; i < 500; i++)
+        inner_run(d_A, M, N);
 
     // Benchmark
     cudaEvent_t start, stop;
@@ -338,29 +311,24 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     CUDACHECK(cudaEventCreate(&stop));
     CUDACHECK(cudaDeviceSynchronize());
     CUDACHECK(cudaEventRecord(start));
-    constexpr int ITERS = (NCU ? 1 : 100);
+    constexpr int ITERS = 100;
     for(int i = 0; i < ITERS; i++)
-        inner_run<SUPER_M>(d_A, d_B, d_C, M, N, K);
+        inner_run(d_A, M, N);
     CUDACHECK(cudaEventRecord(stop));
     CUDACHECK(cudaEventSynchronize(stop));
 
-    // Calculate duration and TFLOPs
+    // Calculate duration and gbps
     float milliseconds;
     cudaEventElapsedTime(&milliseconds, start, stop);
     double useconds = milliseconds * 1000.0 / ITERS;
-    double flops = double(2.0) * M * N * K; // 2 FLOPs per multiply-add
-    double tflops = (flops / useconds) / 1e6;
+    double gbps = (double(2.0) * M * N / useconds) / 1e3;
     std::cout << "Avg Kernel execution time: " << useconds << " us\n";
-    std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
+    std::cout << "Achieved performance: " << gbps << " GB/s\n";
 
     // Clean up
     delete[] h_A;
-    delete[] h_B;
     delete[] h_A_bf16;
-    delete[] h_B_bf16;
     cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
@@ -369,20 +337,17 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
 int main() {
     int N;
-    if (NCU) {
-        N = 4096;
-        run_benchmark(N, N, N);
-    } else {
-        // N = 1024;
-        // run_benchmark(N, N, N);
-        // N = 2048;
-        // run_benchmark(N, N, N);
-        N = 4096;
-        run_benchmark<2>(N, N, N);
-        // N = 8192;
-        // run_benchmark(N, N, N);
-        // N = 16384;
-        // run_benchmark(N, N, N);
-    }
+    // N = 1024;
+    // run_benchmark(N, N);
+    // N = 2048;
+    // run_benchmark(N, N);
+    N = 4096;
+    run_benchmark(N, N);
+    // N = 8192;
+    // run_benchmark(N, N);
+    N = 16384;
+    run_benchmark(N, N);
+    N = 32768;
+    run_benchmark(N, N);
     return 0;
 }
