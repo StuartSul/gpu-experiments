@@ -126,6 +126,28 @@ Allocated device memory
 Copied matrices to device
 Avg Kernel execution time: 57.064 us
 Achieved performance: 2408.51 TFLOPs
+
+Back to 256x256x64 per block, but with cluster size = 4. Ablated to find the best SUPER_M
+--------------------  M=4096 N=4096 K=4096 SUPER_M=2  --------------------
+Block size: 256x256x64
+Num tasks: 512
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 37.0432 us
+Achieved performance: 3710.23 TFLOPs
+
+^ but using TMA multicast
+--------------------  M=4096 N=4096 K=4096 SUPER_M=2  --------------------
+Block size: 256x256x64
+Num tasks: 512
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 40.2656 us
+Achieved performance: 3413.31 TFLOPs
 */
 
 #include "kittens.cuh"
@@ -165,7 +187,7 @@ struct matmul_globals {
 };
 
 template<int SUPER_M> __device__ static inline int2 get_task_idx(const matmul_globals &g, int task_iter) {
-    constexpr int CLUSTER_M = 2*Mb, CLUSTER_N = 2*Nb;
+    constexpr int CLUSTER_M = 4*Mb, CLUSTER_N = 2*Nb;
     int cluster_x = clusterIdx().x;
     int task_id = task_iter * (gridDim.x/CLUSTER_SIZE) + cluster_x;
     int Rblocks = g.d.rows() / CLUSTER_M, Cblocks = g.d.cols() / CLUSTER_N;
@@ -195,10 +217,10 @@ void matmul(const __grid_constant__ matmul_globals g) {
     using a_tile = matmul_globals::a_tile;
     using b_tile = matmul_globals::b_tile;
     
-    static_assert(sizeof(a_tile) * PIPE_DEPTH +
+    static_assert(sizeof(a_tile) * PIPE_DEPTH * 2 +
                   sizeof(b_tile) * PIPE_DEPTH <= DYNAMIC_SHARED_MEMORY);
-    a_tile (&a_smem)[PIPE_DEPTH] = al.allocate<a_tile, PIPE_DEPTH>();
-    b_tile (&b_smem)[PIPE_DEPTH] = al.allocate<b_tile, PIPE_DEPTH>();
+    a_tile (&a_smem)[PIPE_DEPTH][2] = al.allocate<a_tile, PIPE_DEPTH, 2>();
+    b_tile (&b_smem)[PIPE_DEPTH]    = al.allocate<b_tile, PIPE_DEPTH>();
 
     __shared__ semaphore inputs_arrived[PIPE_DEPTH];
     __shared__ semaphore inputs_finished[PIPE_DEPTH];
@@ -214,7 +236,9 @@ void matmul(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::sync();
 
     if(warp::laneid() == 0 && warpgroup::warpid() == 3) {
+        const int a_idx = (cta_rank&0b10)>>1;
         const uint16_t a_mask = 0b101<<(cta_rank&1);
+        // const uint16_t a_mask = 1<<cta_rank;
         const uint16_t b_mask = 1<<cta_rank;
         const int semaphore_cta = cta_rank&(~1);
         int input_ring = 0; // tracking which input block is being loaded
@@ -224,9 +248,8 @@ void matmul(const __grid_constant__ matmul_globals g) {
             for (int idx = 0; idx < iters_per_task; idx++) {
                 tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
                 update_phasebit<1>(bitfield, input_ring);
-                if (((cta_rank&0b10)>>1))
-                    tma::cluster::load_async(a_smem[input_ring], g.a, {rowcol.x*2+(cta_rank&1), idx}, inputs_arrived[input_ring], a_mask, semaphore_cta);
-                tma::cluster::load_async(b_smem[input_ring], g.b, {rowcol.y*4+cta_rank,     idx}, inputs_arrived[input_ring], b_mask, semaphore_cta);
+                tma::cluster::load_async(a_smem[input_ring][a_idx], g.a, {rowcol.x*4+(cta_rank&1)*2+a_idx, idx}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+                tma::cluster::load_async(b_smem[input_ring],        g.b, {rowcol.y*4+cta_rank,             idx}, inputs_arrived[input_ring], b_mask, semaphore_cta);
                 input_ring=ring_advance<PIPE_DEPTH>(input_ring);
             }
         }
@@ -238,7 +261,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
             int2 rowcol = get_task_idx<SUPER_M>(g, task_iter);
             if(rowcol.x == -1) break;
             for(int idx = 0; idx < iters_per_task; idx++) {
-                tma::cluster::expect_bytes(inputs_arrived[input_ring], 2*sizeof(a_tile)+2*sizeof(b_tile));
+                tma::cluster::expect_bytes(inputs_arrived[input_ring], 4*sizeof(a_tile) + 2*sizeof(b_tile));
                 tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
                 update_phasebit<0>(bitfield, input_ring);
                 detail::tcgen05::commit<2>(inputs_finished[input_ring], cta_mask);
@@ -355,7 +378,7 @@ int main() {
         // N = 2048;
         // run_benchmark(N, N, N);
         N = 4096;
-        run_benchmark<4>(N, N, N);
+        run_benchmark<2>(N, N, N);
         // N = 8192;
         // run_benchmark(N, N, N);
         // N = 16384;
