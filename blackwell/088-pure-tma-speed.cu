@@ -150,33 +150,58 @@ Avg Kernel execution time: 40.2656 us
 Achieved performance: 3413.31 TFLOPs
 
 Changed to pure TMA load kernel. Single kernel, 2-cluster, no multicasting, 256x64 per iter, 132-block
+Every CTA-pair loads the same thing (intentionally redundant)
 --------------------  M=4096 N=4096  --------------------
 Block stasksize: 128x64
 Allocated host memory
 Initialized matrices
 Allocated device memory
 Copied matrices to device
-Avg Kernel execution time: 6.22688 us
-Achieved performance: 5388.64 GB/s
+Avg Kernel execution time: 8.25216 us
+Achieved performance: 4066.14 GB/s
 --------------------  M=16384 N=16384  --------------------
 Block stasksize: 128x64
 Allocated host memory
 Initialized matrices
 Allocated device memory
 Copied matrices to device
-Avg Kernel execution time: 77.4778 us
-Achieved performance: 6929.36 GB/s
+Avg Kernel execution time: 78.7738 us
+Achieved performance: 6815.35 GB/s
 --------------------  M=32768 N=32768  --------------------
 Block stasksize: 128x64
 Allocated host memory
 Initialized matrices
 Allocated device memory
 Copied matrices to device
-Avg Kernel execution time: 295.599 us
-Achieved performance: 7264.85 GB/s
+Avg Kernel execution time: 306.4 us
+Achieved performance: 7008.77 GB/s
 
-Now, ^ + multicast
-
+Now, ^ + multicast to remove redundancy
+Learning: barely any difference in utilizing multicast. L2 is fast enough. 
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 8.23232 us
+Achieved performance: 4075.94 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 78.7181 us
+Achieved performance: 6820.17 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 128x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 305.519 us
+Achieved performance: 7028.96 GB/s
 */
 
 #include "kittens.cuh"
@@ -230,25 +255,24 @@ void matmul(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::sync();
 
     if(warp::laneid() == 0 && warpgroup::warpid() == 3) {
-        // const int a_idx = (cta_rank&0b10)>>1;
-        // const uint16_t a_mask = 0b101<<(cta_rank&1);
-        const uint16_t a_mask = 1<<cta_rank;
+        const int a_idx = cta_rank;
+        const uint16_t a_mask = 0b11;
+        // const uint16_t a_mask = 1<<cta_rank;
         const int semaphore_cta = cta_rank&(~1);
         int input_ring = 0;
-        for (int idx = blockIdx.x; idx < num_tasks; idx+=gridDim.x) {
+        for (int idx = blockIdx.x/2; idx < num_tasks; idx+=gridDim.x/2) {
             const int r = idx / Cblocks;
             const int c = idx % Cblocks;
             tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
             update_phasebit<1>(bitfield, input_ring);
-            tma::cluster::load_async(a_smem[input_ring][0], g.a, {r*2+0, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
-            tma::cluster::load_async(a_smem[input_ring][1], g.a, {r*2+1, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            tma::cluster::load_async(a_smem[input_ring][a_idx], g.a, {r*2+a_idx, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
             input_ring=ring_advance<PIPE_DEPTH>(input_ring);
         }
     }
     else if(cta_rank%2 == 0 && warp::laneid() == 0 && warpgroup::warpid() == 0) {
         constexpr uint16_t cta_mask = (1<<CLUSTER_SIZE) - 1;
         int input_ring = 0; // tracking which input block is being loaded
-        for (int idx = blockIdx.x; idx < num_tasks; idx+=gridDim.x) {
+        for (int idx = blockIdx.x/2; idx < num_tasks; idx+=gridDim.x/2) {
             tma::cluster::expect_bytes(inputs_arrived[input_ring], 4*sizeof(a_tile));
             tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
             update_phasebit<0>(bitfield, input_ring);
