@@ -1,6 +1,8 @@
 /*
 Learnings:
     - Must always ablate and find the best SUPER_M (gives extra 4~5% perf boost)
+    - Higher swizzle size = higher throughput
+    - TMA multicast benefits only if splitting (by K) & loading together
 
 Just loader + 2 consumers
 --------------------  M=4096 N=4096 K=4096  --------------------
@@ -114,7 +116,16 @@ Avg Kernel execution time: 57.4179 us
 Achieved performance: 2393.66 TFLOPs
 
 Using swizzle bytes = 128 + only one of the two CTAs load A tile & multicasts to one other CTA + using 132 SMs + 4-Cluster
-
+Learning: no benefit in alternating the load. Major benefit in loading together.
+--------------------  M=4096 N=4096 K=4096 SUPER_M=4  --------------------
+Block size: 256x256x64
+Num tasks: 512
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 57.064 us
+Achieved performance: 2408.51 TFLOPs
 */
 
 #include "kittens.cuh"
@@ -213,7 +224,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
             for (int idx = 0; idx < iters_per_task; idx++) {
                 tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
                 update_phasebit<1>(bitfield, input_ring);
-                if (idx%2 == ((cta_rank&0b10)>>1)) 
+                if (((cta_rank&0b10)>>1))
                     tma::cluster::load_async(a_smem[input_ring], g.a, {rowcol.x*2+(cta_rank&1), idx}, inputs_arrived[input_ring], a_mask, semaphore_cta);
                 tma::cluster::load_async(b_smem[input_ring], g.b, {rowcol.y*4+cta_rank,     idx}, inputs_arrived[input_ring], b_mask, semaphore_cta);
                 input_ring=ring_advance<PIPE_DEPTH>(input_ring);
