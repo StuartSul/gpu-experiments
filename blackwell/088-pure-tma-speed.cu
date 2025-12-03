@@ -176,7 +176,7 @@ Copied matrices to device
 Avg Kernel execution time: 306.4 us
 Achieved performance: 7008.77 GB/s
 
-Now, ^ + multicast to remove redundancy
+Now, ^ + multicast to remove redundancy (x2)
 Learning: barely any difference in utilizing multicast. L2 is fast enough. 
 --------------------  M=4096 N=4096  --------------------
 Block stasksize: 128x64
@@ -202,6 +202,138 @@ Allocated device memory
 Copied matrices to device
 Avg Kernel execution time: 305.519 us
 Achieved performance: 7028.96 GB/s
+
+Back to plain, 4-cluster, 4-redundancy
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 12.3459 us
+Achieved performance: 2717.86 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 147.139 us
+Achieved performance: 3648.73 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 572.639 us
+Achieved performance: 3750.15 GB/s
+
+^ + multicast
+Learning: maybe multicast helps from 4x
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 10.3046 us
+Achieved performance: 3256.24 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 110.603 us
+Achieved performance: 4854.06 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 64x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 427.966 us
+Achieved performance: 5017.88 GB/s
+
+Now dividing by columns, no multicast
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 20.5389 us
+Achieved performance: 1633.7 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 272.565 us
+Achieved performance: 1969.7 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 1077.89 us
+Achieved performance: 1992.31 GB/s
+
+^+multicast
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 12.8182 us
+Achieved performance: 2617.71 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 163.346 us
+Achieved performance: 3286.72 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 637.996 us
+Achieved performance: 3365.98 GB/s
+
+^ same amount of data, but just loading the entire smem
+Learning: This tells me again that multicast < just loading on its own, unless multicast need naturally arises without having to artifically divide an axis
+--------------------  M=4096 N=4096  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 10.3104 us
+Achieved performance: 3254.43 GB/s
+--------------------  M=16384 N=16384  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 112.545 us
+Achieved performance: 4770.27 GB/s
+--------------------  M=32768 N=32768  --------------------
+Block stasksize: 256x64
+Allocated host memory
+Initialized matrices
+Allocated device memory
+Copied matrices to device
+Avg Kernel execution time: 441.536 us
+Achieved performance: 4863.67 GB/s
 */
 
 #include "kittens.cuh"
@@ -210,14 +342,14 @@ using namespace kittens;
 
 constexpr int NUM_THREADS = WARPGROUP_WARPS * WARP_THREADS;
 
-static constexpr int Mb = 128;
+constexpr int CLUSTER_SIZE = 4;
+
+static constexpr int Mb = 256;
 static constexpr int Nb = 64;
 
 constexpr int PIPE_DEPTH = 6;
 
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
-
-constexpr int CLUSTER_SIZE = 2;
 
 struct matmul_globals {
     using a_tile = st_bf<Mb, Nb>;
@@ -233,13 +365,13 @@ __global__ __cluster_dims__(CLUSTER_SIZE, 1, 1) __launch_bounds__(NUM_THREADS, 1
 void matmul(const __grid_constant__ matmul_globals g) {
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
-    const int cta_rank = cluster_ctarank();
-    const int Rblocks = g.a.rows() / (2*Mb);
+    const int cta_rank = blockIdx.x%CLUSTER_SIZE;
+    const int Rblocks = g.a.rows() / Mb;
     const int Cblocks = g.a.cols() / Nb;
     const int num_tasks = Rblocks * Cblocks;
 
     using a_tile = matmul_globals::a_tile;
-    a_tile (&a_smem)[PIPE_DEPTH][2] = al.allocate<a_tile, PIPE_DEPTH, 2>();
+    a_tile (&a_smem)[PIPE_DEPTH] = al.allocate<a_tile, PIPE_DEPTH>();
 
     __shared__ semaphore inputs_arrived[PIPE_DEPTH];
     __shared__ semaphore inputs_finished[PIPE_DEPTH];
@@ -256,24 +388,28 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     if(warp::laneid() == 0 && warpgroup::warpid() == 3) {
         const int a_idx = cta_rank;
-        const uint16_t a_mask = 0b11;
-        // const uint16_t a_mask = 1<<cta_rank;
+        // const uint16_t a_mask = (1<<CLUSTER_SIZE)-1;
+        const uint16_t a_mask = 1<<cta_rank;
         const int semaphore_cta = cta_rank&(~1);
         int input_ring = 0;
-        for (int idx = blockIdx.x/2; idx < num_tasks; idx+=gridDim.x/2) {
+        for (int idx = blockIdx.x/CLUSTER_SIZE; idx < num_tasks; idx+=gridDim.x/CLUSTER_SIZE) {
             const int r = idx / Cblocks;
             const int c = idx % Cblocks;
             tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
             update_phasebit<1>(bitfield, input_ring);
-            tma::cluster::load_async(a_smem[input_ring][a_idx], g.a, {r*2+a_idx, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            tma::cluster::load_async(a_smem[input_ring], g.a, {r, c}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            // #pragma unroll
+            // for (int ii = 0; ii < CLUSTER_SIZE; ii++)
+            //     tma::cluster::load_async(a_smem[input_ring][ii], g.a, {r, c*CLUSTER_SIZE+ii}, inputs_arrived[input_ring], a_mask, semaphore_cta);
+            // tma::cluster::load_async(a_smem[input_ring][cta_rank], g.a, {r, c*CLUSTER_SIZE+cta_rank}, inputs_arrived[input_ring], a_mask, semaphore_cta);
             input_ring=ring_advance<PIPE_DEPTH>(input_ring);
         }
     }
     else if(cta_rank%2 == 0 && warp::laneid() == 0 && warpgroup::warpid() == 0) {
         constexpr uint16_t cta_mask = (1<<CLUSTER_SIZE) - 1;
         int input_ring = 0; // tracking which input block is being loaded
-        for (int idx = blockIdx.x/2; idx < num_tasks; idx+=gridDim.x/2) {
-            tma::cluster::expect_bytes(inputs_arrived[input_ring], 4*sizeof(a_tile));
+        for (int idx = blockIdx.x/CLUSTER_SIZE; idx < num_tasks; idx+=gridDim.x/CLUSTER_SIZE) {
+            tma::cluster::expect_bytes(inputs_arrived[input_ring], 2*sizeof(a_tile));
             tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
             update_phasebit<0>(bitfield, input_ring);
             detail::tcgen05::commit<2>(inputs_finished[input_ring], cta_mask);
