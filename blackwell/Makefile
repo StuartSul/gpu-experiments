@@ -76,7 +76,8 @@
 # SRC := 084-smem-swizzle-atom.cu
 # SRC := 085-smem-swizzle.cu
 # SRC := 086-clc.cu
-SRC := 087-pure-mma-speed.cu
+# SRC := 087-pure-mma-speed.cu
+SRC := 088-pure-tma-speed.cu
 
 # Binaries
 CC := g++
