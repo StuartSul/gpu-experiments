@@ -78,10 +78,11 @@
 # SRC := 086-clc.cu
 # SRC := 087-pure-mma-speed.cu
 # SRC := 088-pure-tma-speed.cu
-SRC := 089-clc-multicast.cu
-SRC := 090-2cw-4cg-multicast.cu
-SRC := 091-smem-mma-tmem-pipe.cu
-SRC := 092-elect-sync.cu
+# SRC := 089-clc-multicast.cu
+# SRC := 090-2cw-4cg-multicast.cu
+# SRC := 091-smem-mma-tmem-pipe.cu
+# SRC := 092-elect-sync.cu
+SRC := 093-cutlass-bf16-gemm.cu
 
 # Binaries
 CC := g++
@@ -115,10 +116,17 @@ NVCCFLAGS+= -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code
 # Choose one of the following configurations:
 
 # 1. Standalone configuration
+# OUT := $(basename $(SRC)).out
+# RUN_CMD := ./$(OUT)
+
+# 2. Cutlass configuration
 OUT := $(basename $(SRC)).out
+CUTLASS_ROOT ?= /home/stuart/stuart/cutlass
+NVCCFLAGS += -I$(CUTLASS_ROOT)/include/ -I$(CUTLASS_ROOT)/tools/util/include/
+NVCCFLAGS += -diag-suppress 2908
 RUN_CMD := ./$(OUT)
 
-# 2. Python binding configuration
+# 3. Python binding configuration
 # NVCCFLAGS += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
 # NVCCFLAGS += -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
 # NVCCFLAGS += -DTORCH_API_INCLUDE_EXTENSION_H
@@ -130,7 +138,7 @@ RUN_CMD := ./$(OUT)
 # OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 # RUN_CMD := python3 $(basename $(SRC)).py
 
-# 3. PyTorch binding configuration
+# 4. PyTorch binding configuration
 # NVCCFLAGS += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
 # NVCCFLAGS += -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
 # NVCCFLAGS += -DTORCH_API_INCLUDE_EXTENSION_H
@@ -143,7 +151,7 @@ RUN_CMD := ./$(OUT)
 # OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 # RUN_CMD := python3 $(basename $(SRC)).py
 
-# 4. PyTorch + Torchrun binding configuration
+# 5. PyTorch + Torchrun binding configuration
 # NVCCFLAGS += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
 # NVCCFLAGS += -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
 # NVCCFLAGS += -DTORCH_API_INCLUDE_EXTENSION_H
@@ -156,12 +164,12 @@ RUN_CMD := ./$(OUT)
 # OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 # RUN_CMD := OMP_NUM_THREADS=1 torchrun --nproc_per_node=8 $(basename $(SRC)).py
 
-# 5. MPI configuration
+# 6. MPI configuration
 # NVCCFLAGS += -ccbin ${MPICC}
 # OUT := $(basename $(SRC)).out
 # RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
 
-# 6. NVSHMEM configuration
+# 7. NVSHMEM configuration
 # NVCCFLAGS += -ccbin ${MPICC}
 # NVCCFLAGS += -rdc=true
 # NVCCFLAGS += -I/usr/include/nvshmem_12/ -L/usr/lib/x86_64-linux-gnu/nvshmem/12 -lnvshmem_host -lnvshmem_device
