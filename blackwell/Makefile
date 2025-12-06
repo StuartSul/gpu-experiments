@@ -113,7 +113,7 @@ NVCCFLAGS += -std=c++20 -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static
 NVCCFLAGS += -O3 --use_fast_math # VERY important to include this flag
 NVCCFLAGS += -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills 
 NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
-NVCCFLAGS+= -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code=sm_100a
+NVCCFLAGS+= -DKITTENS_BLACKWELL -gencode arch=compute_100a,code=sm_100a
 
 # Choose one of the following configurations:
 
