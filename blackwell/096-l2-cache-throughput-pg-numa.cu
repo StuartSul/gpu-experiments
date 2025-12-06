@@ -12,6 +12,17 @@
         Throughput: 16620.81 GB/s
     
     WHAT??
+    Reason why I'm super surprised: when just doing smid = blockIdx.x, we get:
+        ==================================
+        CHIPLET=0, N=4096, REPEAT=128
+        Size: 32 MB
+        Time: 420.93 us
+        Throughput: 10203.44 GB/s
+        ==================================
+        CHIPLET=1, N=4096, REPEAT=128
+        Size: 32 MB
+        Time: 423.79 us
+        Throughput: 10134.65 GB/s
 */
 
 #include <random>
