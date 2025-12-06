@@ -82,7 +82,8 @@
 # SRC := 090-2cw-4cg-multicast.cu
 # SRC := 091-smem-mma-tmem-pipe.cu
 # SRC := 092-elect-sync.cu
-SRC := 093-cutlass-bf16-gemm.cu
+# SRC := 093-cutlass-bf16-gemm.cu
+SRC := 094-l2-cache-throughput.cu
 
 # Binaries
 CC := g++
@@ -116,15 +117,15 @@ NVCCFLAGS+= -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code
 # Choose one of the following configurations:
 
 # 1. Standalone configuration
-# OUT := $(basename $(SRC)).out
-# RUN_CMD := ./$(OUT)
+OUT := $(basename $(SRC)).out
+RUN_CMD := ./$(OUT)
 
 # 2. Cutlass configuration
-OUT := $(basename $(SRC)).out
-CUTLASS_ROOT ?= /home/stuart/stuart/cutlass
-NVCCFLAGS += -I$(CUTLASS_ROOT)/include/ -I$(CUTLASS_ROOT)/tools/util/include/
-NVCCFLAGS += -diag-suppress 2908
-RUN_CMD := ./$(OUT)
+# OUT := $(basename $(SRC)).out
+# CUTLASS_ROOT ?= /home/stuart/stuart/cutlass
+# NVCCFLAGS += -I$(CUTLASS_ROOT)/include/ -I$(CUTLASS_ROOT)/tools/util/include/
+# NVCCFLAGS += -diag-suppress 2908
+# RUN_CMD := ./$(OUT)
 
 # 3. Python binding configuration
 # NVCCFLAGS += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
