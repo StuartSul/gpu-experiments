@@ -23,6 +23,31 @@
         Size: 32 MB
         Time: 423.79 us
         Throughput: 10134.65 GB/s
+
+    Similar behavior on Hopper as well
+        Using SMID:
+        ==================================
+        CHIPLET=0, N=4096, REPEAT=128
+        Size: 32 MB
+        Time: 606.94 us
+        Throughput: 7076.39 GB/s
+        ==================================
+        CHIPLET=1, N=4096, REPEAT=128
+        Size: 32 MB
+        Time: 608.20 us
+        Throughput: 7061.81 GB/s   --> much less difference than Blackwell, probs due to single-chiplet design
+
+        Using blockIdx.x:
+        ==================================
+        CHIPLET=0, N=2048, REPEAT=128
+        Size: 8 MB
+        Time: 238.98 us
+        Throughput: 4493.06 GB/s
+        ==================================
+        CHIPLET=1, N=2048, REPEAT=128
+        Size: 8 MB
+        Time: 273.15 us
+        Throughput: 3930.98 GB/s
 */
 
 #include <random>
@@ -46,7 +71,7 @@ struct globals {
     a_gl a;
     b_gl b;
 
-    __host__ dim3 grid() { return dim3(148); }
+    __host__ dim3 grid() { return dim3(132); }
     __host__ dim3 block() { return dim3(1); }
     __host__ __device__ constexpr int dynamic_shared_memory() const { 
         return MAX_SHARED_MEMORY - 1024; 
@@ -56,10 +81,10 @@ struct globals {
 template <typename globals_t>
 __global__ void kernel(const __grid_constant__ globals_t g) {
     constexpr int PIPE_DEPTH = g.dynamic_shared_memory() / sizeof(globals_t::tile);
-    constexpr int CHIPLET_SMS = 74;
+    constexpr int CHIPLET_SMS = 66;
 
-    int smid;
-    asm volatile("{mov.u32 %0, %smid;}" : "=r"(smid));
+    int smid = blockIdx.x;
+    // asm volatile("{mov.u32 %0, %smid;}" : "=r"(smid));
 
     if ((globals_t::CHIPLET_ID == 0 && smid >= CHIPLET_SMS) ||
         (globals_t::CHIPLET_ID == 1 && smid < CHIPLET_SMS))
@@ -161,6 +186,6 @@ int main() {
     CUDACHECK(cudaGetDeviceProperties(&prop, device_id));
     printf("L2 Size=%.2f MB\n", (double)prop.l2CacheSize / 1024 / 1024);
 
-    run<globals<0, 4096, 128, 128>>();
-    run<globals<1, 4096, 128, 128>>();
+    run<globals<0, 2048, 128, 128>>();
+    run<globals<1, 2048, 128, 128>>();
 }
