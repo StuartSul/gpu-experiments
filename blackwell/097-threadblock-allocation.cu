@@ -14,7 +14,7 @@ __global__ void kernel_unclustered(const __grid_constant__ globals g) {
     int nsmid;
     asm volatile("{mov.u32 %0, %nsmid;}" : "=r"(nsmid));
 
-    printf("Block ID: %3u | SM ID: %3d / %3d\n", blockIdx.x, smid, nsmid);
+    printf("Block ID: %3u | SM ID: %3d / %3d | Cluster ID: %2d / %2d\n", blockIdx.x, smid, nsmid, blockIdx.x, gridDim.x);
 }
 
 __cluster_dims__(2) __global__ void kernel_2clustered(const __grid_constant__ globals g) {
