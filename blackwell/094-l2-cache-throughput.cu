@@ -1,3 +1,7 @@
+/*
+    B200 L2 throughput seems to be about 12.3 TB/s (actual)
+*/
+
 #include <random>
 #include <vector>
 
