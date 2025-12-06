@@ -1,369 +1,81 @@
 /*
     B200 Results:
         L2 Size=126.50 MB
-        ==================================
-        N=2048, REPEAT=128
-        Size: 8 MB
-        Time: 57.42 us
-        Throughput: 18698.17 GB/s
-        ==================================
-        N=3072, REPEAT=128
-        Size: 18 MB
-        Time: 126.98 us
-        Throughput: 19025.33 GB/s
-        ==================================
-        N=4096, REPEAT=128
-        Size: 32 MB
-        Time: 222.86 us
-        Throughput: 19272.33 GB/s
-        ==================================
-        N=4224, REPEAT=128
-        Size: 34 MB
-        Time: 238.71 us
-        Throughput: 19134.60 GB/s
-        ==================================
-        N=4352, REPEAT=128
-        Size: 36 MB
-        Time: 253.02 us
-        Throughput: 19163.01 GB/s
-        ==================================
-        N=4480, REPEAT=128
-        Size: 38 MB
-        Time: 265.90 us
-        Throughput: 19322.96 GB/s
-        ==================================
-        N=4608, REPEAT=128
-        Size: 40 MB
-        Time: 282.21 us
-        Throughput: 19261.48 GB/s
-        ==================================
-        N=4736, REPEAT=128
-        Size: 43 MB
-        Time: 302.50 us
-        Throughput: 18981.67 GB/s
-        ==================================
-        N=4864, REPEAT=128
-        Size: 45 MB
-        Time: 313.42 us
-        Throughput: 19324.36 GB/s
-        ==================================
-        N=4992, REPEAT=128
-        Size: 48 MB
-        Time: 330.36 us
-        Throughput: 19310.86 GB/s
-        ==================================
-        N=5120, REPEAT=128
-        Size: 50 MB
-        Time: 356.51 us
-        Throughput: 18823.83 GB/s
-        ==================================
-        N=5248, REPEAT=128
-        Size: 53 MB
-        Time: 366.81 us
-        Throughput: 19221.23 GB/s
-        ==================================
-        N=5376, REPEAT=128
-        Size: 55 MB
-        Time: 381.17 us
-        Throughput: 19410.41 GB/s
-        ==================================
-        N=5504, REPEAT=128
-        Size: 58 MB
-        Time: 404.28 us
-        Throughput: 19182.72 GB/s
-        ==================================
-        N=5632, REPEAT=128
-        Size: 60 MB
-        Time: 419.69 us
-        Throughput: 19348.00 GB/s
-        ==================================
-        N=5760, REPEAT=128
-        Size: 63 MB
-        Time: 439.42 us
-        Throughput: 19328.72 GB/s
-        ==================================
-        N=5888, REPEAT=128
-        Size: 66 MB
-        Time: 461.12 us
-        Throughput: 19246.84 GB/s
-        ==================================
-        N=6016, REPEAT=128
-        Size: 69 MB
-        Time: 475.04 us
-        Throughput: 19503.92 GB/s
-        ==================================
-        N=6144, REPEAT=128
-        Size: 72 MB
-        Time: 501.56 us
-        Throughput: 19267.08 GB/s
-        ==================================
-        N=6272, REPEAT=128
-        Size: 75 MB
-        Time: 525.23 us
-        Throughput: 19173.64 GB/s
-        ==================================
-        N=6400, REPEAT=128
-        Size: 78 MB
-        Time: 555.78 us
-        Throughput: 18866.75 GB/s
-        ==================================
-        N=6528, REPEAT=128
-        Size: 81 MB
-        Time: 583.52 us
-        Throughput: 18695.86 GB/s
-        ==================================
-        N=6656, REPEAT=128
-        Size: 84 MB
-        Time: 637.61 us
-        Throughput: 17787.46 GB/s
-        ==================================
-        N=6784, REPEAT=128
-        Size: 88 MB
-        Time: 605.14 us
-        Throughput: 19469.45 GB/s
-        ==================================
-        N=6912, REPEAT=128
-        Size: 91 MB
-        Time: 697.41 us
-        Throughput: 17537.25 GB/s
-        ==================================
-        N=7040, REPEAT=128
-        Size: 95 MB
-        Time: 738.64 us
-        Throughput: 17177.20 GB/s
-        ==================================
-        N=7168, REPEAT=128
-        Size: 98 MB
-        Time: 788.42 us
-        Throughput: 16683.20 GB/s
-        ==================================
-        N=7296, REPEAT=128
-        Size: 102 MB
-        Time: 692.74 us
-        Throughput: 19671.48 GB/s
-        ==================================
-        N=7424, REPEAT=128
-        Size: 105 MB
-        Time: 899.08 us
-        Throughput: 15693.39 GB/s
-        ==================================
-        N=7552, REPEAT=128
-        Size: 109 MB
-        Time: 863.00 us
-        Throughput: 16918.17 GB/s
-        ==================================
-        N=7680, REPEAT=128
-        Size: 112 MB
-        Time: 978.72 us
-        Throughput: 15427.73 GB/s
-        ==================================
-        N=7808, REPEAT=128
-        Size: 116 MB
-        Time: 1044.46 us
-        Throughput: 14942.68 GB/s
-        ==================================
-        N=7936, REPEAT=128
-        Size: 120 MB
-        Time: 832.36 us
-        Throughput: 19370.10 GB/s
-        ==================================
-        N=8064, REPEAT=128
-        Size: 124 MB
-        Time: 1111.41 us
-        Throughput: 14978.43 GB/s
-        ==================================
-        N=8192, REPEAT=128
-        Size: 128 MB
-        Time: 1172.95 us
-        Throughput: 14646.76 GB/s
-        ==================================
-        N=16384, REPEAT=128
-        Size: 512 MB
-        Time: 7260.94 us
-        Throughput: 9464.27 GB/s
+          8 MB -> 18698.17 GB/s
+         18 MB -> 19025.33 GB/s
+         32 MB -> 19272.33 GB/s
+         34 MB -> 19134.60 GB/s
+         36 MB -> 19163.01 GB/s
+         38 MB -> 19322.96 GB/s
+         40 MB -> 19261.48 GB/s
+         43 MB -> 18981.67 GB/s
+         45 MB -> 19324.36 GB/s
+         48 MB -> 19310.86 GB/s
+         50 MB -> 18823.83 GB/s
+         53 MB -> 19221.23 GB/s
+         55 MB -> 19410.41 GB/s
+         58 MB -> 19182.72 GB/s
+         60 MB -> 19348.00 GB/s
+         63 MB -> 19328.72 GB/s
+         66 MB -> 19246.84 GB/s
+         69 MB -> 19503.92 GB/s
+         72 MB -> 19267.08 GB/s
+         75 MB -> 19173.64 GB/s
+         78 MB -> 18866.75 GB/s
+         81 MB -> 18695.86 GB/s
+         84 MB -> 17787.46 GB/s
+         88 MB -> 19469.45 GB/s
+         91 MB -> 17537.25 GB/s
+         95 MB -> 17177.20 GB/s
+         98 MB -> 16683.20 GB/s
+        102 MB -> 19671.48 GB/s
+        105 MB -> 15693.39 GB/s
+        109 MB -> 16918.17 GB/s
+        112 MB -> 15427.73 GB/s
+        116 MB -> 14942.68 GB/s
+        120 MB -> 19370.10 GB/s
+        124 MB -> 14978.43 GB/s
+        128 MB -> 14646.76 GB/s
+        512 MB ->  9464.27 GB/s
 
     H100 Results:
         L2 Size=50.00 MB
-        ==================================
-        N=2048, REPEAT=128
-        Size: 8 MB
-        Time: 143.31 us
-        Throughput: 7492.59 GB/s
-        ==================================
-        N=3072, REPEAT=128
-        Size: 18 MB
-        Time: 320.33 us
-        Throughput: 7542.05 GB/s
-        ==================================
-        N=4096, REPEAT=128
-        Size: 32 MB
-        Time: 573.90 us
-        Throughput: 7483.84 GB/s
-        ==================================
-        N=4224, REPEAT=128
-        Size: 34 MB
-        Time: 617.28 us
-        Throughput: 7399.51 GB/s
-        ==================================
-        N=4352, REPEAT=128
-        Size: 36 MB
-        Time: 656.97 us
-        Throughput: 7380.24 GB/s
-        ==================================
-        N=4480, REPEAT=128
-        Size: 38 MB
-        Time: 715.04 us
-        Throughput: 7185.65 GB/s
-        ==================================
-        N=4608, REPEAT=128
-        Size: 40 MB
-        Time: 797.51 us
-        Throughput: 6815.99 GB/s
-        ==================================
-        N=4736, REPEAT=128
-        Size: 43 MB
-        Time: 981.30 us
-        Throughput: 5851.44 GB/s
-        ==================================
-        N=4864, REPEAT=128
-        Size: 45 MB
-        Time: 990.85 us
-        Throughput: 6112.49 GB/s
-        ==================================
-        N=4992, REPEAT=128
-        Size: 48 MB
-        Time: 1066.67 us
-        Throughput: 5980.82 GB/s
-        ==================================
-        N=5120, REPEAT=128
-        Size: 50 MB
-        Time: 1119.47 us
-        Throughput: 5994.68 GB/s
-        ==================================
-        N=5248, REPEAT=128
-        Size: 53 MB
-        Time: 1294.30 us
-        Throughput: 5447.45 GB/s
-        ==================================
-        N=5376, REPEAT=128
-        Size: 55 MB
-        Time: 1284.25 us
-        Throughput: 5761.17 GB/s
-        ==================================
-        N=5504, REPEAT=128
-        Size: 58 MB
-        Time: 1459.42 us
-        Throughput: 5313.95 GB/s
-        ==================================
-        N=5632, REPEAT=128
-        Size: 60 MB
-        Time: 1457.59 us
-        Throughput: 5570.98 GB/s
-        ==================================
-        N=5760, REPEAT=128
-        Size: 63 MB
-        Time: 1697.67 us
-        Throughput: 5003.02 GB/s
-        ==================================
-        N=5888, REPEAT=128
-        Size: 66 MB
-        Time: 1894.26 us
-        Throughput: 4685.29 GB/s
-        ==================================
-        N=6016, REPEAT=128
-        Size: 69 MB
-        Time: 1811.72 us
-        Throughput: 5114.03 GB/s
-        ==================================
-        N=6144, REPEAT=128
-        Size: 72 MB
-        Time: 2178.90 us
-        Throughput: 4435.11 GB/s
-        ==================================
-        N=6272, REPEAT=128
-        Size: 75 MB
-        Time: 2225.07 us
-        Throughput: 4525.94 GB/s
-        ==================================
-        N=6400, REPEAT=128
-        Size: 78 MB
-        Time: 2139.88 us
-        Throughput: 4900.16 GB/s
-        ==================================
-        N=6528, REPEAT=128
-        Size: 81 MB
-        Time: 2499.51 us
-        Throughput: 4364.61 GB/s
-        ==================================
-        N=6656, REPEAT=128
-        Size: 84 MB
-        Time: 2685.45 us
-        Throughput: 4223.28 GB/s
-        ==================================
-        N=6784, REPEAT=128
-        Size: 88 MB
-        Time: 2601.76 us
-        Throughput: 4528.39 GB/s
-        ==================================
-        N=6912, REPEAT=128
-        Size: 91 MB
-        Time: 3049.57 us
-        Throughput: 4010.60 GB/s
-        ==================================
-        N=7040, REPEAT=128
-        Size: 95 MB
-        Time: 3226.33 us
-        Throughput: 3932.57 GB/s
-        ==================================
-        N=7168, REPEAT=128
-        Size: 98 MB
-        Time: 3476.82 us
-        Throughput: 3783.15 GB/s
-        ==================================
-        N=7296, REPEAT=128
-        Size: 102 MB
-        Time: 3299.00 us
-        Throughput: 4130.74 GB/s
-        ==================================
-        N=7424, REPEAT=128
-        Size: 105 MB
-        Time: 3607.90 us
-        Throughput: 3910.76 GB/s
-        ==================================
-        N=7552, REPEAT=128
-        Size: 109 MB
-        Time: 3776.35 us
-        Throughput: 3866.26 GB/s
-        ==================================
-        N=7680, REPEAT=128
-        Size: 112 MB
-        Time: 3849.55 us
-        Throughput: 3922.41 GB/s
-        ==================================
-        N=7808, REPEAT=128
-        Size: 116 MB
-        Time: 4183.94 us
-        Throughput: 3730.22 GB/s
-        ==================================
-        N=7936, REPEAT=128
-        Size: 120 MB
-        Time: 4177.43 us
-        Throughput: 3859.53 GB/s
-        ==================================
-        N=8064, REPEAT=128
-        Size: 124 MB
-        Time: 4492.15 us
-        Throughput: 3705.84 GB/s
-        ==================================
-        N=8192, REPEAT=128
-        Size: 128 MB
-        Time: 4808.36 us
-        Throughput: 3572.92 GB/s
-        ==================================
-        N=16384, REPEAT=128
-        Size: 512 MB
-        Time: 21382.47 us
-        Throughput: 3213.82 GB/s
+          8 MB -> 7492.59 GB/s
+         18 MB -> 7542.05 GB/s
+         32 MB -> 7483.84 GB/s
+         34 MB -> 7399.51 GB/s
+         36 MB -> 7380.24 GB/s
+         38 MB -> 7185.65 GB/s
+         40 MB -> 6815.99 GB/s
+         43 MB -> 5851.44 GB/s
+         45 MB -> 6112.49 GB/s
+         48 MB -> 5980.82 GB/s
+         50 MB -> 5994.68 GB/s
+         53 MB -> 5447.45 GB/s
+         55 MB -> 5761.17 GB/s
+         58 MB -> 5313.95 GB/s
+         60 MB -> 5570.98 GB/s
+         63 MB -> 5003.02 GB/s
+         66 MB -> 4685.29 GB/s
+         69 MB -> 5114.03 GB/s
+         72 MB -> 4435.11 GB/s
+         75 MB -> 4525.94 GB/s
+         78 MB -> 4900.16 GB/s
+         81 MB -> 4364.61 GB/s
+         84 MB -> 4223.28 GB/s
+         88 MB -> 4528.39 GB/s
+         91 MB -> 4010.60 GB/s
+         95 MB -> 3932.57 GB/s
+         98 MB -> 3783.15 GB/s
+        102 MB -> 4130.74 GB/s
+        105 MB -> 3910.76 GB/s
+        109 MB -> 3866.26 GB/s
+        112 MB -> 3922.41 GB/s
+        116 MB -> 3730.22 GB/s
+        120 MB -> 3859.53 GB/s
+        124 MB -> 3705.84 GB/s
+        128 MB -> 3572.92 GB/s
+        512 MB -> 3213.82 GB/s
 */
 
 #include <random>
