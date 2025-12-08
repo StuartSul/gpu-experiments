@@ -88,7 +88,8 @@
 # SRC := 096-l2-cache-throughput-pg-numa.cu
 # SRC := 097-threadblock-allocation.cu
 # SRC := 098-l2-cache-throughput-ss.cu
-SRC := 099-l2-cache-throughput-ss-allocator.cu
+# SRC := 099-l2-cache-throughput-ss-allocator.cu
+SRC := 100-l2-cache-partition-check.cu
 
 # Binaries
 CC := g++
