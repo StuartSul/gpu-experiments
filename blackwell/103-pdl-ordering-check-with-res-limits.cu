@@ -1,5 +1,20 @@
+/*
+    This test uses 1 thread per threadblock, but each threadblock uses full SMEM.
+    So only 1 threadblock can get scheduled per SM.
+    
+    Observations:
+    - PDL uses all SMs to their fullest; if some SMs are available, it schedules a subset 
+      of second kernel threadblocks on them when possible.
+    - But PDL does not let you overlap scheduling within a fully occupied threadblock; for 
+      instance when you set `NUM_BLOCKS = 148` below, the second kernel won't begin until
+      all of the first kernel threadblocks finish, making PDLs just an expensive overhead.
+      But when you set `NUM_BLOCKS = 148 - 1`, the first threadblock of the second kernel
+      gets scheduled in advance and can print out its message.
+*/
+
 #include "kittens.cuh"
 
+// constexpr int NUM_BLOCKS = 148 - 1;
 constexpr int NUM_BLOCKS = 148;
 
 __global__ void primary_kernel(bool verbose) {
