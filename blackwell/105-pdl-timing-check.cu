@@ -1,3 +1,8 @@
+/*
+    Note that `cudaLaunchAttributeProgrammaticStreamSerialization` attribute alone removes memory flush
+    requirement, which speeds up the kernel launches already. Thus, we see speedups even with NUM_BLOCKS = 148.
+*/
+
 #include "kittens.cuh"
 
 constexpr int NUM_BLOCKS = 148;
