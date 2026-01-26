@@ -92,8 +92,9 @@
 # SRC := 100-l2-cache-partition-check.cu
 # SRC := 101-l2-cache-partition-check-2.cu
 # SRC := 102-pdl-ordering-check.cu
-SRC := 103-pdl-overhead-check.cu
-# SRC := 104-pdl-timing-check.cu
+SRC := 103-pdl-ordering-check-with-res-limits.cu
+# SRC := 104-pdl-overhead-check.cu
+# SRC := 105-pdl-timing-check.cu
 
 # Binaries
 CC := g++
