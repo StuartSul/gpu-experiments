@@ -1,11 +1,16 @@
 /*
     Observations:
     - With small grid size, cudaLaunchKernelEx is faster than <<<>>>
-    - With small grid size, adding PGL attribute on top of ^ is faster
+    - With small grid size, adding PDL attribute on top of ^ is faster
     - With small grid size, adding trigger/sync on top of ^ is faster
     - With large grid size, cudaLaunchKernelEx is as fast as <<<>>>
-    - With large grid size, adding PGL attribute on top of ^ is faster
+    - With large grid size, adding PDL attribute on top of ^ is faster
     - With large grid size, adding trigger/sync on top of ^ is slower than <<<>>> (by 1.7x)
+
+    On a second thought, adding PDL attribute itself *should* make execution faster,
+    because it removes the memory flush requirement between two kernels (even if the kernel
+    does not call `cudaTriggerProgrammaticLaunchCompletion()` to launch the second kernel
+    faster)
 */
 
 #include "kittens.cuh"
