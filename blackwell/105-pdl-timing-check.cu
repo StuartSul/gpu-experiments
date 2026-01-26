@@ -2,7 +2,7 @@
 
 constexpr int NUM_BLOCKS = 148;
 constexpr int BLOCK_SIZE = 512;
-constexpr int N = 128 * 1024;
+constexpr int N = NUM_BLOCKS*BLOCK_SIZE*32;
 constexpr int ITERATIONS = 100;
 
 __global__ void kernel_baseline(float* out, const float* in, int n) {
