@@ -1,25 +1,29 @@
 #include "kittens.cuh"
 
 __global__ void primary_kernel(bool verbose) {
-    if (verbose) printf("[Primary] Before cudaTriggerProgrammaticLaunchCompletion()\n");
-
-    // Let the secondary kernel start
-    cudaTriggerProgrammaticLaunchCompletion();
-
-    for (int i = 0; i < 10; i++) __nanosleep(10000);
-
-    if (verbose) printf("[Primary] After cudaTriggerProgrammaticLaunchCompletion()\n");
-
-    for (int i = 0; i < 10; i++) __nanosleep(10000);
+    if (threadIdx.x == 0) {
+        if (verbose) printf("[Primary] Before cudaTriggerProgrammaticLaunchCompletion()\n");
+    
+        // Let the secondary kernel start
+        cudaTriggerProgrammaticLaunchCompletion(); // only 1 thread in the block needs to call this
+    
+        for (int i = 0; i < 10; i++) __nanosleep(10000);
+    
+        if (verbose) printf("[Primary] After cudaTriggerProgrammaticLaunchCompletion()\n");
+    
+        for (int i = 0; i < 10; i++) __nanosleep(10000);
+    }
 }
 
 __global__ void secondary_kernel(bool verbose) {
-    if (verbose) printf("[Secondary] Before cudaGridDependencySynchronize()\n");
-
-    // Wait until primary kernel fully completes
-    cudaGridDependencySynchronize();
-
-    if (verbose) printf("[Secondary] After cudaGridDependencySynchronize()\n");
+    if (threadIdx.x == 0) {
+        if (verbose) printf("[Secondary] Before cudaGridDependencySynchronize()\n");
+    
+        // Wait until primary kernel fully completes
+        cudaGridDependencySynchronize();
+    
+        if (verbose) printf("[Secondary] After cudaGridDependencySynchronize()\n");
+    }
 }
 
 int main() {
@@ -38,13 +42,13 @@ int main() {
 
     // Warmup runs
     for (int i = 0; i < 10; i++) {
-        primary_kernel<<<1, 1>>>(false);
+        primary_kernel<<<1, 128>>>(false);
         CUDACHECK(cudaLaunchKernelEx(&config, secondary_kernel, false));
     }
     CUDACHECK(cudaDeviceSynchronize());
 
     // Main run
-    primary_kernel<<<1, 1>>>(true);
+    primary_kernel<<<1, 128>>>(true);
     CUDACHECK(cudaLaunchKernelEx(&config, secondary_kernel, true));
     CUDACHECK(cudaDeviceSynchronize());
 
