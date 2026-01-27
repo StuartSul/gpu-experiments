@@ -10,6 +10,8 @@
       all of the first kernel threadblocks finish, making PDLs just an expensive overhead.
       But when you set `NUM_BLOCKS = 148 - 1`, the first threadblock of the second kernel
       gets scheduled in advance and can print out its message.
+    - Another proof: make dynamic shared memory (MAX_SHARED_MEMORY - 1024) / 2, then 
+      overlapping happens. But add +1024 to this, no overlapping
 */
 
 #include "kittens.cuh"
@@ -39,8 +41,10 @@ __global__ void secondary_kernel(bool verbose) {
 }
 
 int main() {
-    CUDACHECK(cudaFuncSetAttribute(primary_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kittens::MAX_SHARED_MEMORY));
-    CUDACHECK(cudaFuncSetAttribute(secondary_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kittens::MAX_SHARED_MEMORY));
+    constexpr size_t dynamic_smem = (kittens::MAX_SHARED_MEMORY - 1024) / 2;
+
+    CUDACHECK(cudaFuncSetAttribute(primary_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem));
+    CUDACHECK(cudaFuncSetAttribute(secondary_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem));
 
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -50,20 +54,20 @@ int main() {
     cudaLaunchConfig_t config = {0};
     config.gridDim = dim3(NUM_BLOCKS);
     config.blockDim = dim3(1);
-    config.dynamicSmemBytes = kittens::MAX_SHARED_MEMORY;
+    config.dynamicSmemBytes = dynamic_smem;
     config.stream = 0;  // default stream
     config.attrs = attribute;
     config.numAttrs = 1;
 
     // Warmup runs
     for (int i = 0; i < 10; i++) {
-        primary_kernel<<<NUM_BLOCKS, 1, kittens::MAX_SHARED_MEMORY>>>(false);
+        primary_kernel<<<NUM_BLOCKS, 1, dynamic_smem>>>(false);
         CUDACHECK(cudaLaunchKernelEx(&config, secondary_kernel, false));
     }
     CUDACHECK(cudaDeviceSynchronize());
 
     // Main run
-    primary_kernel<<<NUM_BLOCKS, 1, kittens::MAX_SHARED_MEMORY>>>(true);
+    primary_kernel<<<NUM_BLOCKS, 1, dynamic_smem>>>(true);
     CUDACHECK(cudaLaunchKernelEx(&config, secondary_kernel, true));
     CUDACHECK(cudaDeviceSynchronize());
 
