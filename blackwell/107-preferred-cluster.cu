@@ -9,6 +9,11 @@
     - CLUSTER_SIZE 16: Launched with 144 SMs (divisibility), 112 SMs utilized concurrently
 
     Thus, it is significant to set fallback cluster size to 2
+
+    Observed, with fallback:
+    - CLUSTER_SIZE  4: 148 SMs utilized concurrently
+    - CLUSTER_SIZE  8: Launched with 144 SMs (divisibility), 144 SMs utilized concurrently
+    - CLUSTER_SIZE 16: Launched with 144 SMs (divisibility), 144 SMs utilized concurrently
 */
 
 #include "kittens.cuh"
@@ -161,8 +166,8 @@ __host__ int main() {
 
     // With fallbacks
     run<config<256, 256, 128, 148, 4, 2>>(N, N, N);
-    run<config<256, 256, 128, 148, 8, 2>>(N, N, N);
-    run<config<256, 256, 128, 148, 16, 2>>(N, N, N);
+    run<config<256, 256, 128, 144, 8, 2>>(N, N, N);
+    run<config<256, 256, 128, 144, 16, 2>>(N, N, N);
 
     return 0;
 }
