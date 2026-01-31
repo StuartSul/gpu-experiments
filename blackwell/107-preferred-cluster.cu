@@ -1,4 +1,20 @@
+/*
+    The maximum number of concurrent clusters is not SM_COUNT / CLUSTER_SIZE.
+    
+    Observed:
+    - CLUSTER_SIZE  1: 148 SMs utilized concurrently
+    - CLUSTER_SIZE  2: 148 SMs utilized concurrently
+    - CLUSTER_SIZE  4: 132 SMs utilized concurrently
+    - CLUSTER_SIZE  8: Launched with 144 SMs (divisibility), 120 SMs utilized concurrently
+    - CLUSTER_SIZE 16: Launched with 144 SMs (divisibility), 112 SMs utilized concurrently
+
+    Thus, it is significant to set fallback cluster size to 2
+*/
+
 #include "kittens.cuh"
+
+#include <chrono>
+#include <thread>
 
 using namespace kittens;
 
@@ -16,12 +32,15 @@ __global__ void fill_kernel(T* data, size_t count, uint64_t seed, float min_val,
     }
 }
 
-template <int _Mb, int _Nb, int _Kb>
+template <int _Mb, int _Nb, int _Kb, int _NUM_BLOCKS, int _CLUSTER_PREFERRED, int _CLUSTER_MINIMUM>
 struct config {
     static constexpr int Mb = _Mb;
     static constexpr int Nb = _Nb;
     static constexpr int Kb = _Kb;
+    static constexpr int NUM_BLOCKS = _NUM_BLOCKS;
     static constexpr int NUM_THREADS = 128;
+    static constexpr int CLUSTER_PREFERRED = _CLUSTER_PREFERRED;
+    static constexpr int CLUSTER_MINIMUM = _CLUSTER_MINIMUM;
 };
 
 template <typename C>
@@ -35,7 +54,7 @@ struct globals {
     a_gl a;
     b_gl b;
 
-    __host__ __inline__ dim3 grid() { return dim3(148); }
+    __host__ __inline__ dim3 grid() { return dim3(C::NUM_BLOCKS); }
     __host__ __inline__ dim3 block() { return dim3(C::NUM_THREADS); }
     __host__ __inline__ int dynamic_shared_memory() { return MAX_SHARED_MEMORY - 1024; }
 };
@@ -43,12 +62,16 @@ struct globals {
 template <typename C>
 __launch_bounds__(C::NUM_THREADS, 1)
 __global__ void kernel(const __grid_constant__ globals<C> g) {
-    // to be implemented
+    if (threadIdx.x == 0)
+        printf("num_clusters=%d, cluster_idx=%d, cluster_size=%d, cta_rank=%d, blockIdx.x=%d\n",
+               nclusterid().x, clusterIdx().x, cluster_nctarank(), cluster_ctarank(), blockIdx.x);
+    for (int i = 0; i < 500000; i++) __nanosleep(10000);
 }
 
 template <typename C>
 __host__ double run(size_t M, size_t N, size_t K) {
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
+    std::cout << "CLUSTER_PREFERRED=" << C::CLUSTER_PREFERRED << " CLUSTER_MINIMUM=" << C::CLUSTER_MINIMUM << std::endl;
 
     int l2_cache_size;
     cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
@@ -80,11 +103,15 @@ __host__ double run(size_t M, size_t N, size_t K) {
     }
 
     CUDACHECK(cudaFuncSetAttribute(kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, g[0].dynamic_shared_memory()));
+    CUDACHECK(cudaFuncSetAttribute(kernel<C>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
 
-    LaunchConfig<true, true> launch_config(g[0].grid(), g[0].block(), g[0].dynamic_shared_memory(), 0, 2);
+    dim3 cluster_preferred(C::CLUSTER_PREFERRED, 1, 1);
+    dim3 cluster_minimum(C::CLUSTER_MINIMUM, 1, 1);
+    LaunchConfig<true, true> launch_config(g[0].grid(), g[0].block(), g[0].dynamic_shared_memory(), 0, 
+                                           cluster_preferred, cluster_minimum);
 
-    constexpr int num_warmups = 500;
-    constexpr int num_iters = 100;
+    constexpr int num_warmups = 0;
+    constexpr int num_iters = 1;
 
     for(int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
@@ -100,6 +127,8 @@ __host__ double run(size_t M, size_t N, size_t K) {
         cudaLaunchKernelEx(launch_config, kernel<C>, g[idx]);
     }
     CUDACHECK(cudaEventRecord(stop));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    std::cout << "----------------------------------------\n";
     CUDACHECK(cudaEventSynchronize(stop));
 
     float milliseconds;
@@ -122,6 +151,18 @@ __host__ double run(size_t M, size_t N, size_t K) {
 
 __host__ int main() {
     int N = 16384;
-    run<config<256, 256, 128>>(N, N, N);
+
+    // No fallbacks
+    run<config<256, 256, 128, 148, 1, 1>>(N, N, N);
+    run<config<256, 256, 128, 148, 2, 2>>(N, N, N);
+    run<config<256, 256, 128, 148, 4, 4>>(N, N, N);
+    run<config<256, 256, 128, 144, 8, 8>>(N, N, N);
+    run<config<256, 256, 128, 144, 16, 16>>(N, N, N);
+
+    // With fallbacks
+    run<config<256, 256, 128, 148, 4, 2>>(N, N, N);
+    run<config<256, 256, 128, 148, 8, 2>>(N, N, N);
+    run<config<256, 256, 128, 148, 16, 2>>(N, N, N);
+
     return 0;
 }
