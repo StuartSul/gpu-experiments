@@ -95,7 +95,8 @@
 # SRC := 103-pdl-ordering-check-with-res-limits.cu
 # SRC := 104-pdl-overhead-check.cu
 # SRC := 105-pdl-timing-check.cu
-SRC := 106-tgcen05-occupancy-test.cu
+# SRC := 106-tgcen05-occupancy-test.cu
+SRC := 107-preferred-cluster.cu
 
 # Binaries
 CC := g++
