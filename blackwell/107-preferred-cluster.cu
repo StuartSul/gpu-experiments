@@ -12,8 +12,18 @@
 
     Observed, with fallback:
     - CLUSTER_SIZE  4: 148 SMs utilized concurrently
+        - 132 SMs are clustered in groups of 4
+        - 16 SMs are clustered in groups of 2
     - CLUSTER_SIZE  8: Launched with 144 SMs (divisibility), 144 SMs utilized concurrently
     - CLUSTER_SIZE 16: Launched with 144 SMs (divisibility), 144 SMs utilized concurrently
+
+    Very convenient thing about cluster index is that it gives index as if rest of the clusters
+    were same size as the current one. For instance, for cluster size 4 with fallback 2, we have
+    cluster indices 0, ..., 32 for the first 132 SMs (33 clusters of 4 CTAs each), but then for
+    the last 16 SMs, we have cluster indices 66, ..., 73 (8 clusters of 2 CTAs each). In the 
+    perspective of last 16 SMs, it's as if all of 148 SMs are running with cluster size 2. So the
+    kernel implementation becomes simple; just make sure it works on cluster sizes 4 and 2. No 
+    need to handle varying cluster sizes. 
 */
 
 #include "kittens.cuh"
