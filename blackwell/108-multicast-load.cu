@@ -62,29 +62,30 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
     B_tile (&B_tiles)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<B_tile, C::LOAD_PIPE_DEPTH>();
 
     // Declare tensor memory
-    tensor_allocator<1, 2> tm_allocator;
-    auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+    tensor_allocator<1, 2, false> tm_allocator;
 
     // Set up mbarriers
+    __shared__ uint32_t tmem_addr;
     __shared__ semaphore inputs_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore tmem_finished;
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(inputs_arrived[i], 0, 1);
             init_semaphore(inputs_finished[i], 0, 1);
         }
+        init_semaphore(tmem_finished, 0, 1);
     }
     everyone::tma::cluster::arrive_aligned();
 
     const int cta_id = cluster_ctarank();
-    const int cluster_id = clusterIdx().x;
-    const int cluster_size = 2;
+    const int cluster_id = clusterid().x;
+    const int cluster_size = cluster_nctarank();;
     const int rblks = g.a.rows() / C::Mb;
     const int cblks = g.b.rows() / C::Nb;
     const int num_blocks = cblks * rblks;
     const int num_iters_per_block = g.a.cols() / C::Kb;
-    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * cblks;
 
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;
@@ -93,36 +94,39 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
     if (warpgroup::warpid() == 3 && warp::elect_leader()) {
         // Load input tiles to shared memory
         pdl::wait();
-        everyone::tma::cluster::wait_aligned();
+        everyone::tma::cluster::wait();
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / cluster_size) {
-            int supergroup_idx = block_idx / num_blocks_per_supergroup;
-            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
-            int rows_in_supergroup = min(C::SUPERGROUP_SIZE, rblks - supergroup_idx * C::SUPERGROUP_SIZE);
-            int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
-            int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
-            int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            int2 tile_coord = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(rblks, cblks, block_idx);
 
             for (int i = 0; i < num_iters_per_block; ++i) {
                 tma::cluster::wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
-                tma::cluster::load_async(A_tiles[stage], g.a, {row_block_idx * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
-                tma::cluster::load_async(B_tiles[stage], g.b, {col_block_idx * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                tma::cluster::load_async(A_tiles[stage], g.a, {tile_coord.x * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                tma::cluster::load_async(B_tiles[stage], g.b, {tile_coord.y * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
                 stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
             }
         }
-    } else if (cta_id == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
+    } else if (warpgroup::warpid() == 0) {
         // Launch tensor core matrix multiply
-        everyone::tma::cluster::wait_aligned();
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / cluster_size) {
-            for (int i = 0; i < num_iters_per_block; i++) {
-                tma::cluster::expect_bytes(inputs_arrived[stage], 2*(sizeof(A_tile) + sizeof(B_tile)));
-                tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<0>(phasebits, stage);
-                if (i == 0) mm2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
-                else       mma2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
-                stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+        everyone::tma::cluster::wait();
+        tm_allocator.provision(tmem_addr);
+        tm_allocator.set_addr(tmem_addr);
+        auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+        if (cta_id == 0 && warp::elect_leader()) {
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / cluster_size) {
+                for (int i = 0; i < num_iters_per_block; i++) {
+                    tma::cluster::expect_bytes(inputs_arrived[stage], 2*(sizeof(A_tile)+sizeof(B_tile)));
+                    tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    update_phasebit<0>(phasebits, stage);
+                    if (i == 0) mm2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
+                    else       mma2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
             }
+            kittens::detail::tcgen05::commit<2>(tmem_finished);
         }
+        tma::cluster::wait(tmem_finished, 0);
+        tm_allocator.deprovision();
     }
 }
 
