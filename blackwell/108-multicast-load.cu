@@ -215,7 +215,7 @@ __host__ int main() {
     int N = 16384;
 
     run<config<256, 256, 128, 148, 2, 2>>(N, N, N);
-    // run<config<256, 256, 128, 148, 4, 2>>(N, N, N);
+    run<config<256, 256, 128, 148, 4, 2>>(N, N, N);
 
     return 0;
 }
