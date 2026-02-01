@@ -80,8 +80,9 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
     everyone::tma::cluster::arrive_aligned();
 
     const int cta_id = cluster_ctarank();
-    const int cluster_id = clusterid().x;
-    const int cluster_size = cluster_nctarank();;
+    const int cta_parity = cta_id & 0b1;
+    const int cluster_size = cluster_nctarank();
+    const int cluster_id = clusterid().x*(cluster_size/2) + cta_id/2;
     const int rblks = g.a.rows() / C::Mb;
     const int cblks = g.b.rows() / C::Nb;
     const int num_blocks = cblks * rblks;
@@ -95,14 +96,14 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
         // Load input tiles to shared memory
         pdl::wait();
         everyone::tma::cluster::wait();
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / cluster_size) {
+        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / 2) {
             int2 tile_coord = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(rblks, cblks, block_idx);
 
             for (int i = 0; i < num_iters_per_block; ++i) {
                 tma::cluster::wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
-                tma::cluster::load_async(A_tiles[stage], g.a, {tile_coord.x * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
-                tma::cluster::load_async(B_tiles[stage], g.b, {tile_coord.y * 2 + cta_id, i}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                tma::cluster::load_async(A_tiles[stage], g.a, {tile_coord.x * 2 + cta_parity, i}, inputs_arrived[stage], (uint16_t)(1<<cta_id), cta_id&(~0b1));
+                tma::cluster::load_async(B_tiles[stage], g.b, {tile_coord.y * 2 + cta_parity, i}, inputs_arrived[stage], (uint16_t)(1<<cta_id), cta_id&(~0b1));
                 stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
             }
         }
@@ -112,18 +113,19 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
         tm_allocator.provision(tmem_addr);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        if (cta_id == 0 && warp::elect_leader()) {
-            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / cluster_size) {
+        if (cta_parity == 0 && warp::elect_leader()) {
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / 2) {
                 for (int i = 0; i < num_iters_per_block; i++) {
                     tma::cluster::expect_bytes(inputs_arrived[stage], 2*(sizeof(A_tile)+sizeof(B_tile)));
                     tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
-                    if (i == 0) mm2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
-                    else       mma2_ABt(out_tm, A_tiles[stage], B_tiles[stage], inputs_finished[stage]);
+                    if (i == 0) mm2_ABt(out_tm, A_tiles[stage], B_tiles[stage]);
+                    else       mma2_ABt(out_tm, A_tiles[stage], B_tiles[stage]);
+                    tensor_commit<2>(inputs_finished[stage], 0b11<<cta_id);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             }
-            kittens::detail::tcgen05::commit<2>(tmem_finished);
+            tensor_commit<2>(tmem_finished, 0b11<<cta_id);
         }
         tma::cluster::wait(tmem_finished, 0);
         tm_allocator.deprovision();
