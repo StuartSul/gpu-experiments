@@ -97,7 +97,8 @@
 # SRC := 105-pdl-timing-check.cu
 # SRC := 106-tgcen05-occupancy-test.cu
 # SRC := 107-preferred-cluster.cu
-SRC := 108-multicast-load.cu
+# SRC := 108-multicast-load.cu
+SRC := 109-elect-sync.cu
 
 # Binaries
 CC := g++
@@ -196,6 +197,9 @@ all: $(OUT)
 
 ptx: $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) --ptx -o $(basename $(SRC)).ptx
+
+sass: $(OUT)
+	cuobjdump --dump-sass $(OUT) > $(basename $(SRC)).sass
 
 run: $(OUT)
 	$(RUN_CMD)
