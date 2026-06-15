@@ -6,7 +6,7 @@ A collection of GPU experiments and benchmarks for my personal understanding and
 
 - ThunderKittens
 - CUDA 12.8+
-- NVIDIA Hopper (H100) or Blackwell (B200) GPUs
+- NVIDIA Hopper (H100), Blackwell (B200), or Blackwell Ultra (B300) GPUs
 - Python 3.11+ with PyTorch 2.8+ and pybind11
 
 ## How to Run
@@ -17,8 +17,9 @@ A collection of GPU experiments and benchmarks for my personal understanding and
 
 ## Organization
 
-- `hopper/`: Experiments targeting H100
-- `blackwell/`: Experiments targeting B200
+- `hopper/`: Experiments targeting H100s
+- `blackwell/`: Experiments targeting B200s
+- `blackwell-ultra/`: Experiments targetting (G)B300s
 
 ## Note
 
