@@ -54,7 +54,9 @@ def main():
 
     torch.cuda.set_device(local_device)
     device = torch.device(f"cuda:{local_device}")
+    print(f"[rank {rank}] connecting to {os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']} ...", flush=True)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=local_device)
+    print(f"[rank {rank}] process group ready", flush=True)
 
     is_src = rank == SRC_RANK
     is_dst = rank == DST_RANK
@@ -72,8 +74,10 @@ def main():
     buf = symm_mem.empty(numel, dtype=DTYPE, device=device)
     buf.fill_(SRC_VALUE if is_src else 0.0)
     torch.cuda.synchronize()
+    print(f"[rank {rank}] symmetric memory allocated", flush=True)
 
     hdl = symm_mem.rendezvous(buf, dist.group.WORLD.group_name)
+    print(f"[rank {rank}] rendezvous done", flush=True)
     dist.barrier()
 
     # Source rank pushes its buffer into the destination rank's buffer over NVLink.
