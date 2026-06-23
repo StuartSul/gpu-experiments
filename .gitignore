@@ -13,3 +13,4 @@ gmon.out
 *.so
 *.png
 *.json 
+*.pyc

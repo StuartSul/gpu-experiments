@@ -82,7 +82,12 @@ def reference_full(q, k, v, rank, world_size):
     return full_out[:, rank * LOCAL_SEQ : (rank + 1) * LOCAL_SEQ]
 
 
-def main():
+def run(ring_attention, name):
+    """Shared harness: set up NCCL, check correctness vs full attention, profile, time.
+
+    Pass a ring-attention implementation `ring_attention(q, k, v, rank, world_size)`
+    and a short `name` used for the banner and the per-rank Perfetto trace filename.
+    """
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -93,8 +98,8 @@ def main():
     assert dist.get_backend() == "nccl", f"expected NCCL backend, got {dist.get_backend()}"
 
     if rank == 0:
-        print("\nNaive Ring Attention (flash-attn CuTe + NCCL)")
-        print("============================================")
+        print(f"\n{name.capitalize()} Ring Attention (flash-attn CuTe + NCCL)")
+        print("=" * 60)
         print(f"World size {world_size} | per-rank seq {LOCAL_SEQ} (global {world_size * LOCAL_SEQ})")
         print(f"Heads {NHEADS} | head dim {HEAD_DIM} | batch {BATCH} | {torch.bfloat16}\n", flush=True)
     dist.barrier()
@@ -126,7 +131,7 @@ def main():
         for _ in range(num_profiles):
             ring_attention(q, k, v, rank, world_size)
         torch.cuda.synchronize()
-    trace_path = f"trace_ring_naive_rank{rank}.json"
+    trace_path = f"trace_ring_{name}_rank{rank}.json"
     prof.export_chrome_trace(trace_path)
     if rank == 0:
         print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
@@ -157,4 +162,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run(ring_attention, "naive")
