@@ -42,9 +42,15 @@ def combine(acc_o, acc_lse, o, lse):
     return acc_o * wa + o.float() * wb, new_lse + torch.log(denom)
 
 
-def ring_exchange(tensors, rank, world_size):
-    """Blocking ring shift: send each tensor to rank+1, receive from rank-1."""
-    recv = [torch.empty_like(t) for t in tensors]
+def ring_exchange(tensors, rank, world_size, recv=None):
+    """Ring shift: send each tensor to rank+1, receive from rank-1.
+
+    Receives into the provided `recv` buffers if given (e.g. caller-owned double
+    buffers); otherwise allocates fresh ones. Issues on the current stream, so wrap
+    in a comm-stream context to overlap. The `wait` is stream-ordered, not a host sync.
+    """
+    if recv is None:
+        recv = [torch.empty_like(t) for t in tensors]
     ops = [dist.P2POp(dist.isend, t, (rank + 1) % world_size) for t in tensors]
     ops += [dist.P2POp(dist.irecv, r, (rank - 1) % world_size) for r in recv]
     reqs = dist.batch_isend_irecv(ops)
@@ -106,6 +112,8 @@ def run(ring_attention, name):
 
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
     q, k, v = (torch.randn((BATCH, LOCAL_SEQ, NHEADS, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=gen) for _ in range(3))
+    torch.cuda.synchronize()
+    dist.barrier()
 
     out = ring_attention(q, k, v, rank, world_size)
     ref = reference_full(q, k, v, rank, world_size)
@@ -118,6 +126,7 @@ def run(ring_attention, name):
         f"out max {out_abs.max().item():.5f} mean {out_abs.mean().item():.5f}",
         flush=True,
     )
+    torch.cuda.synchronize()
     dist.barrier()
 
     num_profiles = 3
