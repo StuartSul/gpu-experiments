@@ -149,7 +149,8 @@ def main():
     avg_ms = start.elapsed_time(end) / num_iters
     flops = 4 * BATCH * NHEADS * HEAD_DIM * LOCAL_SEQ * (world_size * LOCAL_SEQ)
     tflops = flops / (avg_ms * 1e-3) / 1e12
-    print(f"[rank {rank}] avg {avg_ms:.3f} ms/iter | {tflops:.1f} TFLOP/s", flush=True)
+    if rank == 0:
+        print(f"[rank {rank}] avg {avg_ms:.3f} ms/iter | {tflops:.1f} TFLOP/s", flush=True)
 
     dist.barrier()
     dist.destroy_process_group()
