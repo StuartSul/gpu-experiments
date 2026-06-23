@@ -1,6 +1,6 @@
 """
 Run on 4 GPUs:
-    CUDA_VISIBLE_DEVICES=0,1,2,3 ~/anytitan/.venv/bin/torchrun --nproc_per_node=4 004-naive-comm-comp-overlap.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 ~/anytitan/.venv/bin/torchrun --nproc_per_node=4 004-ring-attention-naive.py
 """
 
 import math
@@ -126,7 +126,7 @@ def main():
         for _ in range(num_profiles):
             ring_attention(q, k, v, rank, world_size)
         torch.cuda.synchronize()
-    trace_path = f"trace_ring_rank{rank}.json"
+    trace_path = f"trace_ring_naive_rank{rank}.json"
     prof.export_chrome_trace(trace_path)
     if rank == 0:
         print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
