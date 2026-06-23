@@ -115,8 +115,23 @@ def main():
     )
     dist.barrier()
 
+    num_profiles = 3
     num_warmups = 5
     num_iters = 10
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof:
+        for _ in range(num_profiles):
+            ring_attention(q, k, v, rank, world_size)
+        torch.cuda.synchronize()
+    trace_path = f"trace_ring_rank{rank}.json"
+    prof.export_chrome_trace(trace_path)
+    if rank == 0:
+        print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     for _ in range(num_warmups):
         ring_attention(q, k, v, rank, world_size)
