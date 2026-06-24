@@ -3,17 +3,22 @@ Stream-overlapped ring attention. Reuses the shared harness + helpers from
 004-ring-attention-naive.py; only the ring_attention implementation differs.
 
 Run on 4 GPUs:
-    CUDA_VISIBLE_DEVICES=0,1,2,3 ~/anytitan/.venv/bin/torchrun --nproc_per_node=4 006-ring-attention-stream-green.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 ~/anytitan/.venv/bin/torchrun --nproc_per_node=4 006-ring-attention-stream-manual-split.py
 """
 
 import importlib.util
 import os
 import pathlib
 
-# Limit NCCL SMs
-_NCCL_SMS = 4
+# Allocate SMs for NCCL / FlashAttention
+_NCCL_SMS = 16
 os.environ["NCCL_MAX_CTAS"] = str(_NCCL_SMS)
 os.environ["NCCL_MIN_CTAS"] = str(_NCCL_SMS)
+import cutlass.utils as _cutlass_utils
+_orig_sm_count = _cutlass_utils.HardwareInfo.get_device_multiprocessor_count
+_cutlass_utils.HardwareInfo.get_device_multiprocessor_count = (
+    lambda self: _orig_sm_count(self) - _NCCL_SMS
+)
 
 import torch
 
@@ -72,4 +77,4 @@ def ring_attention(q, k, v, rank, world_size):
 
 
 if __name__ == "__main__":
-    naive.run(ring_attention, "green")
+    naive.run(ring_attention, "manual-split")
