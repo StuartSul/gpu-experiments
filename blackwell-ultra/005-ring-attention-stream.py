@@ -35,6 +35,7 @@ def ring_attention(q, k, v, rank, world_size):
 
     compute_done = torch.cuda.Event()
     comm_done = torch.cuda.Event()
+    compute_done.record(compute_stream)  # to have comm wait for previous run to finish
 
     # Double-buffered receive scratch
     buf_k = [torch.empty_like(k), torch.empty_like(k)]
@@ -49,8 +50,7 @@ def ring_attention(q, k, v, rank, world_size):
             cur_k, cur_v = buf_k[(step - 1) % 2], buf_v[(step - 1) % 2]
 
         if step < world_size - 1:
-            if step > 0:
-                comm_stream.wait_event(compute_done)
+            comm_stream.wait_event(compute_done)
             with torch.cuda.stream(comm_stream):
                 ring_exchange([cur_k, cur_v], rank, world_size, recv=[buf_k[step % 2], buf_v[step % 2]])
             comm_done.record(comm_stream)
