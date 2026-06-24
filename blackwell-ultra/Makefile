@@ -3,7 +3,8 @@
 # SRC := 001-nvlink-bandwidth-sm-tma.cu
 # SRC := 002-nvlink-bandwidth-sm.cu
 # SRC := 003-inter-node-copy-engine.cu
-SRC := 008-nvlink-bandwidth-sm-tma-remote.cu
+# SRC := 008-nvlink-bandwidth-sm-tma-remote.cu
+SRC := 009-nvlink-bandwidth-sm-tma-pull.cu
 
 # Binaries
 CC := g++
