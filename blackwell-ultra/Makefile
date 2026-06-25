@@ -6,7 +6,8 @@
 # SRC := 008-nvlink-bandwidth-sm-tma-remote.cu
 # SRC := 009-nvlink-bandwidth-sm-tma-pull.cu
 # SRC := 010-nvlink-bandwidth-sm-tma-pushpull.cu
-SRC := 011-nvl72-bandwidth.cu
+# SRC := 011-nvl72-bandwidth.cu
+SRC := 012-moe-dispatch-bw.cu
 
 # Binaries
 CC := g++
