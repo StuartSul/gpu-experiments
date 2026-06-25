@@ -6,7 +6,7 @@ using namespace kittens;
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 1;
+    static constexpr int NUM_THREADS = 128;
 };
 
 struct globals {
@@ -14,66 +14,93 @@ struct globals {
     static constexpr int ROW_BLOCK_SIZE = 128;
     static constexpr int COL_BLOCK_SIZE = 128;
 
-    using tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE>;
-    using send_gl = gl<bf16, 1, -1, -1, -1, tile>;
-    using recv_gl = pgl<gl<bf16, 1, -1, -1, -1, tile>, NUM_DEVICES, false>;
+    using token_tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE, false>;
+    using token_vec = sv_bf<COL_BLOCK_SIZE>;
+
+    using tokens_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
+    using recv_buffer_gl = pgl<gl<bf16, 1, -1, -1, -1, token_tile>, NUM_DEVICES, false>;
     using index_gl = gl<int, 1, 1, 1, -1>;
 
-    send_gl send;
-    recv_gl recv;
-    index_gl dst_rank;
-    index_gl dst_block;
+    tokens_gl tokens;
+    recv_buffer_gl recv_buffer;
+    index_gl schedule_src_token_idx;
+    index_gl schedule_dst_rank;
+    index_gl schedule_dst_block_idx;
 
     __host__ inline dim3 grid() const {
-        return dim3(send.cols() / COL_BLOCK_SIZE, send.rows() / ROW_BLOCK_SIZE, 1);
+        return dim3(tokens.cols() / COL_BLOCK_SIZE, schedule_dst_rank.cols());
     }
     __host__ inline int dynamic_shared_memory() const {
-        return static_cast<int>(sizeof(tile) + 1024);
+        return static_cast<int>(sizeof(token_tile) + 1024);
     }
 };
 
 __device__ inline void dispatch_kernel(const globals &G) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator((int*)&__shm[0]);
-    globals::tile &tile = allocator.allocate<globals::tile>();
+    globals::token_tile &token_tile = allocator.allocate<globals::token_tile>();
 
-    const int src_block_idx = blockIdx.y;
+    const int tid = threadIdx.x;
     const int col_idx = blockIdx.x;
-    const int dst_rank = G.dst_rank[{src_block_idx}];
-    const int dst_block_idx = G.dst_block[{src_block_idx}];
+    const int src_block_idx = blockIdx.y;
+    const int dst_rank = G.schedule_dst_rank[{src_block_idx}];
+    const int dst_block_idx = G.schedule_dst_block_idx[{src_block_idx}];
 
     if (dst_rank < 0) return; // this source-block slot is past the dispatch schedule
 
+    const int src_token_idx = G.schedule_src_token_idx[{src_block_idx * globals::ROW_BLOCK_SIZE + tid}];
+    globals::token_vec &dst_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * globals::COL_BLOCK_SIZE]);
+
     __shared__ semaphore inputs_arrived;
-    init_semaphore(inputs_arrived, 0, 1);
-    tma::expect_bytes(inputs_arrived, sizeof(globals::tile));
-    tma::load_async(tile, G.send, {src_block_idx, col_idx}, inputs_arrived);
+    const int num_valid = __syncthreads_count(src_token_idx >= 0);
+    if (tid == 0) {
+        init_semaphore(inputs_arrived, 0, 1);
+        tma::expect_bytes(inputs_arrived, num_valid * sizeof(globals::token_vec));
+    }
+    __syncthreads();
+
+    if (src_token_idx >= 0) {
+        tma::load_async(dst_vec, G.tokens, {src_token_idx, col_idx}, inputs_arrived); // causes peeling loop but still faster
+    } else {
+        #pragma unroll
+        for (int j = 0; j < globals::COL_BLOCK_SIZE; ++j)
+            dst_vec[j] = __float2bfloat16(0.0f);
+    }
+
+    __syncthreads(); // for the padding writes
     wait(inputs_arrived, 0);
-    tma::store_async(G.recv[dst_rank], tile, {dst_block_idx, col_idx});
+
+    if (tid == 0) {
+        tma::store_async(G.recv_buffer[dst_rank], token_tile, {dst_block_idx, col_idx});
+        tma::store_async_wait();
+    }
 }
 
 void dispatch(
-    const at::Tensor &send,
-    const at::Tensor &recv,
-    const std::vector<int64_t> &recv_ptrs,
-    const at::Tensor &dst_rank,
-    const at::Tensor &dst_block
+    const at::Tensor &tokens,
+    const at::Tensor &recv_buffer,
+    const std::vector<int64_t> &recv_buffer_ptrs,
+    const at::Tensor &schedule_src_token_idx,
+    const at::Tensor &schedule_dst_rank,
+    const at::Tensor &schedule_dst_block_idx
 ) {
-    bf16 *recv_data[globals::NUM_DEVICES];
+    bf16 *recv_buffer_data[globals::NUM_DEVICES];
     for (int i = 0; i < globals::NUM_DEVICES; ++i)
-        recv_data[i] = reinterpret_cast<bf16*>(recv_ptrs[i]);
+        recv_buffer_data[i] = reinterpret_cast<bf16*>(recv_buffer_ptrs[i]);
 
     globals G {
-        .send = kittens::py::tensor_to_gl<globals::send_gl>(send),
-        .recv = globals::recv_gl{recv_data, nullptr, static_cast<size_t>(1), static_cast<size_t>(recv.size(0)), static_cast<size_t>(recv.size(1))},
-        .dst_rank = kittens::py::tensor_to_gl<globals::index_gl>(dst_rank),
-        .dst_block = kittens::py::tensor_to_gl<globals::index_gl>(dst_block),
+        .tokens = kittens::py::tensor_to_gl<globals::tokens_gl>(tokens),
+        .recv_buffer = globals::recv_buffer_gl{recv_buffer_data, nullptr, static_cast<size_t>(1), static_cast<size_t>(recv_buffer.size(0)), static_cast<size_t>(recv_buffer.size(1))},
+        .schedule_src_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_token_idx),
+        .schedule_dst_rank = kittens::py::tensor_to_gl<globals::index_gl>(schedule_dst_rank),
+        .schedule_dst_block_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_dst_block_idx),
     };
 
     kittens::py::launch_kernel<config, globals, dispatch_kernel>(G);
 }
 
 PYBIND11_MODULE(_C, m) {
-    m.def("dispatch", &dispatch, "MoE reorganize-and-dispatch (TMA 128x128 tile push over NVLink)",
-          pybind11::arg("send"), pybind11::arg("recv"), pybind11::arg("recv_ptrs"), pybind11::arg("dst_rank"), pybind11::arg("dst_block"));
+    m.def("dispatch", &dispatch, "MoE gather-and-dispatch (TMA vector gather -> single 128x128 token_tile push over NVLink)",
+          pybind11::arg("tokens"), pybind11::arg("recv_buffer"), pybind11::arg("recv_buffer_ptrs"), 
+          pybind11::arg("schedule_src_token_idx"), pybind11::arg("schedule_dst_rank"), pybind11::arg("schedule_dst_block_idx"));
 }
