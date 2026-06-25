@@ -11,6 +11,70 @@ How to run:
 
 Local sanity check:
     torchrun --nproc_per_node=4 011-nvl72-bandwidth.py
+
+Results:
+
+=== mode: copy-engine ===
+dst   node  locality     time(ms)     BW(GB/s)
+----  ----  -----------  -----------  ---------
+   0     0  self               3.151    3173.30
+   1     0  intra-node        13.767     726.39
+   2     0  intra-node        13.765     726.47
+   3     0  intra-node        13.765     726.47
+   4     1  inter-node        13.756     726.93
+   5     1  inter-node        13.767     726.37
+   6     1  inter-node        13.767     726.40
+   7     1  inter-node        13.749     727.33
+   8     2  inter-node        13.774     726.02
+   9     2  inter-node        13.758     726.87
+  10     2  inter-node        13.766     726.43
+  11     2  inter-node        13.764     726.54
+  12     3  inter-node        13.767     726.40
+  13     3  inter-node        13.757     726.89
+  14     3  inter-node        13.770     726.22
+  15     3  inter-node        13.770     726.19
+
+
+=== mode: tma ===
+dst   node  locality     time(ms)     BW(GB/s)
+----  ----  -----------  -----------  ---------
+   0     0  self               2.993    3340.63
+   1     0  intra-node        14.939     669.40
+   2     0  intra-node        14.939     669.39
+   3     0  intra-node        14.939     669.38
+   4     1  inter-node        14.938     669.43
+   5     1  inter-node        14.939     669.41
+   6     1  inter-node        14.938     669.41
+   7     1  inter-node        14.938     669.44
+   8     2  inter-node        14.938     669.42
+   9     2  inter-node        14.939     669.39
+  10     2  inter-node        14.940     669.36
+  11     2  inter-node        14.938     669.42
+  12     3  inter-node        14.938     669.41
+  13     3  inter-node        14.939     669.39
+  14     3  inter-node        14.938     669.43
+  15     3  inter-node        14.938     669.43
+
+
+=== mode: ld/st ===
+dst   node  locality     time(ms)     BW(GB/s)
+----  ----  -----------  -----------  ---------
+   0     0  self               5.190    1926.67
+   1     0  intra-node        18.188     549.82
+   2     0  intra-node        18.254     547.81
+   3     0  intra-node        18.291     546.71
+   4     1  inter-node        18.246     548.08
+   5     1  inter-node        18.213     549.06
+   6     1  inter-node        18.190     549.75
+   7     1  inter-node        18.195     549.60
+   8     2  inter-node        18.265     547.49
+   9     2  inter-node        18.330     545.55
+  10     2  inter-node        18.206     549.27
+  11     2  inter-node        18.243     548.14
+  12     3  inter-node        18.281     547.00
+  13     3  inter-node        18.213     549.07
+  14     3  inter-node        18.244     548.13
+  15     3  inter-node        18.205     549.29
 """
 
 import gc
