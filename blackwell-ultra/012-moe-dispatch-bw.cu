@@ -3,6 +3,8 @@
 
 using namespace kittens;
 
+namespace dispatcher {
+
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int MIN_BLOCKS_PER_SM = 6;
@@ -89,8 +91,10 @@ void dispatch(
     kittens::py::launch_kernel<config, globals, dispatch_kernel>(G);
 }
 
+} // namespace dispatcher
+
 PYBIND11_MODULE(_C, m) {
-    m.def("dispatch", &dispatch, "MoE gather-and-dispatch (local gather -> push over NVLink)",
+    m.def("dispatch", &dispatcher::dispatch, "MoE gather-and-dispatch (local gather -> push over NVLink)",
           pybind11::arg("tokens"), pybind11::arg("recv_buffer"), pybind11::arg("recv_buffer_ptrs"), 
           pybind11::arg("schedule_src_token_idx"), pybind11::arg("schedule_dst_rank"), pybind11::arg("schedule_dst_token_idx"));
 }
