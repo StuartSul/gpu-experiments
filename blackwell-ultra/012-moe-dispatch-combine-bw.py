@@ -143,24 +143,35 @@ def main():
     dist.all_gather(stats_all, stats)
 
     if rank == 0:
-        print(f"correctness: {'PASSED' if int(errors.item()) == 0 else 'FAILED (' + str(int(errors.item())) + ' mismatches)'}\n")
-        print("rank  tokens  local  remote   time(ms)  sched(ms)  total(GB/s)  remote(GB/s)")
-        print("----  ------  -----  ------  ---------  ---------  -----------  ------------")
-        max_seconds = 0.0
+        dispatch_ok = int(dispatch_errors.item()) == 0
+        combine_ok = int(combine_errors.item()) == 0
+        print(f"dispatch correctness: {'PASSED' if dispatch_ok else 'FAILED (' + str(int(dispatch_errors.item())) + ' mismatches)'}")
+        print(f"combine  correctness: {'PASSED' if combine_ok else 'FAILED (' + str(int(combine_errors.item())) + ' mismatches)'}\n")
+        print("rank  tokens  local  remote  disp(ms)  total(GB/s)  remote(GB/s)  comb(ms)  total(GB/s)  remote(GB/s)  sched(ms)")
+        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------")
+        max_disp_s = 0.0
+        max_comb_s = 0.0
         sum_remote_bytes = 0.0
         sum_total_bytes = 0.0
         for rank, stats in enumerate(stats_all):
-            nt, lt, rt, bt, br, dms, sms = stats.tolist()
-            seconds = dms / 1000.0
-            print(f"{rank:>4}  {int(nt):>6}  {int(lt):>5}  {int(rt):>6}  {dms:>9.3f}  {sms:>9.4f}  "
-                  f"{(bt / GiB) / seconds:>11.2f}  {(br / GiB) / seconds:>12.2f}")
-            max_seconds = max(max_seconds, seconds)
+            nt, lt, rt, bt, br, dms, cms, sms = stats.tolist()
+            disp_s = dms / 1000.0
+            comb_s = cms / 1000.0
+            print(f"{int(rank):>4}  {int(nt):>6}  {int(lt):>5}  {int(rt):>6}  "
+                  f"{dms:>8.3f}  {(bt / GiB) / disp_s:>11.2f}  {(br / GiB) / disp_s:>12.2f}  "
+                  f"{cms:>8.3f}  {(bt / GiB) / comb_s:>11.2f}  {(br / GiB) / comb_s:>12.2f}  "
+                  f"{sms:>9.4f}")
+            max_disp_s = max(max_disp_s, disp_s)
+            max_comb_s = max(max_comb_s, comb_s)
             sum_remote_bytes += br
             sum_total_bytes += bt
-        print("----  ------  -----  ------  ---------  ---------  -----------  ------------")
-        print(f"aggregate (sum bytes / slowest rank): "
-              f"total {(sum_total_bytes / GiB) / max_seconds:.2f} GB/s, "
-              f"remote {(sum_remote_bytes / GiB) / max_seconds:.2f} GB/s", flush=True)
+        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------")
+        print(f"dispatch (sum bytes / slowest rank): "
+              f"total {(sum_total_bytes / GiB) / max_disp_s:.2f} GB/s, "
+              f"remote {(sum_remote_bytes / GiB) / max_disp_s:.2f} GB/s")
+        print(f"combine  (sum bytes / slowest rank): "
+              f"total {(sum_total_bytes / GiB) / max_comb_s:.2f} GB/s, "
+              f"remote {(sum_remote_bytes / GiB) / max_comb_s:.2f} GB/s", flush=True)
 
     dist.barrier()
     del dhdl
