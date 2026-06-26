@@ -9,7 +9,8 @@ namespace scheduler {
 
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int NUM_THREADS = 256;
+    static constexpr int NUM_THREADS = 1024;
+    static constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
 };
 
 struct globals {
@@ -20,10 +21,9 @@ struct globals {
     index_gl schedule_src_rank;      // (capacity,)
     index_gl schedule_src_token_idx; // (capacity,)
     index_gl tokens_per_src_rank;    // (world_size,) must be zero-initialized
-    index_gl cursor;                 // (world_size,) must be zero-initialized
 
-    int first_expert;                // inclusive
-    int last_expert;                 // exclusive
+    int rank;                        // this (destination) rank
+    int num_local_experts;           // experts hosted per rank
 
     __host__ inline dim3 grid() const {
         const int blocks = std::clamp(static_cast<int>((topk.numel() + config::NUM_THREADS - 1) / config::NUM_THREADS), 1, 2048);
@@ -41,6 +41,8 @@ __device__ inline void count_kernel(const globals &G) {
     const int topk = G.topk.cols();
     const int rank_stride = num_local_tokens * topk;
     const int num_global_tokens = world_size * rank_stride;
+    const int first_expert = G.rank * G.num_local_experts;
+    const int last_expert = first_expert + G.num_local_experts;
 
     extern __shared__ int tokens_per_src_rank[]; // (world_size,)
     for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
@@ -52,7 +54,7 @@ __device__ inline void count_kernel(const globals &G) {
         const int src_rank = idx / rank_stride;
         const int local_topk_idx = idx - src_rank * rank_stride;
         const int expert_idx = G.topk[{src_rank, local_topk_idx / topk, local_topk_idx % topk}];
-        if (expert_idx >= G.first_expert && expert_idx < G.last_expert)
+        if (expert_idx >= first_expert && expert_idx < last_expert)
             atomicAdd(&tokens_per_src_rank[src_rank], 1);
     }
     __syncthreads();
@@ -62,37 +64,66 @@ __device__ inline void count_kernel(const globals &G) {
             atomicAdd(&G.tokens_per_src_rank[{rank}], tokens_per_src_rank[rank]);
 }
 
-// Stage 2: scatter each qualifying route to its round-robin row (outputs pre-filled with -1 by host).
-__device__ inline void place_kernel(const globals &G) {
+// Stage 2: Schedule each source token
+__device__ inline void schedule_kernel(const globals &G) {
     const int world_size = G.topk.depth();
     const int num_local_tokens = G.topk.rows();
     const int topk = G.topk.cols();
     const int rank_stride = num_local_tokens * topk;
-    const int num_global_tokens = world_size * rank_stride;
+    const int first_expert = G.rank * G.num_local_experts;
+    const int last_expert = first_expert + G.num_local_experts;
 
     extern __shared__ int tokens_per_src_rank[]; // (world_size,)
     for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
         tokens_per_src_rank[rank] = G.tokens_per_src_rank[{rank}];
     __syncthreads();
 
-    const int grid_stride = gridDim.x * blockDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_global_tokens; idx += grid_stride) {
-        const int src_rank = idx / rank_stride;
-        const int local_topk_idx = idx - src_rank * rank_stride;
-        const int src_token_idx = local_topk_idx / topk;
-        const int expert_idx = G.topk[{src_rank, src_token_idx, local_topk_idx % topk}];
-        if (expert_idx >= G.first_expert && expert_idx < G.last_expert) {
-            const int j = atomicAdd(&G.cursor[{src_rank}], 1); // this route is source rank src_rank'src_rank (j+1)-th
-            int row = 0;
-            for (int rank = 0; rank < world_size; ++rank) {
-                const int num_tokens = tokens_per_src_rank[rank];
-                row += (num_tokens < j ? num_tokens : j);                 // emits from rank during passes 0..j-1
-                row += (rank < src_rank && num_tokens > j) ? 1 : 0;   // emits from rank before us during pass j
-            }
-            // TODO: prevent capacity overflow
-            G.schedule_src_rank[{row}] = src_rank;
-            G.schedule_src_token_idx[{row}] = src_token_idx;
+    __shared__ int cumulative_tokens_from_src_rank[config::NUM_WARPS];
+
+    for (int src_rank = blockIdx.x; src_rank < world_size; src_rank += gridDim.x) {
+        // Step 1. Count the number of tokens routed from this source rank in parallel
+        int _tokens_from_src_rank = 0;
+        for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
+            const int expert_idx = G.topk[{src_rank, local_topk_idx / topk, local_topk_idx % topk}];
+            _tokens_from_src_rank += (expert_idx >= first_expert && expert_idx < last_expert) ? 1 : 0;
         }
+        // Step 2. Cumulative sum within a warp: thread i's `inclusive` will have the sum from thraed 0 to thread i
+        int inclusive = _tokens_from_src_rank;
+        for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
+            const int n = __shfl_up_sync(0xffffffff, inclusive, offset);
+            if (warp::laneid() >= offset) inclusive += n;
+        }
+        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_src_rank[warp] = inclusive;
+        __syncthreads();
+        // Step 3: Cumulative sum across warps
+        if (warpid() == 0) {
+            int warp_total = (warp::laneid() < config::NUM_WARPS) ? cumulative_tokens_from_src_rank[warp::laneid()] : 0;
+            for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
+                const int n = __shfl_up_sync(0xffffffff, warp_total, offset);
+                if (warp::laneid() >= offset) warp_total += n;
+            }
+            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_src_rank[warp::laneid()] = t;
+        }
+        __syncthreads();
+        int j = (warp == 0 ? 0 : cumulative_tokens_from_src_rank[warp - 1]) + inclusive - _tokens_from_src_rank;
+
+        for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
+            const int src_token_idx = local_topk_idx / topk;
+            const int expert_idx = G.topk[{src_rank, src_token_idx, local_topk_idx % topk}];
+            if (expert_idx >= first_expert && expert_idx < last_expert) {
+                int dst_token_idx = 0;
+                for (int rank = 0; rank < world_size; ++rank) {
+                    const int num_tokens = tokens_per_src_rank[rank];
+                    dst_token_idx += min(num_tokens, j);
+                    dst_token_idx += (rank < src_rank && num_tokens > j) ? 1 : 0;
+                }
+                // TODO: prevent capacity overflow
+                G.schedule_src_rank[{dst_token_idx}] = src_rank;
+                G.schedule_src_token_idx[{dst_token_idx}] = src_token_idx;
+                ++j;
+            }
+        }
+        __syncthreads(); // before the next source rank reuses cumulative_tokens_from_src_rank
     }
 }
 
@@ -106,7 +137,6 @@ void schedule(
     const int world_size = static_cast<int>(topk_all.size(0));
     const auto i32 = topk_all.options().dtype(at::kInt);
     at::Tensor tokens_per_src_rank = at::zeros({world_size}, i32);
-    at::Tensor cursor = at::zeros({world_size}, i32);
     schedule_src_rank.fill_(-1);
     schedule_src_token_idx.fill_(-1);
 
@@ -115,13 +145,12 @@ void schedule(
         .schedule_src_rank = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_rank),
         .schedule_src_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_token_idx),
         .tokens_per_src_rank = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_src_rank),
-        .cursor = kittens::py::tensor_to_gl<globals::index_gl>(cursor),
-        .first_expert = rank * num_local_experts,
-        .last_expert = rank * num_local_experts + num_local_experts,
+        .rank = rank,
+        .num_local_experts = num_local_experts,
     };
 
     kittens::py::launch_kernel<config, globals, count_kernel>(G);
-    kittens::py::launch_kernel<config, globals, place_kernel>(G);
+    kittens::py::launch_kernel<config, globals, schedule_kernel>(G);
 }
 
 } // namespace scheduler
