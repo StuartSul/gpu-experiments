@@ -173,13 +173,13 @@ namespace dispatcher {
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 128;
+    static constexpr int NUM_THREADS = 64;
 };
 
 struct globals {
     static constexpr int NUM_DEVICES = 4;
-    static constexpr int ROW_BLOCK_SIZE = 128;
-    static constexpr int COL_BLOCK_SIZE = 128;
+    static constexpr int ROW_BLOCK_SIZE = 64;
+    static constexpr int COL_BLOCK_SIZE = 256;
 
     using token_tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE, false>;
     using token_vec = sv_bf<COL_BLOCK_SIZE>;
@@ -263,13 +263,13 @@ namespace combiner {
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 128;
+    static constexpr int NUM_THREADS = 64;
 };
 
 struct globals {
     static constexpr int NUM_DEVICES = 4;
-    static constexpr int ROW_BLOCK_SIZE = 128;
-    static constexpr int COL_BLOCK_SIZE = 128;
+    static constexpr int ROW_BLOCK_SIZE = 64;
+    static constexpr int COL_BLOCK_SIZE = 256;
 
     using token_tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE, false>;
     using token_vec = sv_bf<COL_BLOCK_SIZE>;
