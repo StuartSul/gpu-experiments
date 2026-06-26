@@ -17,10 +17,10 @@ struct globals {
     using topk_gl = gl<int, 1, -1, -1, -1>; // (world_size, num_local_tokens, topk)
     using index_gl = gl<int, 1, 1, 1, -1>;  // (capacity,)
 
-    topk_gl topk;                    // (world_size, num_local_tokens, topk)
-    index_gl schedule_src_rank;      // (capacity,)
-    index_gl schedule_src_token_idx; // (capacity,)
-    index_gl tokens_per_src_rank;    // (world_size,) must be zero-initialized
+    topk_gl topk;                      // (world_size, num_local_tokens, topk)
+    index_gl schedule_peer_rank;       // (capacity,)
+    index_gl schedule_peer_token_idx;  // (capacity,)
+    index_gl tokens_per_peer_rank;     // (world_size,) must be zero-initialized
 
     int rank;                        // this (destination) rank
     int num_local_experts;           // experts hosted per rank
@@ -44,27 +44,27 @@ __device__ inline void count_kernel(const globals &G) {
     const int first_expert = G.rank * G.num_local_experts;
     const int last_expert = first_expert + G.num_local_experts;
 
-    extern __shared__ int tokens_per_src_rank[]; // (world_size,)
+    extern __shared__ int tokens_per_peer_rank[]; // (world_size,)
     for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
-        tokens_per_src_rank[rank] = 0;
+        tokens_per_peer_rank[rank] = 0;
     __syncthreads();
 
     const int grid_stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_global_tokens; idx += grid_stride) {
-        const int src_rank = idx / rank_stride;
-        const int local_topk_idx = idx - src_rank * rank_stride;
-        const int expert_idx = G.topk[{src_rank, local_topk_idx / topk, local_topk_idx % topk}];
+        const int peer_rank = idx / rank_stride;
+        const int local_topk_idx = idx - peer_rank * rank_stride;
+        const int expert_idx = G.topk[{peer_rank, local_topk_idx / topk, local_topk_idx % topk}];
         if (expert_idx >= first_expert && expert_idx < last_expert)
-            atomicAdd(&tokens_per_src_rank[src_rank], 1);
+            atomicAdd(&tokens_per_peer_rank[peer_rank], 1);
     }
     __syncthreads();
 
     for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
-        if (tokens_per_src_rank[rank] != 0)
-            atomicAdd(&G.tokens_per_src_rank[{rank}], tokens_per_src_rank[rank]);
+        if (tokens_per_peer_rank[rank] != 0)
+            atomicAdd(&G.tokens_per_peer_rank[{rank}], tokens_per_peer_rank[rank]);
 }
 
-// Stage 2: Schedule each source token
+// Stage 2: Schedule each token
 __device__ inline void schedule_kernel(const globals &G) {
     const int world_size = G.topk.depth();
     const int num_local_tokens = G.topk.rows();
@@ -73,77 +73,77 @@ __device__ inline void schedule_kernel(const globals &G) {
     const int first_expert = G.rank * G.num_local_experts;
     const int last_expert = first_expert + G.num_local_experts;
 
-    extern __shared__ int tokens_per_src_rank[]; // (world_size,)
+    extern __shared__ int tokens_per_peer_rank[]; // (world_size,)
     for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
-        tokens_per_src_rank[rank] = G.tokens_per_src_rank[{rank}];
+        tokens_per_peer_rank[rank] = G.tokens_per_peer_rank[{rank}];
     __syncthreads();
 
-    __shared__ int cumulative_tokens_from_src_rank[config::NUM_WARPS];
+    __shared__ int cumulative_tokens_from_peer_rank[config::NUM_WARPS];
 
-    for (int src_rank = blockIdx.x; src_rank < world_size; src_rank += gridDim.x) {
-        // Step 1. Count the number of tokens routed from this source rank in parallel
-        int _tokens_from_src_rank = 0;
+    for (int peer_rank = blockIdx.x; peer_rank < world_size; peer_rank += gridDim.x) {
+        // Step 1. Count the number of tokens routed from this peer rank in parallel
+        int _tokens_from_peer_rank = 0;
         for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
-            const int expert_idx = G.topk[{src_rank, local_topk_idx / topk, local_topk_idx % topk}];
-            _tokens_from_src_rank += (expert_idx >= first_expert && expert_idx < last_expert) ? 1 : 0;
+            const int expert_idx = G.topk[{peer_rank, local_topk_idx / topk, local_topk_idx % topk}];
+            _tokens_from_peer_rank += (expert_idx >= first_expert && expert_idx < last_expert) ? 1 : 0;
         }
         // Step 2. Cumulative sum within a warp: thread i's `inclusive` will have the sum from thraed 0 to thread i
-        int inclusive = _tokens_from_src_rank;
+        int inclusive = _tokens_from_peer_rank;
         for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
             const int n = __shfl_up_sync(0xffffffff, inclusive, offset);
             if (warp::laneid() >= offset) inclusive += n;
         }
-        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_src_rank[warpid()] = inclusive;
+        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_peer_rank[warpid()] = inclusive;
         __syncthreads();
         // Step 3: Cumulative sum across warps
         if (warpid() == 0) {
-            int warp_total = (warp::laneid() < config::NUM_WARPS) ? cumulative_tokens_from_src_rank[warp::laneid()] : 0;
+            int warp_total = (warp::laneid() < config::NUM_WARPS) ? cumulative_tokens_from_peer_rank[warp::laneid()] : 0;
             for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
                 const int n = __shfl_up_sync(0xffffffff, warp_total, offset);
                 if (warp::laneid() >= offset) warp_total += n;
             }
-            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_src_rank[warp::laneid()] = warp_total;
+            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_peer_rank[warp::laneid()] = warp_total;
         }
         __syncthreads();
-        int j = (warpid() == 0 ? 0 : cumulative_tokens_from_src_rank[warpid() - 1]) + inclusive - _tokens_from_src_rank;
+        int j = (warpid() == 0 ? 0 : cumulative_tokens_from_peer_rank[warpid() - 1]) + inclusive - _tokens_from_peer_rank;
 
         for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
-            const int src_token_idx = local_topk_idx / topk;
-            const int expert_idx = G.topk[{src_rank, src_token_idx, local_topk_idx % topk}];
+            const int peer_token_idx = local_topk_idx / topk;
+            const int expert_idx = G.topk[{peer_rank, peer_token_idx, local_topk_idx % topk}];
             if (expert_idx >= first_expert && expert_idx < last_expert) {
                 int dst_token_idx = 0;
                 for (int rank = 0; rank < world_size; ++rank) {
-                    const int num_tokens = tokens_per_src_rank[rank];
+                    const int num_tokens = tokens_per_peer_rank[rank];
                     dst_token_idx += min(num_tokens, j);
-                    dst_token_idx += (rank < src_rank && num_tokens > j) ? 1 : 0;
+                    dst_token_idx += (rank < peer_rank && num_tokens > j) ? 1 : 0;
                 }
                 // TODO: prevent capacity overflow
-                G.schedule_src_rank[{dst_token_idx}] = src_rank;
-                G.schedule_src_token_idx[{dst_token_idx}] = src_token_idx;
+                G.schedule_peer_rank[{dst_token_idx}] = peer_rank;
+                G.schedule_peer_token_idx[{dst_token_idx}] = peer_token_idx;
                 ++j;
             }
         }
-        __syncthreads(); // before the next source rank reuses cumulative_tokens_from_src_rank
+        __syncthreads(); // before the next peer rank reuses cumulative_tokens_from_peer_rank
     }
 }
 
 void schedule(
     const at::Tensor &topk_all,
-    const at::Tensor &schedule_src_rank,
-    const at::Tensor &schedule_src_token_idx,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
     int rank,
     int num_local_experts
 ) {
     const int world_size = static_cast<int>(topk_all.size(0));
-    at::Tensor tokens_per_src_rank = at::zeros({world_size}, topk_all.options().dtype(at::kInt));
-    schedule_src_rank.fill_(-1);
-    schedule_src_token_idx.fill_(-1);
+    at::Tensor tokens_per_peer_rank = at::zeros({world_size}, topk_all.options().dtype(at::kInt));
+    schedule_peer_rank.fill_(-1);
+    schedule_peer_token_idx.fill_(-1);
 
     globals G {
         .topk = kittens::py::tensor_to_gl<globals::topk_gl>(topk_all),
-        .schedule_src_rank = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_rank),
-        .schedule_src_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_token_idx),
-        .tokens_per_src_rank = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_src_rank),
+        .schedule_peer_rank = kittens::py::tensor_to_gl<globals::index_gl>(schedule_peer_rank),
+        .schedule_peer_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_peer_token_idx),
+        .tokens_per_peer_rank = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_peer_rank),
         .rank = rank,
         .num_local_experts = num_local_experts,
     };
@@ -328,9 +328,12 @@ void combine(
 
 PYBIND11_MODULE(_C, m) {
     m.def("schedule", &scheduler::schedule, "Build this rank's dispatch schedule from all-gathered topk routing",
-          pybind11::arg("topk_all"), pybind11::arg("schedule_src_rank"), pybind11::arg("schedule_src_token_idx"),
+          pybind11::arg("topk_all"), pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("rank"), pybind11::arg("num_local_experts"));
     m.def("dispatch", &dispatcher::dispatch, "MoE pull-based dispatch",
           pybind11::arg("send_buffer"), pybind11::arg("send_buffer_ptrs"), pybind11::arg("recv_buffer"),
           pybind11::arg("schedule_src_rank"), pybind11::arg("schedule_src_token_idx"));
+    m.def("combine", &combiner::combine, "MoE push-based combine",
+          pybind11::arg("send_buffer"), pybind11::arg("recv_buffer"), pybind11::arg("recv_buffer_ptrs"),
+          pybind11::arg("schedule_dst_rank"), pybind11::arg("schedule_dst_token_idx"));
 }
