@@ -19,7 +19,7 @@ struct globals {
 
     topk_gl topk;                      // (world_size, num_local_tokens, topk)
     index_gl schedule_peer_rank;       // (capacity,)
-    index_gl schedule_peer_token_idx;  // (capacity,)
+    index_gl schedule_peer_token_idx;  // (capacity,) original_token_idx * topk + k
     index_gl tokens_per_peer_rank;     // (world_size,) must be zero-initialized
 
     int rank;                        // this (destination) rank
@@ -52,8 +52,8 @@ __device__ inline void count_kernel(const globals &G) {
     const int grid_stride = gridDim.x * blockDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_global_tokens; idx += grid_stride) {
         const int peer_rank = idx / rank_stride;
-        const int local_topk_idx = idx - peer_rank * rank_stride;
-        const int expert_idx = G.topk[{peer_rank, local_topk_idx / topk, local_topk_idx % topk}];
+        const int peer_token_idx = idx - peer_rank * rank_stride;
+        const int expert_idx = G.topk[{peer_rank, peer_token_idx / topk, peer_token_idx % topk}];
         if (expert_idx >= first_expert && expert_idx < last_expert)
             atomicAdd(&tokens_per_peer_rank[peer_rank], 1);
     }
@@ -83,8 +83,8 @@ __device__ inline void schedule_kernel(const globals &G) {
     for (int peer_rank = blockIdx.x; peer_rank < world_size; peer_rank += gridDim.x) {
         // Step 1. Count the number of tokens routed from this peer rank in parallel
         int _tokens_from_peer_rank = 0;
-        for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
-            const int expert_idx = G.topk[{peer_rank, local_topk_idx / topk, local_topk_idx % topk}];
+        for (int peer_token_idx = threadIdx.x; peer_token_idx < rank_stride; peer_token_idx += blockDim.x) {
+            const int expert_idx = G.topk[{peer_rank, peer_token_idx / topk, peer_token_idx % topk}];
             _tokens_from_peer_rank += (expert_idx >= first_expert && expert_idx < last_expert) ? 1 : 0;
         }
         // Step 2. Cumulative sum within a warp: thread i's `inclusive` will have the sum from thraed 0 to thread i
@@ -107,9 +107,9 @@ __device__ inline void schedule_kernel(const globals &G) {
         __syncthreads();
         int j = (warpid() == 0 ? 0 : cumulative_tokens_from_peer_rank[warpid() - 1]) + inclusive - _tokens_from_peer_rank;
 
-        for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
-            const int peer_token_idx = local_topk_idx / topk;
-            const int expert_idx = G.topk[{peer_rank, peer_token_idx, local_topk_idx % topk}];
+        for (int peer_token_idx = threadIdx.x; peer_token_idx < rank_stride; peer_token_idx += blockDim.x) {
+            const int orig_token_idx = peer_token_idx / topk;
+            const int expert_idx = G.topk[{peer_rank, orig_token_idx, peer_token_idx % topk}];
             if (expert_idx >= first_expert && expert_idx < last_expert) {
                 int dst_token_idx = 0;
                 for (int rank = 0; rank < world_size; ++rank) {
@@ -119,7 +119,7 @@ __device__ inline void schedule_kernel(const globals &G) {
                 }
                 // TODO: prevent capacity overflow
                 G.schedule_peer_rank[{dst_token_idx}] = peer_rank;
-                G.schedule_peer_token_idx[{dst_token_idx}] = peer_token_idx;
+                G.schedule_peer_token_idx[{dst_token_idx}] = peer_token_idx; // original_token_idx * topk + k
                 ++j;
             }
         }
@@ -137,7 +137,6 @@ void schedule(
     const int world_size = static_cast<int>(topk_all.size(0));
     at::Tensor tokens_per_peer_rank = at::zeros({world_size}, topk_all.options().dtype(at::kInt));
     schedule_peer_rank.fill_(-1);
-    schedule_peer_token_idx.fill_(-1);
 
     globals G {
         .topk = kittens::py::tensor_to_gl<globals::topk_gl>(topk_all),
@@ -177,7 +176,9 @@ struct globals {
     send_buffer_pgl send_buffer;     // (num_local_tokens, H)
     recv_buffer_gl recv_buffer;      // (capacity, H)
     index_gl schedule_src_rank;      // (capacity,)
-    index_gl schedule_src_token_idx; // (capacity,)
+    index_gl schedule_src_token_idx; // (capacity,) original_token_idx * topk + k
+
+    int topk;
 
     __host__ inline dim3 grid() const {
         return dim3(recv_buffer.cols() / COL_BLOCK_SIZE, recv_buffer.rows() / ROW_BLOCK_SIZE);
@@ -194,7 +195,7 @@ __device__ inline void dispatch_kernel(const globals &G) {
 
     const int dst_row_idx = row_block_idx * globals::ROW_BLOCK_SIZE + tid;
     const int src_rank = G.schedule_src_rank[{dst_row_idx}];
-    const int src_row_idx = G.schedule_src_token_idx[{dst_row_idx}];
+    const int src_row_idx = G.schedule_src_token_idx[{dst_row_idx}] / G.topk;
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator((int*)&__shm[0]);
@@ -202,7 +203,7 @@ __device__ inline void dispatch_kernel(const globals &G) {
     globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * globals::COL_BLOCK_SIZE]);
 
     __shared__ semaphore inputs_arrived;
-    const int num_valid = __syncthreads_count(src_row_idx >= 0);
+    const int num_valid = __syncthreads_count(src_rank >= 0);
     if (num_valid == 0) return; // whole recv block is padding
     if (tid == 0) {
         init_semaphore(inputs_arrived, 0, 1);
@@ -210,10 +211,10 @@ __device__ inline void dispatch_kernel(const globals &G) {
     }
     __syncthreads();
 
-    if (src_row_idx >= 0)
+    if (src_rank >= 0)
         tma::load_async(token_vec, G.send_buffer[src_rank], {src_row_idx, col_block_idx}, inputs_arrived);
     wait(inputs_arrived, 0);
-    if (src_row_idx >= 0)
+    if (src_rank >= 0)
         tma::store_async(G.recv_buffer, token_vec, {dst_row_idx, col_block_idx});
 }
 
@@ -222,7 +223,8 @@ void dispatch(
     const std::vector<int64_t> &send_buffer_ptrs,
     const at::Tensor &recv_buffer,
     const at::Tensor &schedule_src_rank,
-    const at::Tensor &schedule_src_token_idx
+    const at::Tensor &schedule_src_token_idx,
+    int topk
 ) {
     bf16 *send_buffer_data[globals::NUM_DEVICES];
     for (int i = 0; i < globals::NUM_DEVICES; ++i)
@@ -233,6 +235,7 @@ void dispatch(
         .recv_buffer = kittens::py::tensor_to_gl<globals::recv_buffer_gl>(recv_buffer),
         .schedule_src_rank = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_rank),
         .schedule_src_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_src_token_idx),
+        .topk = topk,
     };
 
     kittens::py::launch_kernel<config, globals, dispatch_kernel>(G);
@@ -288,7 +291,7 @@ __device__ inline void combine_kernel(const globals &G) {
     globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * globals::COL_BLOCK_SIZE]);
 
     __shared__ semaphore inputs_arrived;
-    const int num_valid = __syncthreads_count(dst_row_idx >= 0);
+    const int num_valid = __syncthreads_count(dst_rank >= 0);
     if (num_valid == 0) return; // whole send block is padding
     if (tid == 0) {
         init_semaphore(inputs_arrived, 0, 1);
@@ -296,10 +299,10 @@ __device__ inline void combine_kernel(const globals &G) {
     }
     __syncthreads();
 
-    if (dst_row_idx >= 0)
+    if (dst_rank >= 0)
         tma::load_async(token_vec, G.send_buffer, {src_row_idx, col_block_idx}, inputs_arrived);
     wait(inputs_arrived, 0);
-    if (dst_row_idx >= 0)
+    if (dst_rank >= 0)
         tma::store_async(G.recv_buffer[dst_rank], token_vec, {dst_row_idx, col_block_idx});
 }
 
@@ -332,7 +335,7 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("rank"), pybind11::arg("num_local_experts"));
     m.def("dispatch", &dispatcher::dispatch, "MoE pull-based dispatch",
           pybind11::arg("send_buffer"), pybind11::arg("send_buffer_ptrs"), pybind11::arg("recv_buffer"),
-          pybind11::arg("schedule_src_rank"), pybind11::arg("schedule_src_token_idx"));
+          pybind11::arg("schedule_src_rank"), pybind11::arg("schedule_src_token_idx"), pybind11::arg("topk"));
     m.def("combine", &combiner::combine, "MoE push-based combine",
           pybind11::arg("send_buffer"), pybind11::arg("recv_buffer"), pybind11::arg("recv_buffer_ptrs"),
           pybind11::arg("schedule_dst_rank"), pybind11::arg("schedule_dst_token_idx"));

@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _C import dispatch, schedule
+from _C import dispatch, schedule, combine
 
 
 NUM_LOCAL_TOKENS = 7168
@@ -63,32 +63,32 @@ def main():
     topk_ids = topk_ids.to(torch.int32)
     topk_ids_all = torch.empty(world_size, NUM_LOCAL_TOKENS, TOPK, dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-    schedule_src_rank = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
-    schedule_src_token_idx = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
+    schedule_peer_rank = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
+    schedule_peer_token_idx = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
 
     # Scheduler benchmark
     for _ in range(WARMUP_ITERS):
-        schedule(topk_ids_all, schedule_src_rank, schedule_src_token_idx, rank, NUM_LOCAL_EXPERTS)
+        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, rank, NUM_LOCAL_EXPERTS)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        schedule(topk_ids_all, schedule_src_rank, schedule_src_token_idx, rank, NUM_LOCAL_EXPERTS)
+        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, rank, NUM_LOCAL_EXPERTS)
     end.record()
     torch.cuda.synchronize()
     scheduler_ms = start.elapsed_time(end) / TIMED_ITERS
 
     # Dispatcher benchmark
     for _ in range(WARMUP_ITERS):
-        dispatch(tokens, tokens_ptrs, recv2d, schedule_src_rank, schedule_src_token_idx)
+        dispatch(tokens, tokens_ptrs, recv2d, schedule_peer_rank, schedule_peer_token_idx, TOPK)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     dist.barrier()  # release all ranks together so the dispatch is genuinely concurrent
     start.record()
     for _ in range(TIMED_ITERS):
-        dispatch(tokens, tokens_ptrs, recv2d, schedule_src_rank, schedule_src_token_idx)
+        dispatch(tokens, tokens_ptrs, recv2d, schedule_peer_rank, schedule_peer_token_idx, TOPK)
     end.record()
     torch.cuda.synchronize()
     dispatcher_ms = start.elapsed_time(end) / TIMED_ITERS
