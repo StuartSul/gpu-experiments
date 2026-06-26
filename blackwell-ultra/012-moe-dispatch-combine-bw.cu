@@ -25,18 +25,10 @@ struct globals {
     index_gl tokens_per_expert_and_peer; // (num_local_experts * world_size,) per-(local_expert, peer_rank) token counts, must be zero-initialized
 
     int rank;                            // this (destination) rank
-
-    __host__ inline dim3 grid() const {
-        const int blocks = std::clamp(static_cast<int>((topk.numel() + config::NUM_THREADS - 1) / config::NUM_THREADS), 1, 2048);
-        return dim3(static_cast<unsigned int>(blocks));
-    }
-    __host__ inline int dynamic_shared_memory() const {
-        return static_cast<int>(tokens_per_expert_and_peer.cols() * sizeof(int));
-    }
 };
 
 // Stage 1: Count the number of tokens routed from each peer rank to each local expert
-__device__ inline void count_kernel(const globals &G) {
+__global__ void count_kernel(const __grid_constant__ globals G) {
     const int world_size = G.topk.depth();
     const int num_local_tokens = G.topk.rows();
     const int topk = G.topk.cols();
@@ -67,7 +59,7 @@ __device__ inline void count_kernel(const globals &G) {
 }
 
 // Stage 2: Pad each expert's total token count by EXPERT_PADDING
-__global__ void offsets_kernel(globals G) {
+__global__ void pad_kernel(const __grid_constant__ globals G) {
     const int local_expert = blockIdx.x;
     const int world_size = G.topk.depth();
     int num_tokens = 0;
@@ -77,14 +69,13 @@ __global__ void offsets_kernel(globals G) {
 }
 
 // Stage 3: Schedule each token into its expert's 256-padded segment
-__device__ inline void scatter_kernel(const globals &G) {
+__global__ void schedule_kernel(const __grid_constant__ globals G) {
     const int world_size = G.topk.depth();
     const int num_local_tokens = G.topk.rows();
     const int topk = G.topk.cols();
     const int rank_stride = num_local_tokens * topk;
     const int num_local_experts = G.tokens_per_expert.cols();
     const int first_expert = G.rank * num_local_experts;
-    const int capacity = G.schedule_peer_rank.cols();
 
     extern __shared__ int tokens_per_peer_rank[]; // (world_size,) this expert's per-peer-rank counts
     __shared__ int cumulative_tokens_from_peer_rank[config::NUM_WARPS];
@@ -169,9 +160,10 @@ void schedule(
         .rank = rank,
     };
 
-    kittens::py::launch_kernel<config, globals, count_kernel>(G);
-    offsets_kernel<<<num_local_experts, 1, 0, at::cuda::getCurrentCUDAStream()>>>(G);
-    kittens::py::launch_kernel<config, globals, scatter_kernel>(G);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    count_kernel<<<(G.topk.numel() + config::NUM_THREADS - 1) / config::NUM_THREADS, config::NUM_THREADS, num_local_experts * world_size * sizeof(int), stream>>>(G);
+    pad_kernel<<<num_local_experts, 1, 0, stream>>>(G);
+    schedule_kernel<<<num_local_experts * world_size, config::NUM_THREADS, world_size * sizeof(int), stream>>>(G);
 }
 
 } // namespace scheduler
