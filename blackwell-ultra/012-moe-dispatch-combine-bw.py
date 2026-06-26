@@ -54,6 +54,9 @@ def main():
     # Generate inputs and buffers
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
     router_logits = torch.randn(NUM_LOCAL_TOKENS, NUM_EXPERTS, generator=gen, device=device)
+    schedule_peer_rank = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
+    schedule_peer_token_idx = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
+    tokens_per_expert = torch.empty(NUM_LOCAL_EXPERTS, dtype=torch.int32, device=device)
     tokens = symm_mem.empty(NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     tokens.normal_(generator=gen)
     dhdl = symm_mem.rendezvous(tokens, dist.group.WORLD.group_name)
@@ -80,18 +83,16 @@ def main():
     topk_ids = topk_ids.to(torch.int32)
     topk_ids_all = torch.empty(world_size, NUM_LOCAL_TOKENS, TOPK, dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-    schedule_peer_rank = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
-    schedule_peer_token_idx = torch.empty((CAPACITY,), dtype=torch.int32, device=device)
 
     # Scheduler benchmark
     for _ in range(WARMUP_ITERS):
-        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, rank, NUM_LOCAL_EXPERTS)
+        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, rank)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, rank, NUM_LOCAL_EXPERTS)
+        schedule(topk_ids_all, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, rank)
     end.record()
     torch.cuda.synchronize()
     scheduler_ms = start.elapsed_time(end) / TIMED_ITERS
