@@ -1,7 +1,7 @@
 """
 To run:
     make
-    torchrun --nproc_per_node=4 012-moe-dispatch-bw.py
+    torchrun --nproc_per_node=4 012-moe-dispatch-combine-bw.py
 """
 
 import gc
