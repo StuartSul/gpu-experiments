@@ -266,7 +266,7 @@ struct globals {
     index_gl schedule_dst_token_idx; // (capacity,)
 
     __host__ inline dim3 grid() const {
-        return dim3(send_buffer_.cols() / COL_BLOCK_SIZE, send_buffer_.rows() / ROW_BLOCK_SIZE);
+        return dim3(send_buffer.cols() / COL_BLOCK_SIZE, send_buffer.rows() / ROW_BLOCK_SIZE);
     }
     __host__ inline int dynamic_shared_memory() const {
         return static_cast<int>(sizeof(token_tile) + 1024);
