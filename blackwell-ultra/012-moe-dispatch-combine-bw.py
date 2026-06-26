@@ -44,9 +44,13 @@ def main():
     router_logits = torch.randn(NUM_LOCAL_TOKENS, NUM_EXPERTS, generator=gen, device=device)
     tokens = symm_mem.empty(NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     tokens.normal_(generator=gen)
-    hdl = symm_mem.rendezvous(tokens, dist.group.WORLD.group_name)
-    tokens_ptrs = [hdl.buffer_ptrs[i] for i in range(world_size)]
-    recv2d = torch.zeros(CAPACITY, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dhdl = symm_mem.rendezvous(tokens, dist.group.WORLD.group_name)
+    tokens_ptrs = [dhdl.buffer_ptrs[i] for i in range(world_size)]
+    dispatch_recv = torch.zeros(CAPACITY, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    combine_recv = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    combine_recv.zero_()
+    chdl = symm_mem.rendezvous(combine_recv, dist.group.WORLD.group_name)
+    combine_recv_ptrs = [chdl.buffer_ptrs[i] for i in range(world_size)]
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -81,36 +85,59 @@ def main():
 
     # Dispatcher benchmark
     for _ in range(WARMUP_ITERS):
-        dispatch(tokens, tokens_ptrs, recv2d, schedule_peer_rank, schedule_peer_token_idx, TOPK)
+        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, TOPK)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     dist.barrier()  # release all ranks together so the dispatch is genuinely concurrent
     start.record()
     for _ in range(TIMED_ITERS):
-        dispatch(tokens, tokens_ptrs, recv2d, schedule_peer_rank, schedule_peer_token_idx, TOPK)
+        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, TOPK)
     end.record()
     torch.cuda.synchronize()
     dispatcher_ms = start.elapsed_time(end) / TIMED_ITERS
     dist.barrier()
 
-    # Correctness check
+    # Combiner benchmark
+    for _ in range(WARMUP_ITERS):
+        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    dist.barrier()
+    start.record()
+    for _ in range(TIMED_ITERS):
+        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx)
+    end.record()
+    torch.cuda.synchronize()
+    combiner_ms = start.elapsed_time(end) / TIMED_ITERS
+    dist.barrier()
+
+    # Dispatch correctness check
     tokens_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(tokens_all, tokens)
-    valid = schedule_src_token_idx >= 0
-    expected = torch.zeros_like(recv2d)
-    expected[valid] = tokens_all[schedule_src_rank[valid], schedule_src_token_idx[valid]]
-    errors = (recv2d != expected).sum()
-    dist.all_reduce(errors, op=dist.ReduceOp.SUM)
+    valid = schedule_peer_rank >= 0
+    dispatch_expected = torch.zeros_like(dispatch_recv)
+    dispatch_expected[valid] = tokens_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
+    dispatch_errors = (dispatch_recv != dispatch_expected).sum()
+    dist.all_reduce(dispatch_errors, op=dist.ReduceOp.SUM)
+
+    # Combine correctness check
+    combine_expected = tokens.unsqueeze(1).expand(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM)
+    combine_errors = (combine_recv.view(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM) != combine_expected).sum()
+    dist.all_reduce(combine_errors, op=dist.ReduceOp.SUM)
 
     # Performance check
     num_tokens = int(valid.sum().item())
-    num_local_tokens = int((valid & (schedule_src_rank == rank)).sum().item())
+    num_local_tokens = int((valid & (schedule_peer_rank == rank)).sum().item())
     num_remote_tokens = num_tokens - num_local_tokens
     bytes_total = num_tokens * HIDDEN_DIM * 2
     bytes_remote = num_remote_tokens * HIDDEN_DIM * 2
     stats = torch.tensor([
-        num_tokens, num_local_tokens, num_remote_tokens, bytes_total, bytes_remote, dispatcher_ms, scheduler_ms
+        num_tokens, 
+        num_local_tokens, num_remote_tokens, 
+        bytes_total, bytes_remote,
+        dispatcher_ms, combiner_ms, scheduler_ms
     ], dtype=torch.float64, device=device)
     stats_all = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(stats_all, stats)
@@ -136,7 +163,8 @@ def main():
               f"remote {(sum_remote_bytes / GiB) / max_seconds:.2f} GB/s", flush=True)
 
     dist.barrier()
-    del hdl
+    del dhdl
+    del chdl
     gc.collect()
     dist.destroy_process_group()
 
