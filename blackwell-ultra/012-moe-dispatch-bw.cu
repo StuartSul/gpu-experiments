@@ -10,7 +10,7 @@ namespace scheduler {
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_THREADS = 1024;
-    static constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
 };
 
 struct globals {
@@ -93,7 +93,7 @@ __device__ inline void schedule_kernel(const globals &G) {
             const int n = __shfl_up_sync(0xffffffff, inclusive, offset);
             if (warp::laneid() >= offset) inclusive += n;
         }
-        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_src_rank[warp] = inclusive;
+        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_src_rank[warpid()] = inclusive;
         __syncthreads();
         // Step 3: Cumulative sum across warps
         if (warpid() == 0) {
@@ -102,10 +102,10 @@ __device__ inline void schedule_kernel(const globals &G) {
                 const int n = __shfl_up_sync(0xffffffff, warp_total, offset);
                 if (warp::laneid() >= offset) warp_total += n;
             }
-            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_src_rank[warp::laneid()] = t;
+            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_src_rank[warp::laneid()] = warp_total;
         }
         __syncthreads();
-        int j = (warp == 0 ? 0 : cumulative_tokens_from_src_rank[warp - 1]) + inclusive - _tokens_from_src_rank;
+        int j = (warpid() == 0 ? 0 : cumulative_tokens_from_src_rank[warpid() - 1]) + inclusive - _tokens_from_src_rank;
 
         for (int local_topk_idx = threadIdx.x; local_topk_idx < rank_stride; local_topk_idx += blockDim.x) {
             const int src_token_idx = local_topk_idx / topk;
@@ -135,8 +135,7 @@ void schedule(
     int num_local_experts
 ) {
     const int world_size = static_cast<int>(topk_all.size(0));
-    const auto i32 = topk_all.options().dtype(at::kInt);
-    at::Tensor tokens_per_src_rank = at::zeros({world_size}, i32);
+    at::Tensor tokens_per_src_rank = at::zeros({world_size}, topk_all.options().dtype(at::kInt));
     schedule_src_rank.fill_(-1);
     schedule_src_token_idx.fill_(-1);
 
