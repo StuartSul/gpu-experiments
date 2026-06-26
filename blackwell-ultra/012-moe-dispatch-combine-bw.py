@@ -27,6 +27,18 @@ TIMED_ITERS = 10
 GiB = 1024 ** 3
 
 
+@torch.compile
+def finalize(combine_recv, topk_weights):
+    """
+    combine_recv: (NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM) bf16
+    topk_weights: (NUM_LOCAL_TOKENS, TOPK) fp32
+    returns:      (NUM_LOCAL_TOKENS, HIDDEN_DIM) bf16
+    """
+    num_local_tokens, topk = topk_weights.shape
+    x = combine_recv.view(num_local_tokens, topk, -1).float()
+    return (x * topk_weights.unsqueeze(-1)).sum(dim=1).to(torch.bfloat16)
+
+
 def main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -63,7 +75,8 @@ def main():
         print(f"iters:       warmup {WARMUP_ITERS}, timed {TIMED_ITERS}\n", flush=True)
 
     # Router all-gather
-    _, topk_ids = torch.topk(router_logits, TOPK, dim=1)
+    topk_vals, topk_ids = torch.topk(router_logits, TOPK, dim=1)
+    topk_weights = torch.softmax(topk_vals.float(), dim=-1)
     topk_ids = topk_ids.to(torch.int32)
     topk_ids_all = torch.empty(world_size, NUM_LOCAL_TOKENS, TOPK, dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(topk_ids_all, topk_ids)
@@ -113,6 +126,19 @@ def main():
     combiner_ms = start.elapsed_time(end) / TIMED_ITERS
     dist.barrier()
 
+    # Finalize benchmark
+    for _ in range(WARMUP_ITERS):
+        output = finalize(combine_recv, topk_weights)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(TIMED_ITERS):
+        output = finalize(combine_recv, topk_weights)
+    end.record()
+    torch.cuda.synchronize()
+    finalize_ms = start.elapsed_time(end) / TIMED_ITERS
+
     # Dispatch correctness check
     tokens_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(tokens_all, tokens)
@@ -127,17 +153,22 @@ def main():
     combine_errors = (combine_recv.view(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM) != combine_expected).sum()
     dist.all_reduce(combine_errors, op=dist.ReduceOp.SUM)
 
+    # Finalize correctness check
+    finalize_errors = ((output.float() - tokens.float()).abs() > 1e-2).sum()
+    dist.all_reduce(finalize_errors, op=dist.ReduceOp.SUM)
+
     # Performance check
     num_tokens = int(valid.sum().item())
     num_local_tokens = int((valid & (schedule_peer_rank == rank)).sum().item())
     num_remote_tokens = num_tokens - num_local_tokens
     bytes_total = num_tokens * HIDDEN_DIM * 2
     bytes_remote = num_remote_tokens * HIDDEN_DIM * 2
+    bytes_finalize = (NUM_LOCAL_TOKENS * TOPK + NUM_LOCAL_TOKENS) * HIDDEN_DIM * 2
     stats = torch.tensor([
         num_tokens, 
         num_local_tokens, num_remote_tokens, 
-        bytes_total, bytes_remote,
-        dispatcher_ms, combiner_ms, scheduler_ms
+        bytes_total, bytes_remote, bytes_finalize,
+        dispatcher_ms, combiner_ms, scheduler_ms, finalize_ms
     ], dtype=torch.float64, device=device)
     stats_all = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(stats_all, stats)
@@ -145,27 +176,30 @@ def main():
     if rank == 0:
         dispatch_ok = int(dispatch_errors.item()) == 0
         combine_ok = int(combine_errors.item()) == 0
+        finalize_ok = int(finalize_errors.item()) == 0
         print(f"dispatch correctness: {'PASSED' if dispatch_ok else 'FAILED (' + str(int(dispatch_errors.item())) + ' mismatches)'}")
-        print(f"combine  correctness: {'PASSED' if combine_ok else 'FAILED (' + str(int(combine_errors.item())) + ' mismatches)'}\n")
-        print("rank  tokens  local  remote  disp(ms)  total(GB/s)  remote(GB/s)  comb(ms)  total(GB/s)  remote(GB/s)  sched(ms)")
-        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------")
+        print(f"combine  correctness: {'PASSED' if combine_ok else 'FAILED (' + str(int(combine_errors.item())) + ' mismatches)'}")
+        print(f"finalize correctness: {'PASSED' if finalize_ok else 'FAILED (' + str(int(finalize_errors.item())) + ' mismatches)'}\n")
+        print("rank  tokens  local  remote  disp(ms)  total(GB/s)  remote(GB/s)  comb(ms)  total(GB/s)  remote(GB/s)  sched(ms)  fin(ms)  fin(GB/s)")
+        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------  -------  ---------")
         max_disp_s = 0.0
         max_comb_s = 0.0
         sum_remote_bytes = 0.0
         sum_total_bytes = 0.0
         for rank, stats in enumerate(stats_all):
-            nt, lt, rt, bt, br, dms, cms, sms = stats.tolist()
+            nt, lt, rt, bt, br, bf, dms, cms, sms, fms = stats.tolist()
             disp_s = dms / 1000.0
             comb_s = cms / 1000.0
+            fin_s = fms / 1000.0
             print(f"{int(rank):>4}  {int(nt):>6}  {int(lt):>5}  {int(rt):>6}  "
                   f"{dms:>8.3f}  {(bt / GiB) / disp_s:>11.2f}  {(br / GiB) / disp_s:>12.2f}  "
                   f"{cms:>8.3f}  {(bt / GiB) / comb_s:>11.2f}  {(br / GiB) / comb_s:>12.2f}  "
-                  f"{sms:>9.4f}")
+                  f"{sms:>9.4f}  {fms:>7.3f}  {(bf / GiB) / fin_s:>9.2f}")
             max_disp_s = max(max_disp_s, disp_s)
             max_comb_s = max(max_comb_s, comb_s)
             sum_remote_bytes += br
             sum_total_bytes += bt
-        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------")
+        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------  -------  ---------")
         print(f"dispatch (sum bytes / slowest rank): "
               f"total {(sum_total_bytes / GiB) / max_disp_s:.2f} GB/s, "
               f"remote {(sum_remote_bytes / GiB) / max_disp_s:.2f} GB/s")
