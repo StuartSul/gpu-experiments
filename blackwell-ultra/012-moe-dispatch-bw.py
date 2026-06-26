@@ -37,54 +37,59 @@ def main():
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
 
     NUM_EXPERTS = NUM_LOCAL_EXPERTS * world_size
+    # Global recv capacity: tokens arriving at this rank average ~NUM_LOCAL_TOKENS*TOPK (1/world_size of
+    # all routes); 2x headroom. Multiple of BLOCK_SIZE for the dispatch row tiling.
+    recv_rows = NUM_LOCAL_TOKENS * TOPK * 2
 
-    # Per-rank inputs (distinct routing per rank for a realistic, imbalanced dispatch).
+    # Per-rank routing (distinct per rank for a realistic, imbalanced dispatch).
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
-    tokens = torch.randn(NUM_LOCAL_TOKENS, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16)
     router_logits = torch.randn(NUM_LOCAL_TOKENS, NUM_EXPERTS, generator=gen, device=device)
 
-    SEND_BUFFER_CAPACITY = (NUM_LOCAL_TOKENS * TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
-    RECV_BUFFER_CAPACITY = NUM_LOCAL_TOKENS * TOPK * 2 // BLOCK_SIZE
-    recv_rows = NUM_LOCAL_EXPERTS * RECV_BUFFER_CAPACITY * BLOCK_SIZE
-
     if rank == 0:
-        print("\nMoE Dispatch Bandwidth (gather-and-dispatch, TMA vector gather + vector store)")
+        print("\nMoE Dispatch Bandwidth (PULL-based: destination reads remote tokens over NVLink)")
         print("===========================================================================")
         print(f"tokens/rank: {NUM_LOCAL_TOKENS} x {HIDDEN_DIM} bf16   experts: {NUM_EXPERTS} "
               f"({NUM_LOCAL_EXPERTS}/rank)   topk: {TOPK}")
-        print(f"send cap:    {SEND_BUFFER_CAPACITY} blocks ({SEND_BUFFER_CAPACITY * BLOCK_SIZE} rows)")
-        print(f"recv cap:    {RECV_BUFFER_CAPACITY} blocks/expert ({recv_rows} rows total)")
+        print(f"recv cap:    {recv_rows} rows total (local buffer, dense per-expert packing)")
         print(f"iters:       warmup {WARMUP_ITERS}, timed {TIMED_ITERS}\n", flush=True)
 
-    # ----- schedule: build the dispatch index metadata on-device from the all-gathered routing -----
-    # We only all-gather the (tiny) router result; the schedule kernel turns it into the per-slot
-    # gather/scatter indices. No token data is touched on the PyTorch side.
-    _, topk_ids = torch.topk(router_logits, TOPK, dim=1)             # (num_local_tokens, topk) expert ids
+    # ----- routing -> all-gathered topk -> round-robin pull schedule (built in CUDA/C++) -----
+    _, topk_ids = torch.topk(router_logits, TOPK, dim=1)
     topk_all = torch.empty(world_size, NUM_LOCAL_TOKENS, TOPK, dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(topk_all, topk_ids.to(torch.int32))
+    schedule_src_rank = torch.full((recv_rows,), -1, dtype=torch.int32, device=device)
+    schedule_src_token_idx = torch.full((recv_rows,), -1, dtype=torch.int32, device=device)
 
-    schedule_len = SEND_BUFFER_CAPACITY * BLOCK_SIZE
-    schedule_src_token_idx = torch.empty(schedule_len, dtype=torch.int32, device=device)
-    schedule_dst_rank = torch.empty(schedule_len, dtype=torch.int32, device=device)
-    schedule_dst_token_idx = torch.empty(schedule_len, dtype=torch.int32, device=device)
-    schedule(topk_all, schedule_src_token_idx, schedule_dst_rank, schedule_dst_token_idx,
-             rank, NUM_LOCAL_EXPERTS, RECV_BUFFER_CAPACITY)
-
-    # Symmetric recv buffer (NVLink-addressable across the fabric); tokens stay local.
-    recv = symm_mem.empty(recv_rows * HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-    recv.zero_()
+    # ----- time the schedule-build kernel on its own (CUDA events; calls are idempotent) -----
+    for _ in range(WARMUP_ITERS):
+        schedule(topk_all, schedule_src_rank, schedule_src_token_idx, rank, NUM_LOCAL_EXPERTS)
     torch.cuda.synchronize()
-    hdl = symm_mem.rendezvous(recv, dist.group.WORLD.group_name)
+    sched_start = torch.cuda.Event(enable_timing=True)
+    sched_end = torch.cuda.Event(enable_timing=True)
+    sched_start.record()
+    for _ in range(TIMED_ITERS):
+        schedule(topk_all, schedule_src_rank, schedule_src_token_idx, rank, NUM_LOCAL_EXPERTS)
+    sched_end.record()
+    torch.cuda.synchronize()
+    sched_ms = sched_start.elapsed_time(sched_end) / TIMED_ITERS
+
+    # ----- symmetric token buffer: this rank's tokens, remotely readable by every other rank -----
+    tokens_flat = symm_mem.empty(NUM_LOCAL_TOKENS * HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    tokens = tokens_flat.view(NUM_LOCAL_TOKENS, HIDDEN_DIM)
+    tokens.normal_(generator=gen)
+    torch.cuda.synchronize()
+    hdl = symm_mem.rendezvous(tokens_flat, dist.group.WORLD.group_name)
+    tokens_ptrs = [hdl.buffer_ptrs[i] for i in range(world_size)]
     if rank == 0:
         print("[rank 0] symmetric memory rendezvous complete", flush=True)
-    dist.barrier()
 
-    recv2d = recv.view(recv_rows, HIDDEN_DIM)
-    recv_ptrs = [hdl.buffer_ptrs[i] for i in range(world_size)]
+    # ----- local destination recv buffer (zeroed so padding rows compare cleanly) -----
+    recv2d = torch.zeros(recv_rows, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dist.barrier()
 
     # ----- benchmark with torch CUDA events (warmup + timed, on the current stream) -----
     for _ in range(WARMUP_ITERS):
-        dispatch(tokens, recv2d, recv_ptrs, schedule_src_token_idx, schedule_dst_rank, schedule_dst_token_idx)
+        dispatch(tokens, tokens_ptrs, recv2d, schedule_src_rank, schedule_src_token_idx)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -92,44 +97,30 @@ def main():
     dist.barrier()  # release all ranks together so the dispatch is genuinely concurrent
     start.record()
     for _ in range(TIMED_ITERS):
-        dispatch(tokens, recv2d, recv_ptrs, schedule_src_token_idx, schedule_dst_rank, schedule_dst_token_idx)
+        dispatch(tokens, tokens_ptrs, recv2d, schedule_src_rank, schedule_src_token_idx)
     end.record()
     torch.cuda.synchronize()
     avg_ms = start.elapsed_time(end) / TIMED_ITERS
     dist.barrier()
 
-    # ----- correctness: replay every rank's schedule against the gathered token rows -----
-    # send_ref[s] mirrors the kernel's gather (tokens[src], zeros for padding); each rank's schedule
-    # then says where each row lands, so we just scatter the rows targeting this rank.
-    has_token = schedule_src_token_idx >= 0
-    send_ref = torch.zeros(schedule_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-    send_ref[has_token] = tokens[schedule_src_token_idx[has_token].to(torch.long)]
-
-    g_send = torch.empty(world_size, schedule_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-    dist.all_gather_into_tensor(g_send, send_ref)
-    g_dst_rank = torch.empty(world_size, schedule_len, dtype=torch.int32, device=device)
-    dist.all_gather_into_tensor(g_dst_rank, schedule_dst_rank)
-    g_dst_token = torch.empty(world_size, schedule_len, dtype=torch.int32, device=device)
-    dist.all_gather_into_tensor(g_dst_token, schedule_dst_token_idx)
-
+    # ----- correctness: recv row r must equal source token (src_rank[r], src_token_idx[r]) -----
+    g_tokens = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dist.all_gather_into_tensor(g_tokens, tokens)
+    valid = schedule_src_token_idx >= 0
     expected = torch.zeros_like(recv2d)
-    for s in range(world_size):
-        sel = g_dst_rank[s] == rank
-        expected[g_dst_token[s][sel].to(torch.long)] = g_send[s][sel]
-
+    expected[valid] = g_tokens[schedule_src_rank[valid].to(torch.long),
+                               schedule_src_token_idx[valid].to(torch.long)]
     mism = (recv2d != expected).sum()
     dist.all_reduce(mism, op=dist.ReduceOp.SUM)
 
-    # ----- bandwidth bookkeeping (post-timing). The vector store moves exactly the real tokens (no
-    # block padding), so we account for tokens routed, not padded blocks. -----
-    num_tokens = int(has_token.sum().item())                         # = NUM_LOCAL_TOKENS * TOPK
-    local_tokens = int((has_token & (schedule_dst_rank == rank)).sum().item())
+    # ----- bandwidth bookkeeping (pull perspective): bytes this rank reads; remote = from other ranks -----
+    num_tokens = int(valid.sum().item())
+    local_tokens = int((valid & (schedule_src_rank == rank)).sum().item())
     remote_tokens = num_tokens - local_tokens
     bytes_total = num_tokens * HIDDEN_DIM * 2
     bytes_remote = remote_tokens * HIDDEN_DIM * 2
-    sec = avg_ms / 1000.0
     stats = torch.tensor([num_tokens, local_tokens, remote_tokens,
-                          bytes_total, bytes_remote, avg_ms], dtype=torch.float64, device=device)
+                          bytes_total, bytes_remote, avg_ms, sched_ms], dtype=torch.float64, device=device)
     gathered_stats = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(gathered_stats, stats)
 
@@ -141,18 +132,23 @@ def main():
         max_t = 0.0
         sum_remote_bytes = 0.0
         sum_total_bytes = 0.0
+        sched_times = []
         for r, s in enumerate(gathered_stats):
-            nt, lt, rt, bt, br, ms = s.tolist()
+            nt, lt, rt, bt, br, ms, sm = s.tolist()
             sc = ms / 1000.0
             print(f"{r:>4}  {int(nt):>6}  {int(lt):>5}  {int(rt):>6}  {ms:>9.3f}  "
                   f"{(bt / GiB) / sc:>11.2f}  {(br / GiB) / sc:>12.2f}")
             max_t = max(max_t, sc)
             sum_remote_bytes += br
             sum_total_bytes += bt
+            sched_times.append(sm)
         print("----  ------  -----  ------  ---------  -----------  ------------")
         print(f"aggregate (sum bytes / slowest rank): "
               f"total {(sum_total_bytes / GiB) / max_t:.2f} GB/s, "
-              f"remote {(sum_remote_bytes / GiB) / max_t:.2f} GB/s", flush=True)
+              f"remote {(sum_remote_bytes / GiB) / max_t:.2f} GB/s")
+        print(f"\nschedule-build kernel (separate, avg over {TIMED_ITERS} iters): "
+              + "  ".join(f"r{r} {t:.4f}ms" for r, t in enumerate(sched_times))
+              + f"   mean {sum(sched_times) / len(sched_times):.4f} ms", flush=True)
 
     dist.barrier()
     del hdl
