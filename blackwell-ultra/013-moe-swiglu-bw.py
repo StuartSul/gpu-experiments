@@ -26,15 +26,18 @@ TIMED_ITERS = 10
 
 def moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert):
     y = torch.empty_like(x)
+    gate = torch.empty(x.size(0), w_gate.size(1), device=x.device, dtype=x.dtype)
+    up = torch.empty_like(gate)
+    hidden = torch.empty_like(gate)
     offset = 0
     for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
-        _x = x[offset:offset + num_tokens]                          # (num_tokens, H)
-        gate = _x @ w_gate[expert_idx].T                            # (num_tokens, I)
-        up = _x @ w_up[expert_idx].T                                # (num_tokens, I)
-        hid = (F.silu(gate.float()) * up.float()).to(x.dtype)       # (num_tokens, I)
-        y[offset:offset + num_tokens] = hid @ w_down[expert_idx].T  # (num_tokens, H)
+        _x = x[offset:offset + num_tokens]
+        gate[offset:offset + num_tokens] = _x @ w_gate[expert_idx].T
+        up[offset:offset + num_tokens] = _x @ w_up[expert_idx].T
+        hidden[offset:offset + num_tokens] = (F.silu(gate[offset:offset + num_tokens].float()) * up[offset:offset + num_tokens].float()).to(x.dtype)
+        y[offset:offset + num_tokens] = hidden[offset:offset + num_tokens] @ w_down[expert_idx].T
         offset += num_tokens
-    return y
+    return gate, up, hidden, y
 
 
 def main():
@@ -57,13 +60,13 @@ def main():
 
     # Benchmark
     for _ in range(WARMUP_ITERS):
-        y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
+        gate, up, hidden, y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
+        gate, up, hidden, y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / TIMED_ITERS
@@ -82,13 +85,13 @@ def main():
     print(f"moe_swiglu {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
 
     # Correctness check
-    y_ref = moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
-    out = y.float()
-    ref = y_ref.float()
-    diff = (out - ref).abs()
-    print(f"\nout   abs mean {out.abs().mean().item():.4f}   abs max {out.abs().max().item():.4f}")
-    print(f"ref   abs mean {ref.abs().mean().item():.4f}   abs max {ref.abs().max().item():.4f}")
-    print(f"diff  abs mean {diff.mean().item():.4f}   abs max {diff.max().item():.4f}", flush=True)
+    refs = moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+    for name, out, ref in zip(("gate", "up", "hidden", "y"), (gate, up, hidden, y), refs):
+        diff = (out.float() - ref.float()).abs()
+        print(f"\n{name}")
+        print(f"out   abs mean {out.abs().mean().item():.4f}   abs max {out.abs().max().item():.4f}")
+        print(f"ref   abs mean {ref.abs().mean().item():.4f}   abs max {ref.abs().max().item():.4f}")
+        print(f"diff  abs mean {diff.mean().item():.4f}   abs max {diff.max().item():.4f}", flush=True)
 
 
 if __name__ == "__main__":
