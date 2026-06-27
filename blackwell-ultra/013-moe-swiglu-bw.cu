@@ -166,21 +166,21 @@ __device__ __forceinline__ void swiglu(
     }
 }
 
+enum class expert_gemm_kind { GATE, UP, DOWN };
+
 template <typename C>
 __device__ __forceinline__ void expert_grouped_gemm(
     const globals<C> &g,
-    semaphore &tmem_provisioned,
-    semaphore &tmem_finished,
-    semaphore (&inputs_arrived)[C::LOAD_PIPE_DEPTH],
-    semaphore (&inputs_finished)[C::LOAD_PIPE_DEPTH],
-    semaphore &outputs_arrived,
-    semaphore &outputs_finished,
+    semaphore (&gemm_inputs_arrived)[C::LOAD_PIPE_DEPTH],
+    semaphore (&gemm_inputs_finished)[C::LOAD_PIPE_DEPTH],
+    semaphore &gemm_outputs_arrived,
+    semaphore &gemm_outputs_finished,
+    uint32_t &gemm_bitfield,
     int cta_rank,
     int task_idx,
-    int kind,
     uint64_t smem_base_addr,
-    uint32_t &tmem_addr,
-    uint32_t &bitfield
+    expert_gemm_kind kind,
+    tt<float, C::Mb / 2, C::Nb> d_tt
 ) {
     using G = globals<C>;
 
@@ -188,134 +188,89 @@ __device__ __forceinline__ void expert_grouped_gemm(
     typename G::b_tile (&b_smem)[C::LOAD_PIPE_DEPTH] = *reinterpret_cast<typename G::b_tile (*)[C::LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
     typename G::d_tile (&d_smem)[C::NUM_D_TILES] = *reinterpret_cast<typename G::d_tile (*)[C::NUM_D_TILES]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
 
-    const bool is_gate = kind == 0;
-    const bool is_up = kind == 1;
-    const bool is_down = kind == 2;
-    const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
+    const typename G::activation_gl &a_gmem = kind == expert_gemm_kind::DOWN ? g.hidden : g.x;
+    const typename G::weight_gl &b_gmem     = kind == expert_gemm_kind::GATE ? g.w_gate : (kind == expert_gemm_kind::UP ? g.w_up : g.w_down);
+    const typename G::activation_gl &d_gmem = kind == expert_gemm_kind::GATE ? g.gate   : (kind == expert_gemm_kind::UP ? g.up : g.y);
 
-    const typename G::activation_gl &a_gl = is_down ? g.hidden : g.x;
-    const typename G::weight_gl &b_gl = is_gate ? g.w_gate : (is_up ? g.w_up : g.w_down);
-    const typename G::activation_gl &d_gl = is_gate ? g.gate : (is_up ? g.up : g.y);
-    const int iters_per_task = a_gl.cols() / C::Kb;
-    const int col_blocks = b_gl.rows() / C::Nb;
+    const int iters_per_task = a_gmem.cols() / C::Kb;
+    const int col_blocks     = b_gmem.rows() / C::Nb;
 
-    int expert_task_idx = task_idx;
     int row_block_offset = 0;
     int3 tile_coord = {-1, -1, -1};
-    for (int expert_idx = 0; expert_idx < b_gl.depth(); ++expert_idx) {
+    for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
         const int row_blocks = g.tokens_per_expert[{expert_idx}] / C::Mb;
         const int num_tasks = row_blocks * col_blocks;
-        if (expert_task_idx < num_tasks) {
-            const int2 swizzled = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(row_blocks, col_blocks, expert_task_idx);
+        if (task_idx < num_tasks) {
+            const int2 swizzled = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
             tile_coord = {row_block_offset + swizzled.x, swizzled.y, expert_idx};
             break;
         }
-        expert_task_idx -= num_tasks;
+        task_idx -= num_tasks;
         row_block_offset += row_blocks;
     }
-    if (tile_coord.z < 0)
-        return;
-
-    if (is_down) {
-        const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
-        if (threadIdx.x == 0) {
-            int swiglu_counter;
-            while (true) {
-                asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{gate_up_tasks + tile_coord.x}]) : "memory");
-                if (swiglu_counter >= swiglu_tiles_per_row_block)
-                    break;
-                __nanosleep(64);
-            }
-            asm volatile("{fence.acquire.gpu;}" ::: "memory");
-        }
-        __syncthreads();
-    }
-
-    tensor_allocator<1, C::CLUSTER_SIZE, false> tm_alloc{};
-    using d_tt_t = tt<float, C::Mb / 2, C::Nb>;
-
-    if (threadIdx.x == 32) {
-        init_semaphore(tmem_provisioned, 0, 1);
-        init_semaphore(tmem_finished, 0, 1);
-        #pragma unroll
-        for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);
-            init_semaphore(inputs_finished[i], 0, 1);
-        }
-        init_semaphore(outputs_arrived, 0, 1);
-        init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
-    }
-    everyone::tma::cluster::arrive_aligned();
+    if (tile_coord.z < 0) return;
 
     if (warpgroup::groupid() == C::NUM_CONSUMERS) {
-        warpgroup::increase_registers<256>();
-
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
+            if (kind == expert_gemm_kind::DOWN) {
+                const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
+                const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
+                int swiglu_counter;
+                while (true) {
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{gate_up_tasks + tile_coord.x}]) : "memory");
+                    if (swiglu_counter >= swiglu_tiles_per_row_block) break;
+                    __nanosleep(16);
+                }
+                asm volatile("{fence.acquire.gpu;}" ::: "memory");
+            }
             int input_ring = 0;
-            everyone::tma::cluster::wait();
             for (int idx = 0; idx < iters_per_task; ++idx) {
-                wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
-                tma::cluster::load_async(a_smem[input_ring], a_gl, {tile_coord.x * 2 + cta_rank, idx}, inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                tma::cluster::load_async(b_smem[input_ring], b_gl, {tile_coord.z, tile_coord.y * 2 + cta_rank, idx}, inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                update_phasebit<1>(bitfield, input_ring);
+                wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
+                tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, idx},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.z, tile_coord.y * 2 + cta_rank, idx}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                update_phasebit<1>(gemm_bitfield, input_ring);
                 input_ring = ring_advance<C::LOAD_PIPE_DEPTH>(input_ring);
             }
         } else if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
-            everyone::tma::cluster::wait();
-            wait(tmem_provisioned, 0);
-            tm_alloc.set_addr(tmem_addr);
-            d_tt_t d_tt = tm_alloc.template allocate<d_tt_t>(0);
             int input_ring = 0;
-            wait(outputs_finished, 1);
+            wait(gemm_outputs_finished, get_phasebit<1>(gemm_bitfield, C::LOAD_PIPE_DEPTH));
+            update_phasebit<1>(gemm_bitfield, C::LOAD_PIPE_DEPTH);
             for (int idx = 0; idx < iters_per_task; ++idx) {
-                tma::expect_bytes(inputs_arrived[input_ring], C::CLUSTER_SIZE * sizeof(typename G::a_tile) + 2 * sizeof(typename G::b_tile));
-                wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
-                if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
-                else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
-                update_phasebit<0>(bitfield, input_ring);
+                tma::expect_bytes(gemm_inputs_arrived[input_ring], C::CLUSTER_SIZE * sizeof(typename G::a_tile) + 2 * sizeof(typename G::b_tile));
+                wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring], gemm_inputs_finished[input_ring]);
+                else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring], gemm_inputs_finished[input_ring]);
+                update_phasebit<0>(gemm_bitfield, input_ring);
                 input_ring = ring_advance<C::LOAD_PIPE_DEPTH>(input_ring);
             }
-            detail::tcgen05::commit<C::CLUSTER_SIZE>(outputs_arrived);
+            detail::tcgen05::commit<C::CLUSTER_SIZE>(gemm_outputs_arrived);
         }
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
-        warpgroup::increase_registers<256>();
-        everyone::tma::cluster::wait_aligned();
-        if (epilogue_group::warpid() == 0) {
-            tm_alloc.provision(tmem_addr);
-            warp::arrive(tmem_provisioned);
-        }
-        wait(tmem_provisioned, 0);
-        tm_alloc.set_addr(tmem_addr);
-        d_tt_t d_tt = tm_alloc.template allocate<d_tt_t>(0);
-        wait(outputs_arrived, 0);
+        wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, C::LOAD_PIPE_DEPTH));
+        update_phasebit<0>(gemm_bitfield, C::LOAD_PIPE_DEPTH);
         rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> d_reg[C::EPI_PIPE_DEPTH];
         #pragma unroll
         for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i)
             warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, C::Mb / 2, C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
         tensor_load_wait();
         warpgroup::sync(1);
-        warpgroup::tma::cluster::arrive(outputs_finished, 0);
+        warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
         #pragma unroll
         for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
             warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
             warpgroup::sync(1);
             warpgroup::store(d_smem[i % C::NUM_D_TILES], d_reg[i]);
             warpgroup::sync(1);
-            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gl, d_smem[i % C::NUM_D_TILES], {2 * tile_coord.x + cta_rank, C::EPI_PIPE_DEPTH * tile_coord.y + i});
+            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_smem[i % C::NUM_D_TILES], {2 * tile_coord.x + cta_rank, C::EPI_PIPE_DEPTH * tile_coord.y + i});
         }
         epilogue_group::sync(4);
-        if (epilogue_group::warpid() == 0) {
-            if (warp::elect_leader()) {
+        if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
+            if (kind != expert_gemm_kind::DOWN) {
                 tma::store_async_wait();
-                if (!is_down) {
-                    asm volatile("{fence.release.gpu;}" ::: "memory");
-                    atomicAdd(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}], 1);
-                }
-                tma::cluster::arrive(tmem_finished, 1 - cta_rank);
+                asm volatile("{fence.release.gpu;}" ::: "memory");
+                atomicAdd(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}], 1);
             }
-            wait(tmem_finished, 0);
-            tm_alloc.deprovision();
         }
     }
 }
@@ -327,14 +282,12 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     extern __shared__ int __shm[];
     const uint64_t smem_base_addr = (reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023);
 
-    __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore swiglu_inputs_arrived[C::SWIGLU_PIPE_DEPTH];
-    __shared__ semaphore inputs_arrived[C::LOAD_PIPE_DEPTH];
-    __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
-    __shared__ semaphore outputs_arrived, outputs_finished;
+    __shared__ semaphore gemm_inputs_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore gemm_inputs_finished[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
 
-    uint32_t bitfield = 0xFFFF0000;
+    uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
 
     const int cluster_idx = clusterIdx().x;
@@ -344,23 +297,7 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
     const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
 
-    if (cluster_idx < gate_up_tasks) {
-        expert_grouped_gemm<C>(
-            g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
-            outputs_arrived, outputs_finished, cta_rank, cluster_idx, 0,
-            smem_base_addr, tmem_addr, bitfield
-        );
-        return;
-    }
-    if (cluster_idx < 2 * gate_up_tasks) {
-        expert_grouped_gemm<C>(
-            g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
-            outputs_arrived, outputs_finished, cta_rank, cluster_idx - gate_up_tasks, 1,
-            smem_base_addr, tmem_addr, bitfield
-        );
-        return;
-    }
-    if (cluster_idx < 2 * gate_up_tasks + swiglu_tasks) {
+    if (cluster_idx >= 2 * gate_up_tasks && cluster_idx < 2 * gate_up_tasks + swiglu_tasks) {
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int i = 0; i < C::SWIGLU_PIPE_DEPTH; ++i)
@@ -370,11 +307,31 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, cluster_idx - 2 * gate_up_tasks, smem_base_addr);
         return;
     }
+
+    const expert_gemm_kind kind = cluster_idx < gate_up_tasks ? expert_gemm_kind::GATE :
+                                  cluster_idx < 2 * gate_up_tasks ? expert_gemm_kind::UP :
+                                                                   expert_gemm_kind::DOWN;
+    const int task_idx = kind == expert_gemm_kind::GATE ? cluster_idx :
+                         kind == expert_gemm_kind::UP ? cluster_idx - gate_up_tasks :
+                                                       cluster_idx - 2 * gate_up_tasks - swiglu_tasks;
+
+    tensor_allocator<1, C::CLUSTER_SIZE> tm_alloc{};
+    tt<float, C::Mb / 2, C::Nb> d_tt = tm_alloc.template allocate<tt<float, C::Mb / 2, C::Nb>>(0);
+    if (threadIdx.x == 32) {
+        #pragma unroll
+        for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
+            init_semaphore(gemm_inputs_arrived[i], 0, 1);
+            init_semaphore(gemm_inputs_finished[i], 0, 1);
+        }
+        init_semaphore(gemm_outputs_arrived, 0, 1);
+        init_semaphore(gemm_outputs_finished, 0, C::CLUSTER_SIZE);
+    }
+    everyone::tma::cluster::sync();
+    warpgroup::increase_registers<256>();
+
     expert_grouped_gemm<C>(
-        g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
-        outputs_arrived, outputs_finished, cta_rank,
-        cluster_idx - 2 * gate_up_tasks - swiglu_tasks, 2,
-        smem_base_addr, tmem_addr, bitfield
+        g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+        gemm_bitfield, cta_rank, task_idx, smem_base_addr, kind, d_tt
     );
 }
 
