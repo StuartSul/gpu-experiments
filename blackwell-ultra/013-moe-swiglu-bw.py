@@ -7,6 +7,9 @@ To run:
 import torch
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _C import dispatch, schedule, combine
+
 
 NUM_LOCAL_TOKENS = 7168
 HIDDEN_DIM = 7168
