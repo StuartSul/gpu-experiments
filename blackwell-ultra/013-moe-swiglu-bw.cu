@@ -4,6 +4,7 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros.h>
+#include <tuple>
 
 using namespace kittens;
 
@@ -43,6 +44,8 @@ struct globals {
     using index_gl = gl<int, 1, 1, 1, -1>;
 
     activation_gl x;
+    activation_gl gate;
+    activation_gl up;
     activation_gl hidden;
     activation_gl y;
     weight_gl w_gate;
@@ -80,7 +83,6 @@ __device__ __forceinline__ void swiglu(
     if (first_tile_idx >= num_tiles)
         return;
 
-    static_assert(C::LOAD_PIPE_DEPTH * (sizeof(typename G::a_tile) + sizeof(typename G::b_tile)) + C::NUM_D_TILES * sizeof(typename G::d_tile) == 6 * sizeof(typename G::swiglu_tile));
     typename G::swiglu_tile (&a_smem)[3] = *reinterpret_cast<typename G::swiglu_tile (*)[3]>(smem_base_addr);
     typename G::swiglu_tile (&b_smem)[3] = *reinterpret_cast<typename G::swiglu_tile (*)[3]>(smem_base_addr + sizeof(a_smem));
 
@@ -105,8 +107,8 @@ __device__ __forceinline__ void swiglu(
                     __nanosleep(64);
                 init_semaphore(inputs_arrived[stage], 0, 1);
                 tma::expect_bytes(inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
-                tma::load_async(a_smem[stage], g.hidden, {row, col}, inputs_arrived[stage]);
-                tma::load_async(b_smem[stage], g.y, {row, col}, inputs_arrived[stage]);
+                tma::load_async(a_smem[stage], g.gate, {row, col}, inputs_arrived[stage]);
+                tma::load_async(b_smem[stage], g.up, {row, col}, inputs_arrived[stage]);
             }
         }
     }
@@ -186,7 +188,7 @@ __device__ __forceinline__ void expert_grouped_gemm(
 
     const typename G::activation_gl &a_gl = is_down ? g.hidden : g.x;
     const typename G::weight_gl &b_gl = is_gate ? g.w_gate : (is_up ? g.w_up : g.w_down);
-    const typename G::activation_gl &d_gl = is_gate ? g.hidden : g.y;
+    const typename G::activation_gl &d_gl = is_gate ? g.gate : (is_up ? g.up : g.y);
     const int iters_per_task = a_gl.cols() / C::Kb;
     const int col_blocks = b_gl.rows() / C::Nb;
 
@@ -353,7 +355,7 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     );
 }
 
-at::Tensor moe_swiglu(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_swiglu(
     const at::Tensor &x,
     const at::Tensor &w_gate,
     const at::Tensor &w_up,
@@ -363,14 +365,18 @@ at::Tensor moe_swiglu(
     using C = config;
     using G = globals<C>;
 
-    at::Tensor y = at::empty_like(x);
+    at::Tensor gate = at::empty({x.size(0), w_gate.size(1)}, x.options());
+    at::Tensor up = at::empty({x.size(0), w_up.size(1)}, x.options());
     at::Tensor hidden = at::empty({x.size(0), w_gate.size(1)}, x.options());
+    at::Tensor y = at::empty_like(x);
     const int row_blocks = x.size(0) / C::Mb;
     const int gate_up_tasks = row_blocks * (w_gate.size(1) / C::Nb);
     at::Tensor counters = at::zeros({2 * gate_up_tasks + row_blocks}, tokens_per_expert.options());
 
     G g {
         .x = kittens::py::tensor_to_gl<G::activation_gl>(x),
+        .gate = kittens::py::tensor_to_gl<G::activation_gl>(gate),
+        .up = kittens::py::tensor_to_gl<G::activation_gl>(up),
         .hidden = kittens::py::tensor_to_gl<G::activation_gl>(hidden),
         .y = kittens::py::tensor_to_gl<G::activation_gl>(y),
         .w_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_gate),
@@ -382,7 +388,7 @@ at::Tensor moe_swiglu(
 
     kittens::py::launch_kernel<C, G, moe_swiglu_kernel<C>>(g);
 
-    return y;
+    return {gate, up, hidden, y};
 }
 
 } // namespace moe_swigluer
