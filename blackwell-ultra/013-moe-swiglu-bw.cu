@@ -278,45 +278,29 @@ template <typename C>
 __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     using G = globals<C>;
 
+    warpgroup::increase_registers<256>();
+
     extern __shared__ int __shm[];
     const uint64_t smem_base_addr = (reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023);
+
+    const int cluster_idx = clusterIdx().x;
+    const int cta_rank = cluster_ctarank();
+    const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
+    const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
+    const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+    uint32_t gemm_bitfield = 0xFFFF0000;
+    uint32_t swiglu_bitfield = 0xFFFF0000;
 
     __shared__ semaphore swiglu_inputs_arrived[C::SWIGLU_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
 
-    uint32_t gemm_bitfield = 0xFFFF0000;
-    uint32_t swiglu_bitfield = 0xFFFF0000;
-
-    const int cluster_idx = clusterIdx().x;
-    const int cta_rank = cluster_ctarank();
-    const int row_blocks = g.x.rows() / C::Mb;
-    const int gate_up_tasks = row_blocks * (g.w_gate.rows() / C::Nb);
-    const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
-    const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
-
-    if (cluster_idx >= 2 * gate_up_tasks && cluster_idx < 2 * gate_up_tasks + swiglu_tasks) {
-        if (threadIdx.x == 0) {
-            #pragma unroll
-            for (int i = 0; i < C::SWIGLU_PIPE_DEPTH; ++i)
-                init_semaphore(swiglu_inputs_arrived[i], 0, 1);
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int i = 0; i < C::SWIGLU_PIPE_DEPTH; ++i) {
+            init_semaphore(swiglu_inputs_arrived[i], 0, 1);
         }
-        __syncthreads();
-        swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, cluster_idx - 2 * gate_up_tasks, smem_base_addr);
-        return;
-    }
-
-    const expert_gemm_kind kind = cluster_idx < gate_up_tasks ? expert_gemm_kind::GATE :
-                                  cluster_idx < 2 * gate_up_tasks ? expert_gemm_kind::UP :
-                                                                   expert_gemm_kind::DOWN;
-    const int task_idx = kind == expert_gemm_kind::GATE ? cluster_idx :
-                         kind == expert_gemm_kind::UP ? cluster_idx - gate_up_tasks :
-                                                       cluster_idx - 2 * gate_up_tasks - swiglu_tasks;
-
-    tensor_allocator<1, C::CLUSTER_SIZE> tm_alloc{};
-    tt<float, C::Mb / 2, C::Nb> d_tt = tm_alloc.template allocate<tt<float, C::Mb / 2, C::Nb>>(0);
-    if (threadIdx.x == 32) {
         #pragma unroll
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(gemm_inputs_arrived[i], 0, 1);
@@ -325,13 +309,31 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         init_semaphore(gemm_outputs_arrived, 0, 1);
         init_semaphore(gemm_outputs_finished, 0, C::CLUSTER_SIZE);
     }
-    everyone::tma::cluster::sync();
-    warpgroup::increase_registers<256>();
 
-    expert_grouped_gemm<C>(
-        g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-        gemm_bitfield, cta_rank, task_idx, smem_base_addr, kind, d_tt
-    );
+    tensor_allocator<1, C::CLUSTER_SIZE> tm_alloc{};
+    tt<float, C::Mb / 2, C::Nb> d_tt = tm_alloc.template allocate<tt<float, C::Mb / 2, C::Nb>>(0);
+    everyone::tma::cluster::sync();
+
+    if (cluster_idx < gate_up_tasks) {
+        // Gate
+        const int task_idx = cluster_idx;
+        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
+    } else if (cluster_idx < gate_up_tasks * 2) {
+        // Up
+        const int task_idx = cluster_idx - gate_up_tasks;
+        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
+    } else if (cluster_idx < gate_up_tasks * 2 + swiglu_tasks) {
+        // Swiglu
+        const int task_idx = cluster_idx - gate_up_tasks * 2;
+        swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, task_idx, smem_base_addr);
+    } else {
+        // Down
+        const int task_idx = cluster_idx - gate_up_tasks * 2 - swiglu_tasks;
+        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+    }
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_swiglu(
