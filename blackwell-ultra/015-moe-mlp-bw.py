@@ -30,15 +30,15 @@ def main():
     torch.cuda.set_device(device)
 
     # Synthetic post-dispatch schedule
-    tokens_per_expert = torch.full(
-        (E,), NUM_LOCAL_TOKENS * TOPK // E, dtype=torch.int32, device=device
-    )
-    total_tokens = int(tokens_per_expert.sum().item())
+    tokens_per_expert_cpu = [NUM_LOCAL_TOKENS * TOPK // E] * E
+    tokens_per_expert = torch.tensor(tokens_per_expert_cpu, dtype=torch.int32, device=device)
+    total_tokens = sum(tokens_per_expert_cpu)
+    capacity = NUM_LOCAL_TOKENS * TOPK * 2
 
     gen = torch.Generator(device=device).manual_seed(1234)
-    a = torch.randn(total_tokens, H, generator=gen, device=device, dtype=torch.bfloat16)
+    a = torch.randn(capacity, H, generator=gen, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H**-0.5
-    d = torch.empty(total_tokens, I, device=device, dtype=torch.bfloat16)
+    d = torch.full((capacity, I), float("nan"), device=device, dtype=torch.bfloat16)
     torch.cuda.synchronize()
 
     for _ in range(WARMUP_ITERS):
@@ -68,13 +68,13 @@ def main():
     print("-------  -------  ---------")
     print(f"moe_mlp  {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
 
-    d_ref = torch.empty_like(d)
+    d_ref = torch.empty(total_tokens, I, device=device, dtype=torch.bfloat16)
     offset = 0
-    for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
+    for expert_idx, num_tokens in enumerate(tokens_per_expert_cpu):
         d_ref[offset : offset + num_tokens] = a[offset : offset + num_tokens] @ b[expert_idx].T
         offset += num_tokens
 
-    out = d.float()
+    out = d[:total_tokens].float()
     ref = d_ref.float()
     diff = (out - ref).abs()
     print(f"\nout   abs mean {out.abs().mean().item():.4f}   abs max {out.abs().max().item():.4f}")

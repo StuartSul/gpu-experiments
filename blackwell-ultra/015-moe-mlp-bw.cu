@@ -95,6 +95,7 @@ __device__ inline void moe_mlp_kernel(const globals<C> &g) {
         task_idx -= num_tasks;
         row_block_offset += row_blocks;
     }
+    if (tile_coord.z < 0) return;
 
     if (warpgroup::groupid() == C::NUM_CONSUMERS) {
         warpgroup::increase_registers<256>();
