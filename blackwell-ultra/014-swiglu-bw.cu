@@ -41,14 +41,22 @@ __device__ inline void swiglu_kernel(const globals &g) {
     const int first_tile_idx = blockIdx.x * 3;
 
     __shared__ semaphore inputs_arrived[3];
+    int first_row, first_col;
     if (threadIdx.x == 0) {
+        first_row = first_tile_idx / col_blocks;
+        first_col = first_tile_idx % col_blocks;
         #pragma unroll
         for (int stage = 0; stage < 3; ++stage) {
             init_semaphore(inputs_arrived[stage], 0, 1);
             const int tile_idx = first_tile_idx + stage;
             if (tile_idx < num_tiles) {
-                const int row = tile_idx / col_blocks;
-                const int col = tile_idx % col_blocks;
+                // This improves throughput
+                int row = first_row;
+                int col = first_col + stage;
+                if (col >= col_blocks) {
+                    ++row;
+                    col -= col_blocks;
+                }
                 tma::expect_bytes(inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
                 tma::load_async(a_smem[stage], g.a, {row, col}, inputs_arrived[stage]);
                 tma::load_async(b_smem[stage], g.b, {row, col}, inputs_arrived[stage]);
@@ -75,8 +83,13 @@ __device__ inline void swiglu_kernel(const globals &g) {
             compute_group::store(a_smem[stage], a);
             __syncthreads();
             if (threadIdx.x == 0) {
-                const int row = tile_idx / col_blocks;
-                const int col = tile_idx % col_blocks;
+                // This improves throughput
+                int row = first_row;
+                int col = first_col + stage;
+                if (col >= col_blocks) {
+                    ++row;
+                    col -= col_blocks;
+                }
                 tma::store_async(g.c, a_smem[stage], {row, col});
             }
         }
