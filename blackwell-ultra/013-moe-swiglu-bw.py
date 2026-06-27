@@ -25,22 +25,14 @@ TIMED_ITERS = 10
 
 
 def swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert):
-    """bf16 grouped SwiGLU reference.
-
-    x:                 (total_tokens, HIDDEN_DIM)  bf16, tokens grouped contiguously by expert
-    w_gate / w_up:     (E, HIDDEN_DIM, I)          bf16
-    w_down:            (E, I, HIDDEN_DIM)          bf16
-    tokens_per_expert: (E,)                         int, per-expert tokens
-    returns:           (total_tokens, HIDDEN_DIM)  bf16
-    """
     y = torch.empty_like(x)
     offset = 0
     for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
-        _x = x[offset:offset + num_tokens]                        # (num_tokens, H)
-        gate = _x @ w_gate[expert_idx]                            # (num_tokens, I)
-        up = _x @ w_up[expert_idx]                                # (num_tokens, I)
-        hid = (F.silu(gate.float()) * up.float()).to(x.dtype)     # (num_tokens, I)
-        y[offset:offset + num_tokens] = hid @ w_down[expert_idx]  # (num_tokens, H)
+        _x = x[offset:offset + num_tokens]                          # (num_tokens, H)
+        gate = _x @ w_gate[expert_idx].T                            # (num_tokens, I)
+        up = _x @ w_up[expert_idx].T                                # (num_tokens, I)
+        hid = (F.silu(gate.float()) * up.float()).to(x.dtype)       # (num_tokens, I)
+        y[offset:offset + num_tokens] = hid @ w_down[expert_idx].T  # (num_tokens, H)
         offset += num_tokens
     return y
 
@@ -58,9 +50,9 @@ def main():
     # Generate inputs
     gen    = torch.Generator(device=device).manual_seed(1234)
     x      = torch.randn(total_tokens, H, generator=gen, device=device, dtype=torch.bfloat16)
-    w_gate = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
-    w_up   = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
-    w_down = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
+    w_gate = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
+    w_up   = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
+    w_down = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
     torch.cuda.synchronize()
 
     # Benchmark
