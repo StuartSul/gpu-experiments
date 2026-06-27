@@ -4,7 +4,6 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros.h>
-#include <tuple>
 
 using namespace kittens;
 
@@ -15,12 +14,12 @@ struct config {
     static constexpr int Nb = 256;
     static constexpr int Kb = 64;
     static constexpr int SUPERGROUP_SIZE = 8;
+    static constexpr int LOAD_PIPE_DEPTH = 5;
+    static constexpr int EPI_PIPE_DEPTH = 4;
 
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
-
-    static constexpr int LOAD_PIPE_DEPTH = 5;
-    static constexpr int EPI_PIPE_DEPTH = 4;
+    static constexpr int SWIGLU_PIPE_DEPTH = 3;
 
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_CONSUMERS = 1;
@@ -58,7 +57,7 @@ struct globals {
         const int row_blocks = x.rows() / C::Mb;
         const int gate_up_tasks = row_blocks * (w_gate.rows() / C::Nb);
         const int swiglu_tiles = (hidden.rows() / C::SWIGLU_Mb) * (hidden.cols() / C::SWIGLU_Nb);
-        const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * 3 - 1) / (C::CLUSTER_SIZE * 3);
+        const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
         const int down_tasks = row_blocks * (w_down.rows() / C::Nb);
         return dim3(C::CLUSTER_SIZE * (2 * gate_up_tasks + swiglu_tasks + down_tasks));
     }
@@ -67,60 +66,67 @@ struct globals {
 template <typename C>
 __device__ __forceinline__ void swiglu(
     const globals<C> &g,
+    semaphore (&swiglu_inputs_arrived)[C::SWIGLU_PIPE_DEPTH],
+    uint32_t &swiglu_bitfield,
+    int cta_rank,
     int task_idx,
-    uint64_t smem_base_addr,
-    semaphore (&inputs_arrived)[C::LOAD_PIPE_DEPTH]
+    uint64_t smem_base_addr
 ) {
     using G = globals<C>;
 
-    const int cta_rank = cluster_ctarank();
+    typename G::swiglu_tile (&a_smem)[C::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename G::swiglu_tile (*)[C::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
+    typename G::swiglu_tile (&b_smem)[C::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename G::swiglu_tile (*)[C::SWIGLU_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
+
     const int intermediate_col_blocks = g.w_gate.rows() / C::Nb;
-    const int projection_tasks = (g.x.rows() / C::Mb) * intermediate_col_blocks;
-    const int row_blocks = g.hidden.rows() / G::swiglu_tile::rows;
-    const int col_blocks = g.hidden.cols() / G::swiglu_tile::cols;
+    const int gate_up_tasks = (g.x.rows() / C::Mb) * intermediate_col_blocks;
+
+    const int row_blocks = g.hidden.rows() / C::SWIGLU_Mb;
+    const int col_blocks = g.hidden.cols() / C::SWIGLU_Nb;
     const int num_tiles = row_blocks * col_blocks;
-    const int first_tile_idx = task_idx * C::CLUSTER_SIZE * 3 + cta_rank * 3;
+    const int first_tile_idx = task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
     if (first_tile_idx >= num_tiles)
         return;
-
-    typename G::swiglu_tile (&a_smem)[3] = *reinterpret_cast<typename G::swiglu_tile (*)[3]>(smem_base_addr);
-    typename G::swiglu_tile (&b_smem)[3] = *reinterpret_cast<typename G::swiglu_tile (*)[3]>(smem_base_addr + sizeof(a_smem));
 
     int first_row, first_col;
     if (threadIdx.x == 0) {
         first_row = first_tile_idx / col_blocks;
         first_col = first_tile_idx % col_blocks;
         #pragma unroll
-        for (int stage = 0; stage < 3; ++stage) {
+        for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
             if (tile_idx < num_tiles) {
+                // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
                 if (col >= col_blocks) {
                     ++row;
                     col -= col_blocks;
                 }
-                const int parent_task_idx = (row / 2) * intermediate_col_blocks + col / 2;
-                while (atomicAdd(&g.counters[{parent_task_idx}], 0) < C::CLUSTER_SIZE)
-                    __nanosleep(64);
-                while (atomicAdd(&g.counters[{projection_tasks + parent_task_idx}], 0) < C::CLUSTER_SIZE)
-                    __nanosleep(64);
-                init_semaphore(inputs_arrived[stage], 0, 1);
-                tma::expect_bytes(inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
-                tma::load_async(a_smem[stage], g.gate, {row, col}, inputs_arrived[stage]);
-                tma::load_async(b_smem[stage], g.up, {row, col}, inputs_arrived[stage]);
+                tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
+
+                const int parent_task_idx = (row / (C::Mb / C::SWIGLU_Mb)) * intermediate_col_blocks + col / (C::Nb / C::SWIGLU_Nb);
+                while (true) {
+                    int gate_up_counter;
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.counters[{parent_task_idx}]) : "memory");
+                    if (gate_up_counter >= 2 * C::CLUSTER_SIZE) break;
+                    __nanosleep(16);
+                }
+                asm volatile("{fence.acquire.gpu;}" ::: "memory");
+
+                tma::load_async(a_smem[stage], g.gate, {row, col}, swiglu_inputs_arrived[stage]);
+                tma::load_async(b_smem[stage], g.up,   {row, col}, swiglu_inputs_arrived[stage]);
             }
         }
     }
-    __syncthreads();
 
     using compute_group = group<C::NUM_WARPS>;
-    rt_fl<C::Mb / 2 / C::NUM_WARPS, C::Nb / 2> gate, up, denominator;
     #pragma unroll
-    for (int stage = 0; stage < 3; ++stage) {
+    for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
         const int tile_idx = first_tile_idx + stage;
         if (tile_idx < num_tiles) {
-            wait(inputs_arrived[stage], 0);
+            rt_fl<C::SWIGLU_Mb / C::NUM_WARPS, C::SWIGLU_Nb> gate, up, denominator;
+            wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
+            update_phasebit<0>(swiglu_bitfield, stage);
             compute_group::load(gate, a_smem[stage]);
             compute_group::load(up, b_smem[stage]);
             compute_group::mul(denominator, gate, -1.4426950408889634f);
@@ -131,6 +137,7 @@ __device__ __forceinline__ void swiglu(
             compute_group::store(a_smem[stage], gate);
             __syncthreads();
             if (threadIdx.x == 0) {
+                // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
                 if (col >= col_blocks) {
@@ -144,16 +151,16 @@ __device__ __forceinline__ void swiglu(
 
     if (threadIdx.x == 0) {
         tma::store_async_wait();
-        __threadfence();
         #pragma unroll
-        for (int stage = 0; stage < 3; ++stage) {
+        for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
             if (tile_idx < num_tiles) {
+                // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
                 if (col >= col_blocks)
                     ++row;
-                atomicAdd(&g.counters[{2 * projection_tasks + row / 2}], 1);
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{gate_up_tasks + row / (C::Mb / C::SWIGLU_Mb)}]), "r"(1) : "memory");
             }
         }
     }
@@ -162,16 +169,17 @@ __device__ __forceinline__ void swiglu(
 template <typename C>
 __device__ __forceinline__ void expert_grouped_gemm(
     const globals<C> &g,
-    int task_idx,
-    int kind,
-    uint64_t smem_base_addr,
-    uint32_t &tmem_addr,
     semaphore &tmem_provisioned,
     semaphore &tmem_finished,
     semaphore (&inputs_arrived)[C::LOAD_PIPE_DEPTH],
     semaphore (&inputs_finished)[C::LOAD_PIPE_DEPTH],
     semaphore &outputs_arrived,
     semaphore &outputs_finished,
+    int cta_rank,
+    int task_idx,
+    int kind,
+    uint64_t smem_base_addr,
+    uint32_t &tmem_addr,
     uint32_t &bitfield
 ) {
     using G = globals<C>;
@@ -183,8 +191,7 @@ __device__ __forceinline__ void expert_grouped_gemm(
     const bool is_gate = kind == 0;
     const bool is_up = kind == 1;
     const bool is_down = kind == 2;
-    const int cta_rank = cluster_ctarank();
-    const int projection_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
+    const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
 
     const typename G::activation_gl &a_gl = is_down ? g.hidden : g.x;
     const typename G::weight_gl &b_gl = is_gate ? g.w_gate : (is_up ? g.w_up : g.w_down);
@@ -210,10 +217,16 @@ __device__ __forceinline__ void expert_grouped_gemm(
         return;
 
     if (is_down) {
-        const int swiglu_tiles_per_row_block = (C::Mb / G::swiglu_tile::rows) * (g.hidden.cols() / G::swiglu_tile::cols);
+        const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
         if (threadIdx.x == 0) {
-            while (atomicAdd(&g.counters[{2 * projection_tasks + tile_coord.x}], 0) < swiglu_tiles_per_row_block)
+            int swiglu_counter;
+            while (true) {
+                asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{gate_up_tasks + tile_coord.x}]) : "memory");
+                if (swiglu_counter >= swiglu_tiles_per_row_block)
+                    break;
                 __nanosleep(64);
+            }
+            asm volatile("{fence.acquire.gpu;}" ::: "memory");
         }
         __syncthreads();
     }
@@ -296,9 +309,8 @@ __device__ __forceinline__ void expert_grouped_gemm(
             if (warp::elect_leader()) {
                 tma::store_async_wait();
                 if (!is_down) {
-                    __threadfence();
-                    const int counter_task_idx = tile_coord.x * col_blocks + tile_coord.y;
-                    atomicAdd(&g.counters[{(is_gate ? 0 : projection_tasks) + counter_task_idx}], 1);
+                    asm volatile("{fence.release.gpu;}" ::: "memory");
+                    atomicAdd(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}], 1);
                 }
                 tma::cluster::arrive(tmem_finished, 1 - cta_rank);
             }
@@ -317,41 +329,52 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
 
     __shared__ uint32_t tmem_addr;
     __shared__ semaphore tmem_provisioned, tmem_finished;
+    __shared__ semaphore swiglu_inputs_arrived[C::SWIGLU_PIPE_DEPTH];
     __shared__ semaphore inputs_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived, outputs_finished;
 
     uint32_t bitfield = 0xFFFF0000;
+    uint32_t swiglu_bitfield = 0xFFFF0000;
 
     const int cluster_idx = clusterIdx().x;
+    const int cta_rank = cluster_ctarank();
     const int row_blocks = g.x.rows() / C::Mb;
-    const int projection_tasks = row_blocks * (g.w_gate.rows() / C::Nb);
-    const int swiglu_tiles = (g.hidden.rows() / G::swiglu_tile::rows) * (g.hidden.cols() / G::swiglu_tile::cols);
-    const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * 3 - 1) / (C::CLUSTER_SIZE * 3);
+    const int gate_up_tasks = row_blocks * (g.w_gate.rows() / C::Nb);
+    const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
+    const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
 
-    if (cluster_idx < projection_tasks) {
+    if (cluster_idx < gate_up_tasks) {
         expert_grouped_gemm<C>(
-            g, cluster_idx, 0, smem_base_addr, tmem_addr, tmem_provisioned, tmem_finished,
-            inputs_arrived, inputs_finished, outputs_arrived, outputs_finished, bitfield
+            g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
+            outputs_arrived, outputs_finished, cta_rank, cluster_idx, 0,
+            smem_base_addr, tmem_addr, bitfield
         );
         return;
     }
-    if (cluster_idx < 2 * projection_tasks) {
+    if (cluster_idx < 2 * gate_up_tasks) {
         expert_grouped_gemm<C>(
-            g, cluster_idx - projection_tasks, 1, smem_base_addr, tmem_addr, tmem_provisioned,
-            tmem_finished, inputs_arrived, inputs_finished, outputs_arrived,
-            outputs_finished, bitfield
+            g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
+            outputs_arrived, outputs_finished, cta_rank, cluster_idx - gate_up_tasks, 1,
+            smem_base_addr, tmem_addr, bitfield
         );
         return;
     }
-    if (cluster_idx < 2 * projection_tasks + swiglu_tasks) {
-        swiglu<C>(g, cluster_idx - 2 * projection_tasks, smem_base_addr, inputs_arrived);
+    if (cluster_idx < 2 * gate_up_tasks + swiglu_tasks) {
+        if (threadIdx.x == 0) {
+            #pragma unroll
+            for (int i = 0; i < C::SWIGLU_PIPE_DEPTH; ++i)
+                init_semaphore(swiglu_inputs_arrived[i], 0, 1);
+        }
+        __syncthreads();
+        swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, cluster_idx - 2 * gate_up_tasks, smem_base_addr);
         return;
     }
     expert_grouped_gemm<C>(
-        g, cluster_idx - 2 * projection_tasks - swiglu_tasks, 2, smem_base_addr, tmem_addr,
-        tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
-        outputs_arrived, outputs_finished, bitfield
+        g, tmem_provisioned, tmem_finished, inputs_arrived, inputs_finished,
+        outputs_arrived, outputs_finished, cta_rank,
+        cluster_idx - 2 * gate_up_tasks - swiglu_tasks, 2,
+        smem_base_addr, tmem_addr, bitfield
     );
 }
 
@@ -371,7 +394,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_swiglu(
     at::Tensor y = at::empty_like(x);
     const int row_blocks = x.size(0) / C::Mb;
     const int gate_up_tasks = row_blocks * (w_gate.size(1) / C::Nb);
-    at::Tensor counters = at::zeros({2 * gate_up_tasks + row_blocks}, tokens_per_expert.options());
+    at::Tensor counters = at::zeros({gate_up_tasks + row_blocks}, tokens_per_expert.options());
 
     G g {
         .x = kittens::py::tensor_to_gl<G::activation_gl>(x),
