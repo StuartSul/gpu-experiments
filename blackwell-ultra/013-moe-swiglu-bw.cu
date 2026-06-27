@@ -46,10 +46,11 @@ struct globals {
     index_gl tokens_per_expert; // (E,)
     activation_gl y;  // (total_tokens, H)
 
-    __host__ __inline__ dim3 grid() { return dim3(1); } // TODO
+    __host__ __inline__ dim3 grid() const { return dim3(C::CLUSTER_SIZE); } // TODO
 };
 
-__device__ inline void swiglu_kernel(const globals &G) {
+template <typename C>
+__device__ inline void swiglu_kernel(const globals<C> &g) {
     // TODO
 }
 
@@ -60,18 +61,21 @@ at::Tensor swiglu(
     const at::Tensor &w_down,
     const at::Tensor &tokens_per_expert
 ) {
+    using C = config;
+    using G = globals<C>;
+
     at::Tensor y = at::empty_like(x);
 
-    globals G {
-        .x = kittens::py::tensor_to_gl<globals::activation_gl>(x),
-        .w_gate = kittens::py::tensor_to_gl<globals::weight_gl>(w_gate),
-        .w_up = kittens::py::tensor_to_gl<globals::weight_gl>(w_up),
-        .w_down = kittens::py::tensor_to_gl<globals::weight_gl>(w_down),
-        .tokens_per_expert = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert),
-        .y = kittens::py::tensor_to_gl<globals::activation_gl>(y),
+    G g {
+        .x = kittens::py::tensor_to_gl<G::activation_gl>(x),
+        .w_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_gate),
+        .w_up = kittens::py::tensor_to_gl<G::weight_gl>(w_up),
+        .w_down = kittens::py::tensor_to_gl<G::weight_gl>(w_down),
+        .tokens_per_expert = kittens::py::tensor_to_gl<G::index_gl>(tokens_per_expert),
+        .y = kittens::py::tensor_to_gl<G::activation_gl>(y),
     };
 
-    kittens::py::launch_kernel<config, globals, swiglu_kernel>(G);
+    kittens::py::launch_kernel<C, G, swiglu_kernel<C>>(g);
 
     return y;
 }

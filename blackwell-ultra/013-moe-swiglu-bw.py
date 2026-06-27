@@ -4,11 +4,14 @@ To run:
     python3 013-moe-swiglu-bw.py
 """
 
+import os
+import sys
+
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _C import dispatch, schedule, combine
+from _C import swiglu
 
 
 NUM_LOCAL_TOKENS = 7168
@@ -60,18 +63,18 @@ def main():
     w_down = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
     torch.cuda.synchronize()
 
-    # Benchmark reference
+    # Benchmark
     for _ in range(WARMUP_ITERS):
-        y = swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+        y = swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        y = swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+        y = swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     end.record()
     torch.cuda.synchronize()
-    ref_ms = start.elapsed_time(end) / TIMED_ITERS
+    ms = start.elapsed_time(end) / TIMED_ITERS
 
     flops = 6 * total_tokens * H * I
 
@@ -84,7 +87,16 @@ def main():
 
     print("impl         ms      TFLOP/s")
     print("---------  -------  ---------")
-    print(f"bf16 ref   {ref_ms:>7.3f}  {flops / 1e9 / ref_ms:>9.1f}", flush=True)
+    print(f"swiglu     {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
+
+    # Correctness check
+    y_ref = swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+    out = y.float()
+    ref = y_ref.float()
+    diff = (out - ref).abs()
+    print(f"\nout   abs mean {out.abs().mean().item():.4f}   abs max {out.abs().max().item():.4f}")
+    print(f"ref   abs mean {ref.abs().mean().item():.4f}   abs max {ref.abs().max().item():.4f}")
+    print(f"diff  abs mean {diff.mean().item():.4f}   abs max {diff.max().item():.4f}", flush=True)
 
 
 if __name__ == "__main__":
