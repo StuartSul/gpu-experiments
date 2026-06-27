@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _C import swiglu
+from _C import moe_swiglu
 
 
 NUM_LOCAL_TOKENS = 7168
@@ -24,7 +24,7 @@ WARMUP_ITERS = 5
 TIMED_ITERS = 10
 
 
-def swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert):
+def moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert):
     y = torch.empty_like(x)
     offset = 0
     for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
@@ -57,13 +57,13 @@ def main():
 
     # Benchmark
     for _ in range(WARMUP_ITERS):
-        y = swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
+        y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        y = swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
+        y = moe_swiglu(x, w_gate, w_up, w_down, tokens_per_expert)
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / TIMED_ITERS
@@ -79,10 +79,10 @@ def main():
 
     print("impl         ms      TFLOP/s")
     print("---------  -------  ---------")
-    print(f"swiglu     {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
+    print(f"moe_swiglu {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
 
     # Correctness check
-    y_ref = swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+    y_ref = moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
     out = y.float()
     ref = y_ref.float()
     diff = (out - ref).abs()

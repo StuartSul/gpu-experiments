@@ -5,7 +5,7 @@
 
 using namespace kittens;
 
-namespace swigluer {
+namespace moe_swigluer {
 
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
@@ -21,9 +21,9 @@ struct config {
     static constexpr bool OVERLAP_EPI = true;
 
     static constexpr int SUPERGROUP_SIZE = 12;
-    static constexpr int Mb = 256;
-    static constexpr int Nb = 256;
-    static constexpr int Kb = 128;
+    static constexpr int Mb = 256; // must not change
+    static constexpr int Nb = 256; // must not change
+    static constexpr int Kb = 128; // must not change
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int NUM_D_TILES = 2;
 
