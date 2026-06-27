@@ -268,8 +268,7 @@ __device__ __forceinline__ void expert_grouped_gemm(
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
             if (kind != expert_gemm_kind::DOWN) {
                 tma::store_async_wait();
-                asm volatile("{fence.release.gpu;}" ::: "memory");
-                atomicAdd(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}], 1);
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}]), "r"(1) : "memory");
             }
         }
     }
