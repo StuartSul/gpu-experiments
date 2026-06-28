@@ -7,7 +7,7 @@
 
 using namespace kittens;
 
-namespace moe_swigluer {
+namespace moe_mlp_swigluer {
 
 struct config {
     static constexpr int Mb = 256;
@@ -43,24 +43,37 @@ struct globals {
     using weight_gl = gl<bf16, 1, -1, -1, -1, b_tile>;
     using index_gl = gl<int, 1, 1, 1, -1>;
 
-    activation_gl x;
-    activation_gl gate;
-    activation_gl up;
-    activation_gl hidden;
-    activation_gl y;
-    weight_gl w_gate;
-    weight_gl w_up;
-    weight_gl w_down;
+    activation_gl x_shared;
+    activation_gl x_routed;
+    activation_gl gate_shared;
+    activation_gl gate_routed;
+    activation_gl up_shared;
+    activation_gl up_routed;
+    activation_gl hidden_shared;
+    activation_gl hidden_routed;
+    activation_gl y_shared;
+    activation_gl y_routed;
+    weight_gl w_shared_gate;
+    weight_gl w_routed_gate;
+    weight_gl w_shared_up;
+    weight_gl w_routed_up;
+    weight_gl w_shared_down;
+    weight_gl w_routed_down;
     index_gl tokens_per_expert;
     index_gl counters;
 
     __host__ inline dim3 grid() const {
-        const int row_blocks = x.rows() / C::Mb;
-        const int gate_up_tasks = row_blocks * (w_gate.rows() / C::Nb);
-        const int swiglu_tiles = (hidden.rows() / C::SWIGLU_Mb) * (hidden.cols() / C::SWIGLU_Nb);
-        const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
-        const int down_tasks = row_blocks * (w_down.rows() / C::Nb);
-        return dim3(C::CLUSTER_SIZE * (2 * gate_up_tasks + swiglu_tasks + down_tasks));
+        const int shared_row_blocks = x_shared.rows() / C::Mb;
+        const int routed_row_blocks = x_routed.rows() / C::Mb;
+        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / C::Nb);
+        const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.rows() / C::Nb);
+        const int shared_swiglu_tiles = (hidden_shared.rows() / C::SWIGLU_Mb) * (hidden_shared.cols() / C::SWIGLU_Nb);
+        const int routed_swiglu_tiles = (hidden_routed.rows() / C::SWIGLU_Mb) * (hidden_routed.cols() / C::SWIGLU_Nb);
+        const int shared_swiglu_tasks = (shared_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+        const int routed_swiglu_tasks = (routed_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / C::Nb);
+        const int routed_down_tasks = routed_row_blocks * (w_routed_down.rows() / C::Nb);
+        return dim3(C::CLUSTER_SIZE * (2 * (shared_gate_up_tasks + routed_gate_up_tasks) + shared_swiglu_tasks + routed_swiglu_tasks + shared_down_tasks + routed_down_tasks));
     }
 };
 
@@ -279,7 +292,7 @@ __device__ __forceinline__ void expert_grouped_gemm(
 }
 
 template <typename C>
-__device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
+__device__ __forceinline__ void moe_mlp_swiglu_kernel(const globals<C> &g) {
     using G = globals<C>;
 
     warpgroup::increase_registers<256>();
@@ -371,46 +384,67 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     }
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_swiglu(
-    const at::Tensor &x,
-    const at::Tensor &w_gate,
-    const at::Tensor &w_up,
-    const at::Tensor &w_down,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_mlp_swiglu(
+    const at::Tensor &x_shared,
+    const at::Tensor &x_routed,
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_shared_down,
+    const at::Tensor &w_routed_down,
     const at::Tensor &tokens_per_expert
 ) {
     using C = config;
     using G = globals<C>;
 
-    at::Tensor gate = at::empty({x.size(0), w_gate.size(1)}, x.options());
-    at::Tensor up = at::empty({x.size(0), w_up.size(1)}, x.options());
-    at::Tensor hidden = at::empty({x.size(0), w_gate.size(1)}, x.options());
-    at::Tensor y = at::empty_like(x);
-    const int row_blocks = x.size(0) / C::Mb;
-    const int gate_up_tasks = row_blocks * (w_gate.size(1) / C::Nb);
-    at::Tensor counters = at::zeros({gate_up_tasks + row_blocks}, tokens_per_expert.options());
+    at::Tensor gate_shared = at::empty({x_shared.size(0), w_shared_gate.size(0)}, x_shared.options());
+    at::Tensor gate_routed = at::empty({x_routed.size(0), w_routed_gate.size(1)}, x_routed.options());
+    at::Tensor up_shared = at::empty({x_shared.size(0), w_shared_up.size(0)}, x_shared.options());
+    at::Tensor up_routed = at::empty({x_routed.size(0), w_routed_up.size(1)}, x_routed.options());
+    at::Tensor hidden_shared = at::empty({x_shared.size(0), w_shared_gate.size(0)}, x_shared.options());
+    at::Tensor hidden_routed = at::empty({x_routed.size(0), w_routed_gate.size(1)}, x_routed.options());
+    at::Tensor y_shared = at::empty_like(x_shared);
+    at::Tensor y_routed = at::empty_like(x_routed);
+    const int shared_row_blocks = x_shared.size(0) / C::Mb;
+    const int routed_row_blocks = x_routed.size(0) / C::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / C::Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / C::Nb);
+    at::Tensor counters = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
 
     G g {
-        .x = kittens::py::tensor_to_gl<G::activation_gl>(x),
-        .gate = kittens::py::tensor_to_gl<G::activation_gl>(gate),
-        .up = kittens::py::tensor_to_gl<G::activation_gl>(up),
-        .hidden = kittens::py::tensor_to_gl<G::activation_gl>(hidden),
-        .y = kittens::py::tensor_to_gl<G::activation_gl>(y),
-        .w_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_gate),
-        .w_up = kittens::py::tensor_to_gl<G::weight_gl>(w_up),
-        .w_down = kittens::py::tensor_to_gl<G::weight_gl>(w_down),
+        .x_shared = kittens::py::tensor_to_gl<G::activation_gl>(x_shared),
+        .x_routed = kittens::py::tensor_to_gl<G::activation_gl>(x_routed),
+        .gate_shared = kittens::py::tensor_to_gl<G::activation_gl>(gate_shared),
+        .gate_routed = kittens::py::tensor_to_gl<G::activation_gl>(gate_routed),
+        .up_shared = kittens::py::tensor_to_gl<G::activation_gl>(up_shared),
+        .up_routed = kittens::py::tensor_to_gl<G::activation_gl>(up_routed),
+        .hidden_shared = kittens::py::tensor_to_gl<G::activation_gl>(hidden_shared),
+        .hidden_routed = kittens::py::tensor_to_gl<G::activation_gl>(hidden_routed),
+        .y_shared = kittens::py::tensor_to_gl<G::activation_gl>(y_shared),
+        .y_routed = kittens::py::tensor_to_gl<G::activation_gl>(y_routed),
+        .w_shared_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_gate),
+        .w_routed_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_gate),
+        .w_shared_up = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_up),
+        .w_routed_up = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_up),
+        .w_shared_down = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_down),
+        .w_routed_down = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_down),
         .tokens_per_expert = kittens::py::tensor_to_gl<G::index_gl>(tokens_per_expert),
         .counters = kittens::py::tensor_to_gl<G::index_gl>(counters)
     };
 
-    kittens::py::launch_kernel<C, G, moe_swiglu_kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, moe_mlp_swiglu_kernel<C>>(g);
 
-    return {gate, up, hidden, y};
+    return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed};
 }
 
-} // namespace moe_swigluer
+} // namespace moe_mlp_swigluer
 
 PYBIND11_MODULE(_C, m) {
-    m.def("moe_swiglu", &moe_swigluer::moe_swiglu, "MoE SwiGLU",
-          pybind11::arg("x"), pybind11::arg("w_gate"), pybind11::arg("w_up"), pybind11::arg("w_down"),
+    m.def("moe_mlp_swiglu", &moe_mlp_swigluer::moe_mlp_swiglu, "MoE MLP SwiGLU",
+          pybind11::arg("x_shared"), pybind11::arg("x_routed"),
+          pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
+          pybind11::arg("w_shared_up"), pybind11::arg("w_routed_up"),
+          pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
           pybind11::arg("tokens_per_expert"));
 }
