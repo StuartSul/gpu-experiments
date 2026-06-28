@@ -7,7 +7,7 @@
 
 using namespace kittens;
 
-namespace moe_swigluer {
+namespace moe_mlp_swigluer {
 
 struct config {
     static constexpr int MINIBATCH_SIZE = 4096;
@@ -48,29 +48,44 @@ struct globals {
     using weight_gl = gl<bf16, 1, -1, -1, -1, b_tile>;
     using index_gl = gl<int, 1, 1, 1, -1>;
 
-    activation_gl x;
-    activation_gl gate;
-    activation_gl up;
-    activation_gl hidden;
-    activation_gl y;
-    weight_gl w_gate;
-    weight_gl w_up;
-    weight_gl w_down;
+    activation_gl x_shared;
+    activation_gl x_routed;
+    activation_gl gate_shared;
+    activation_gl gate_routed;
+    activation_gl up_shared;
+    activation_gl up_routed;
+    activation_gl hidden_shared;
+    activation_gl hidden_routed;
+    activation_gl y_shared;
+    activation_gl y_routed;
+    weight_gl w_shared_gate;
+    weight_gl w_routed_gate;
+    weight_gl w_shared_up;
+    weight_gl w_routed_up;
+    weight_gl w_shared_down;
+    weight_gl w_routed_down;
     index_gl tokens_per_expert;
     index_gl counters;
 
     __host__ inline dim3 grid() const {
-        const int num_minibatches = (x.rows() + C::MINIBATCH_SIZE - 1) / C::MINIBATCH_SIZE;
-        const int gate_up_tasks = (C::MINIBATCH_SIZE / C::Mb) * (w_gate.rows() / C::Nb);
-        const int swiglu_tiles = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (hidden.cols() / C::SWIGLU_Nb);
-        const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
-        const int down_tasks = (C::MINIBATCH_SIZE / C::Mb) * (w_down.rows() / C::Nb);
-        const int tasks_per_minibatch = 2 * gate_up_tasks + swiglu_tasks + down_tasks;
-        return dim3(C::CLUSTER_SIZE * num_minibatches * tasks_per_minibatch);
+        const int num_minibatches = (x_routed.rows() + C::MINIBATCH_SIZE - 1) / C::MINIBATCH_SIZE;
+        const int shared_row_blocks = x_shared.rows() / C::Mb;
+        const int minibatch_routed_row_blocks = C::MINIBATCH_SIZE / C::Mb;
+        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / C::Nb);
+        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / C::Nb);
+        const int shared_swiglu_tiles = (hidden_shared.rows() / C::SWIGLU_Mb) * (hidden_shared.cols() / C::SWIGLU_Nb);
+        const int minibatch_routed_swiglu_tiles = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (hidden_routed.cols() / C::SWIGLU_Nb);
+        const int shared_swiglu_tasks = (shared_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+        const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / C::Nb);
+        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / C::Nb);
+        const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
+        const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
+        return dim3(C::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks));
     }
 };
 
-template <typename C>
+template <typename C, bool IS_SHARED>
 __device__ __forceinline__ void swiglu(
     const globals<C> &g,
     semaphore (&swiglu_inputs_arrived)[C::SWIGLU_PIPE_DEPTH],
@@ -85,20 +100,42 @@ __device__ __forceinline__ void swiglu(
     typename G::swiglu_tile (&a_smem)[C::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename G::swiglu_tile (*)[C::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
     typename G::swiglu_tile (&b_smem)[C::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename G::swiglu_tile (*)[C::SWIGLU_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
 
-    const int intermediate_col_blocks = g.w_gate.rows() / C::Nb;
-    const int gate_up_tasks = (g.x.rows() / C::Mb) * intermediate_col_blocks;
+    const typename G::activation_gl &x_gmem      = IS_SHARED ? g.x_shared : g.x_routed;
+    const typename G::activation_gl &gate_gmem   = IS_SHARED ? g.gate_shared : g.gate_routed;
+    const typename G::activation_gl &up_gmem     = IS_SHARED ? g.up_shared : g.up_routed;
+    const typename G::activation_gl &hidden_gmem = IS_SHARED ? g.hidden_shared : g.hidden_routed;
+    const typename G::weight_gl     &w_gate_gmem = IS_SHARED ? g.w_shared_gate : g.w_routed_gate;
 
-    int num_tokens = 0;
-    for (int expert_idx = 0; expert_idx < g.w_gate.depth(); ++expert_idx)
-        num_tokens += g.tokens_per_expert[{expert_idx}];
+    const int shared_row_blocks = g.x_shared.rows() / C::Mb;
+    const int routed_row_blocks = g.x_routed.rows() / C::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / C::Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / C::Nb);
+    const int gate_counter_offset = IS_SHARED ? 0 : shared_gate_up_tasks;
+    const int swiglu_counter_offset = shared_gate_up_tasks + routed_gate_up_tasks + (IS_SHARED ? 0 : shared_row_blocks);
+    const int intermediate_col_blocks = w_gate_gmem.rows() / C::Nb;
+
+    int num_tokens;
+    if constexpr (IS_SHARED) {
+        num_tokens = x_gmem.rows();
+    } else {
+        num_tokens = 0;
+        for (int expert_idx = 0; expert_idx < w_gate_gmem.depth(); ++expert_idx)
+            num_tokens += g.tokens_per_expert[{expert_idx}];
+    }
     const int row_blocks = num_tokens / C::SWIGLU_Mb;
-    const int col_blocks = g.hidden.cols() / C::SWIGLU_Nb;
+    const int col_blocks = hidden_gmem.cols() / C::SWIGLU_Nb;
     const int num_tiles = row_blocks * col_blocks;
-    const int num_tiles_per_minibatch = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * col_blocks;
-    const int minibatch_first_tile_idx = minibatch_idx * num_tiles_per_minibatch;
-    const int minibatch_tile_end = min(num_tiles, minibatch_first_tile_idx + num_tiles_per_minibatch);
-    const int first_tile_idx = minibatch_first_tile_idx + task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
-    if (first_tile_idx >= minibatch_tile_end)
+    int first_tile_idx, tile_end;
+    if constexpr (IS_SHARED) {
+        first_tile_idx = task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
+        tile_end = num_tiles;
+    } else {
+        const int num_tiles_per_minibatch = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * col_blocks;
+        const int minibatch_first_tile_idx = minibatch_idx * num_tiles_per_minibatch;
+        first_tile_idx = minibatch_first_tile_idx + task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
+        tile_end = min(num_tiles, minibatch_first_tile_idx + num_tiles_per_minibatch);
+    }
+    if (first_tile_idx >= tile_end)
         return;
 
     int first_row, first_col;
@@ -108,7 +145,7 @@ __device__ __forceinline__ void swiglu(
         #pragma unroll
         for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
-            if (tile_idx < minibatch_tile_end) {
+            if (tile_idx < tile_end) {
                 // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
@@ -121,14 +158,14 @@ __device__ __forceinline__ void swiglu(
                 const int parent_task_idx = (row / (C::Mb / C::SWIGLU_Mb)) * intermediate_col_blocks + col / (C::Nb / C::SWIGLU_Nb);
                 while (true) {
                     int gate_up_counter;
-                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.counters[{parent_task_idx}]) : "memory");
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.counters[{gate_counter_offset + parent_task_idx}]) : "memory");
                     if (gate_up_counter >= 2 * C::CLUSTER_SIZE) break;
                     __nanosleep(16);
                 }
                 asm volatile("{fence.acquire.gpu;}" ::: "memory");
 
-                tma::load_async(a_smem[stage], g.gate, {row, col}, swiglu_inputs_arrived[stage]);
-                tma::load_async(b_smem[stage], g.up,   {row, col}, swiglu_inputs_arrived[stage]);
+                tma::load_async(a_smem[stage], gate_gmem, {row, col}, swiglu_inputs_arrived[stage]);
+                tma::load_async(b_smem[stage], up_gmem,   {row, col}, swiglu_inputs_arrived[stage]);
             }
         }
     }
@@ -137,7 +174,7 @@ __device__ __forceinline__ void swiglu(
     #pragma unroll
     for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
         const int tile_idx = first_tile_idx + stage;
-        if (tile_idx < minibatch_tile_end) {
+        if (tile_idx < tile_end) {
             rt_fl<C::SWIGLU_Mb / C::NUM_WARPS, C::SWIGLU_Nb> gate, up, denominator;
             wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
             update_phasebit<0>(swiglu_bitfield, stage);
@@ -158,7 +195,7 @@ __device__ __forceinline__ void swiglu(
                     ++row;
                     col -= col_blocks;
                 }
-                tma::store_async(g.hidden, a_smem[stage], {row, col});
+                tma::store_async(hidden_gmem, a_smem[stage], {row, col});
             }
         }
     }
@@ -168,13 +205,13 @@ __device__ __forceinline__ void swiglu(
         #pragma unroll
         for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
-            if (tile_idx < minibatch_tile_end) {
+            if (tile_idx < tile_end) {
                 // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
                 if (col >= col_blocks)
                     ++row;
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{gate_up_tasks + row / (C::Mb / C::SWIGLU_Mb)}]), "r"(1) : "memory");
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{swiglu_counter_offset + row / (C::Mb / C::SWIGLU_Mb)}]), "r"(1) : "memory");
             }
         }
     }
@@ -182,7 +219,7 @@ __device__ __forceinline__ void swiglu(
 
 enum class expert_gemm_kind { GATE, UP, DOWN };
 
-template <typename C>
+template <typename C, bool IS_SHARED>
 __device__ __forceinline__ void expert_grouped_gemm(
     const globals<C> &g,
     semaphore (&gemm_inputs_arrived)[C::LOAD_PIPE_DEPTH],
@@ -203,40 +240,63 @@ __device__ __forceinline__ void expert_grouped_gemm(
     typename G::b_tile (&b_smem)[C::LOAD_PIPE_DEPTH] = *reinterpret_cast<typename G::b_tile (*)[C::LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
     typename G::d_tile (&d_smem)[C::NUM_D_TILES] = *reinterpret_cast<typename G::d_tile (*)[C::NUM_D_TILES]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
 
-    const typename G::activation_gl &a_gmem = kind == expert_gemm_kind::DOWN ? g.hidden : g.x;
-    const typename G::weight_gl &b_gmem     = kind == expert_gemm_kind::GATE ? g.w_gate : (kind == expert_gemm_kind::UP ? g.w_up : g.w_down);
-    const typename G::activation_gl &d_gmem = kind == expert_gemm_kind::GATE ? g.gate   : (kind == expert_gemm_kind::UP ? g.up : g.y);
+    const typename G::activation_gl &x_gmem      = IS_SHARED ? g.x_shared : g.x_routed;
+    const typename G::activation_gl &gate_gmem   = IS_SHARED ? g.gate_shared : g.gate_routed;
+    const typename G::activation_gl &up_gmem     = IS_SHARED ? g.up_shared : g.up_routed;
+    const typename G::activation_gl &hidden_gmem = IS_SHARED ? g.hidden_shared : g.hidden_routed;
+    const typename G::activation_gl &y_gmem      = IS_SHARED ? g.y_shared : g.y_routed;
+    const typename G::weight_gl     &w_gate_gmem = IS_SHARED ? g.w_shared_gate : g.w_routed_gate;
+    const typename G::weight_gl     &w_up_gmem   = IS_SHARED ? g.w_shared_up : g.w_routed_up;
+    const typename G::weight_gl     &w_down_gmem = IS_SHARED ? g.w_shared_down : g.w_routed_down;
 
-    constexpr int minibatch_row_blocks = C::MINIBATCH_SIZE / C::Mb;
-    const int minibatch_row_offset = minibatch_idx * minibatch_row_blocks;
+    const typename G::activation_gl &a_gmem = kind == expert_gemm_kind::DOWN ? hidden_gmem : x_gmem;
+    const typename G::weight_gl     &b_gmem = kind == expert_gemm_kind::GATE ? w_gate_gmem : (kind == expert_gemm_kind::UP ? w_up_gmem : w_down_gmem);
+    const typename G::activation_gl &d_gmem = kind == expert_gemm_kind::GATE ? gate_gmem   : (kind == expert_gemm_kind::UP ? up_gmem : y_gmem);
+
     const int iters_per_task = a_gmem.cols() / C::Kb;
     const int col_blocks     = b_gmem.rows() / C::Nb;
+    const int shared_row_blocks = g.x_shared.rows() / C::Mb;
+    const int routed_row_blocks = g.x_routed.rows() / C::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / C::Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / C::Nb);
+    const int gate_counter_offset = IS_SHARED ? 0 : shared_gate_up_tasks;
+    const int swiglu_counter_offset = shared_gate_up_tasks + routed_gate_up_tasks + (IS_SHARED ? 0 : shared_row_blocks);
 
-    int row_block_offset = 0;
     int3 tile_coord = {-1, -1, -1};
-    for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
-        const int expert_row_blocks = g.tokens_per_expert[{expert_idx}] / C::Mb;
-        const int first_row_block = max(minibatch_row_offset, row_block_offset);
-        const int row_blocks = max(0, min(minibatch_row_offset + minibatch_row_blocks, row_block_offset + expert_row_blocks) - first_row_block);
+    if constexpr (IS_SHARED) {
+        const int row_blocks = x_gmem.rows() / C::Mb;
         const int num_tasks = row_blocks * col_blocks;
         if (task_idx < num_tasks) {
             const int2 swizzled = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
-            tile_coord = {first_row_block + swizzled.x, swizzled.y, expert_idx};
-            break;
+            tile_coord = {swizzled.x, swizzled.y, 0};
         }
-        task_idx -= num_tasks;
-        row_block_offset += expert_row_blocks;
+    } else {
+        constexpr int minibatch_routed_row_blocks = C::MINIBATCH_SIZE / C::Mb;
+        const int minibatch_routed_row_offset = minibatch_idx * minibatch_routed_row_blocks;
+        int row_block_offset = 0;
+        for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
+            const int expert_row_blocks = g.tokens_per_expert[{expert_idx}] / C::Mb;
+            const int first_row_block = max(minibatch_routed_row_offset, row_block_offset);
+            const int row_blocks = max(0, min(minibatch_routed_row_offset + minibatch_routed_row_blocks, row_block_offset + expert_row_blocks) - first_row_block);
+            const int num_tasks = row_blocks * col_blocks;
+            if (task_idx < num_tasks) {
+                const int2 swizzled = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
+                tile_coord = {first_row_block + swizzled.x, swizzled.y, expert_idx};
+                break;
+            }
+            task_idx -= num_tasks;
+            row_block_offset += expert_row_blocks;
+        }
     }
     if (tile_coord.z < 0) return;
 
     if (warpgroup::groupid() == C::NUM_CONSUMERS) {
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
             if (kind == expert_gemm_kind::DOWN) {
-                const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
-                const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
+                const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (hidden_gmem.cols() / C::SWIGLU_Nb);
                 int swiglu_counter;
                 while (true) {
-                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{gate_up_tasks + tile_coord.x}]) : "memory");
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{swiglu_counter_offset + tile_coord.x}]) : "memory");
                     if (swiglu_counter >= swiglu_tiles_per_row_block) break;
                     __nanosleep(16);
                 }
@@ -287,14 +347,14 @@ __device__ __forceinline__ void expert_grouped_gemm(
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
             if (kind != expert_gemm_kind::DOWN) {
                 tma::store_async_wait();
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{tile_coord.x * col_blocks + tile_coord.y}]), "r"(1) : "memory");
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{gate_counter_offset + tile_coord.x * col_blocks + tile_coord.y}]), "r"(1) : "memory");
             }
         }
     }
 }
 
 template <typename C>
-__device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
+__device__ __forceinline__ void moe_mlp_swiglu_kernel(const globals<C> &g) {
     using G = globals<C>;
 
     warpgroup::increase_registers<256>();
@@ -304,11 +364,18 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
 
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
-    const int minibatch_gate_up_tasks = (C::MINIBATCH_SIZE / C::Mb) * (g.w_gate.rows() / C::Nb);
-    const int minibatch_down_tasks    = (C::MINIBATCH_SIZE / C::Mb) * (g.w_down.rows() / C::Nb);
-    const int minibatch_swiglu_tiles  = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
-    const int minibatch_swiglu_tasks  = (minibatch_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
-    const int tasks_per_minibatch = 2 * minibatch_gate_up_tasks + minibatch_swiglu_tasks + minibatch_down_tasks;
+    const int shared_row_blocks = g.x_shared.rows() / C::Mb;
+    const int minibatch_routed_row_blocks = C::MINIBATCH_SIZE / C::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / C::Nb);
+    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / C::Nb);
+    const int shared_swiglu_tiles = (g.hidden_shared.rows() / C::SWIGLU_Mb) * (g.hidden_shared.cols() / C::SWIGLU_Nb);
+    const int minibatch_routed_swiglu_tiles = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (g.hidden_routed.cols() / C::SWIGLU_Nb);
+    const int shared_swiglu_tasks = (shared_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+    const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+    const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / C::Nb);
+    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / C::Nb);
+    const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
+    const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
 
@@ -353,32 +420,58 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
             tma::expect_bytes(schedule_arrived[clc_stage], sizeof(clc_handle[clc_stage]));
         }
 
-        const int minibatch_idx  = cluster_idx / tasks_per_minibatch;
-        const int minibatch_task_idx = cluster_idx - minibatch_idx * tasks_per_minibatch;
-
-        if (minibatch_task_idx < minibatch_gate_up_tasks) {
-            // Gate
+        if (cluster_idx < shared_gate_up_tasks) {
+            // Shared gate
             current_is_swiglu = false;
-            const int task_idx = minibatch_task_idx;
-            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
-        } else if (minibatch_task_idx < minibatch_gate_up_tasks * 2) {
-            // Up
+            const int task_idx = cluster_idx;
+            expert_grouped_gemm<C, true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                         gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
+        } else if (cluster_idx < shared_gate_up_tasks * 2) {
+            // Shared up
             current_is_swiglu = false;
-            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks;
-            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
-        } else if (minibatch_task_idx < minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks) {
-            // Swiglu
+            const int task_idx = cluster_idx - shared_gate_up_tasks;
+            expert_grouped_gemm<C, true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                         gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
+        } else if (cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks) {
+            // Shared Swiglu
             current_is_swiglu = true;
-            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks * 2;
-            swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr);
-        } else {
-            // Down
+            const int task_idx = cluster_idx - shared_gate_up_tasks * 2;
+            swiglu<C, true>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, 0, task_idx, smem_base_addr);
+        } else if (cluster_idx < shared_tasks) {
+            // Shared down
             current_is_swiglu = false;
-            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks * 2 - minibatch_swiglu_tasks;
-            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+            const int task_idx = cluster_idx - shared_gate_up_tasks * 2 - shared_swiglu_tasks;
+            expert_grouped_gemm<C, true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                         gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+        } else {
+            // Routed expert with minibatching
+            const int minibatch_idx = (cluster_idx - shared_tasks) / minibatch_tasks;
+            const int minibatch_task_idx = (cluster_idx - shared_tasks) - minibatch_idx * minibatch_tasks;
+
+            if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
+                // Routed gate
+                current_is_swiglu = false;
+                const int task_idx = minibatch_task_idx;
+                expert_grouped_gemm<C, false>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                              gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
+            } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2) {
+                // Routed up
+                current_is_swiglu = false;
+                const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
+                expert_grouped_gemm<C, false>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                              gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
+            } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks) {
+                // Routed Swiglu
+                current_is_swiglu = true;
+                const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
+                swiglu<C, false>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr);
+            } else {
+                // Routed down
+                current_is_swiglu = false;
+                const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2 - minibatch_routed_swiglu_tasks;
+                expert_grouped_gemm<C, false>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                              gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+            }
         }
 
         wait(schedule_arrived[clc_stage], (task_iter / C::CLC_PIPE_DEPTH) % 2);
@@ -388,54 +481,75 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
 
         // SWIGLU -> GEMM requires a cluster-wide sync
-        if (current_is_swiglu && cluster_idx >= 0) {
-            const int next_minibatch_task_idx = cluster_idx - (cluster_idx / tasks_per_minibatch) * tasks_per_minibatch;
-            if (next_minibatch_task_idx < minibatch_gate_up_tasks * 2 || next_minibatch_task_idx >= minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks)
-                everyone::tma::cluster::sync();
-        }
+        const int next_minibatch_task_idx = (cluster_idx - shared_tasks) - ((cluster_idx - shared_tasks) / minibatch_tasks) * minibatch_tasks;
+        const bool next_is_shared_swiglu = cluster_idx >= shared_gate_up_tasks * 2 && cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks;
+        const bool next_is_routed_swiglu = next_minibatch_task_idx >= minibatch_routed_gate_up_tasks * 2 && next_minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks;;
+        if (current_is_swiglu && cluster_idx >= 0 && !next_is_shared_swiglu && !next_is_routed_swiglu)
+            everyone::tma::cluster::sync();
     }
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_swiglu(
-    const at::Tensor &x,
-    const at::Tensor &w_gate,
-    const at::Tensor &w_up,
-    const at::Tensor &w_down,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_mlp_swiglu(
+    const at::Tensor &x_shared,
+    const at::Tensor &x_routed,
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_shared_down,
+    const at::Tensor &w_routed_down,
     const at::Tensor &tokens_per_expert
 ) {
     using C = config;
     using G = globals<C>;
 
-    at::Tensor gate = at::empty({x.size(0), w_gate.size(1)}, x.options());
-    at::Tensor up = at::empty({x.size(0), w_up.size(1)}, x.options());
-    at::Tensor hidden = at::empty({x.size(0), w_gate.size(1)}, x.options());
-    at::Tensor y = at::empty_like(x);
-    const int row_blocks = x.size(0) / C::Mb;
-    const int gate_up_tasks = row_blocks * (w_gate.size(1) / C::Nb);
-    at::Tensor counters = at::zeros({gate_up_tasks + row_blocks}, tokens_per_expert.options());
+    at::Tensor gate_shared = at::empty({x_shared.size(0), w_shared_gate.size(0)}, x_shared.options());
+    at::Tensor gate_routed = at::empty({x_routed.size(0), w_routed_gate.size(1)}, x_routed.options());
+    at::Tensor up_shared = at::empty({x_shared.size(0), w_shared_up.size(0)}, x_shared.options());
+    at::Tensor up_routed = at::empty({x_routed.size(0), w_routed_up.size(1)}, x_routed.options());
+    at::Tensor hidden_shared = at::empty({x_shared.size(0), w_shared_gate.size(0)}, x_shared.options());
+    at::Tensor hidden_routed = at::empty({x_routed.size(0), w_routed_gate.size(1)}, x_routed.options());
+    at::Tensor y_shared = at::empty_like(x_shared);
+    at::Tensor y_routed = at::empty_like(x_routed);
+    const int shared_row_blocks = x_shared.size(0) / C::Mb;
+    const int routed_row_blocks = x_routed.size(0) / C::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / C::Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / C::Nb);
+    at::Tensor counters = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
 
     G g {
-        .x = kittens::py::tensor_to_gl<G::activation_gl>(x),
-        .gate = kittens::py::tensor_to_gl<G::activation_gl>(gate),
-        .up = kittens::py::tensor_to_gl<G::activation_gl>(up),
-        .hidden = kittens::py::tensor_to_gl<G::activation_gl>(hidden),
-        .y = kittens::py::tensor_to_gl<G::activation_gl>(y),
-        .w_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_gate),
-        .w_up = kittens::py::tensor_to_gl<G::weight_gl>(w_up),
-        .w_down = kittens::py::tensor_to_gl<G::weight_gl>(w_down),
+        .x_shared = kittens::py::tensor_to_gl<G::activation_gl>(x_shared),
+        .x_routed = kittens::py::tensor_to_gl<G::activation_gl>(x_routed),
+        .gate_shared = kittens::py::tensor_to_gl<G::activation_gl>(gate_shared),
+        .gate_routed = kittens::py::tensor_to_gl<G::activation_gl>(gate_routed),
+        .up_shared = kittens::py::tensor_to_gl<G::activation_gl>(up_shared),
+        .up_routed = kittens::py::tensor_to_gl<G::activation_gl>(up_routed),
+        .hidden_shared = kittens::py::tensor_to_gl<G::activation_gl>(hidden_shared),
+        .hidden_routed = kittens::py::tensor_to_gl<G::activation_gl>(hidden_routed),
+        .y_shared = kittens::py::tensor_to_gl<G::activation_gl>(y_shared),
+        .y_routed = kittens::py::tensor_to_gl<G::activation_gl>(y_routed),
+        .w_shared_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_gate),
+        .w_routed_gate = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_gate),
+        .w_shared_up = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_up),
+        .w_routed_up = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_up),
+        .w_shared_down = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_down),
+        .w_routed_down = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_down),
         .tokens_per_expert = kittens::py::tensor_to_gl<G::index_gl>(tokens_per_expert),
         .counters = kittens::py::tensor_to_gl<G::index_gl>(counters)
     };
 
-    kittens::py::launch_kernel<C, G, moe_swiglu_kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, moe_mlp_swiglu_kernel<C>>(g);
 
-    return {gate, up, hidden, y};
+    return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed};
 }
 
-} // namespace moe_swigluer
+} // namespace moe_mlp_swigluer
 
 PYBIND11_MODULE(_C, m) {
-    m.def("moe_swiglu", &moe_swigluer::moe_swiglu, "MoE SwiGLU",
-          pybind11::arg("x"), pybind11::arg("w_gate"), pybind11::arg("w_up"), pybind11::arg("w_down"),
+    m.def("moe_mlp_swiglu", &moe_mlp_swigluer::moe_mlp_swiglu, "MoE MLP SwiGLU",
+          pybind11::arg("x_shared"), pybind11::arg("x_routed"),
+          pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
+          pybind11::arg("w_shared_up"), pybind11::arg("w_routed_up"),
+          pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
           pybind11::arg("tokens_per_expert"));
 }
