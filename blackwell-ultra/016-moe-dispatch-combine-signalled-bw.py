@@ -1,7 +1,7 @@
 """
 To run:
     make
-    torchrun --nproc_per_node=4 012-moe-dispatch-combine-bw.py
+    torchrun --nproc_per_node=4 016-moe-dispatch-combine-signalled-bw.py
 """
 
 import gc
@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _C import dispatch, schedule, combine
 
 
+MINIBATCH_SIZE = 4096
 NUM_LOCAL_TOKENS = 7168
 HIDDEN_DIM = 7168
 NUM_LOCAL_EXPERTS = 4
@@ -50,6 +51,7 @@ def main():
 
     NUM_EXPERTS = NUM_LOCAL_EXPERTS * world_size
     CAPACITY = NUM_LOCAL_TOKENS * TOPK * 2 # Global recv capacit, 2x headroom over average
+    num_minibatches = (CAPACITY + MINIBATCH_SIZE - 1) // MINIBATCH_SIZE
 
     # Generate inputs and buffers
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
@@ -62,6 +64,8 @@ def main():
     dhdl = symm_mem.rendezvous(tokens, dist.group.WORLD.group_name)
     tokens_ptrs = [dhdl.buffer_ptrs[i] for i in range(world_size)]
     dispatch_recv = torch.zeros(CAPACITY, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dispatch_counter = torch.zeros(num_minibatches, dtype=torch.int32, device=device)
+    combine_counter = torch.full((num_minibatches,), 999999, dtype=torch.int32, device=device)
     combine_recv = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_recv.zero_()
     chdl = symm_mem.rendezvous(combine_recv, dist.group.WORLD.group_name)
@@ -99,14 +103,14 @@ def main():
 
     # Dispatcher benchmark
     for _ in range(WARMUP_ITERS):
-        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, TOPK)
+        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, TOPK)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     dist.barrier()  # release all ranks together so the dispatch is genuinely concurrent
     start.record()
     for _ in range(TIMED_ITERS):
-        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, TOPK)
+        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, TOPK)
     end.record()
     torch.cuda.synchronize()
     dispatcher_ms = start.elapsed_time(end) / TIMED_ITERS
@@ -114,14 +118,14 @@ def main():
 
     # Combiner benchmark
     for _ in range(WARMUP_ITERS):
-        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx)
+        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     dist.barrier()
     start.record()
     for _ in range(TIMED_ITERS):
-        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx)
+        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter)
     end.record()
     torch.cuda.synchronize()
     combiner_ms = start.elapsed_time(end) / TIMED_ITERS
