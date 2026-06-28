@@ -1055,7 +1055,7 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
 ) {
     static constexpr int NUM_DEVICES = 4;
     static constexpr int MINIBATCH_SIZE = 4096;
-    static constexpr int DISPATCH_COMBINE_SMS = 8;
+    static constexpr int DISPATCH_COMBINE_SMS = 24;
 
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
