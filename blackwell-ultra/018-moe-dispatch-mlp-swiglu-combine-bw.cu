@@ -984,7 +984,7 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor> schedule(
     return {schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert};
 }
 
-__host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_mlp_swiglu_combine(
+__host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_mlp_swiglu_combine(
     // Inputs and communication buffers
     const at::Tensor &x,
     const std::vector<int64_t> &x_ptrs,
@@ -1033,7 +1033,7 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     mlp_swigluer::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
     combiner::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
 
-    return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, combine_buffer};
+    return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer};
 }
 
 PYBIND11_MODULE(_C, m) {
