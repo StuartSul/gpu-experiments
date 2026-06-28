@@ -390,7 +390,7 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         // SWIGLU -> GEMM requires a cluster-wide sync
         if (current_is_swiglu && cluster_idx >= 0) {
             const int next_minibatch_task_idx = cluster_idx - (cluster_idx / tasks_per_minibatch) * tasks_per_minibatch;
-            if (next_minibatch_task_idx >= minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks)
+            if (next_minibatch_task_idx < minibatch_gate_up_tasks * 2 || next_minibatch_task_idx >= minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks)
                 everyone::tma::cluster::sync();
         }
     }
