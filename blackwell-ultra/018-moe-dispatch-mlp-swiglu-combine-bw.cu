@@ -950,13 +950,6 @@ static __host__ void mlp_swiglu(
 
 }; // struct mlp_swigluer
 
-static constexpr int NUM_DEVICES = 4;
-static constexpr int MINIBATCH_SIZE = 4096;
-
-using Dispatcher = dispatcher<NUM_DEVICES, MINIBATCH_SIZE>;
-using Combiner = combiner<NUM_DEVICES, MINIBATCH_SIZE>;
-using MlpSwigluer = mlp_swigluer<MINIBATCH_SIZE>;
-
 __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor> schedule(
     const at::Tensor &topk_all,
     const int num_local_experts,
@@ -1000,6 +993,8 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     // Metadata
     int topk
 ) {
+    static constexpr int NUM_DEVICES = 4;
+    static constexpr int MINIBATCH_SIZE = 4096;
 
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
@@ -1021,9 +1016,9 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     at::Tensor mlp_swiglu_counter = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
     at::Tensor combine_counter = at::zeros({num_minibatches}, tokens_per_expert.options());
 
-    Dispatcher::dispatch(x, x_ptrs, dispatch_buffer, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, topk);
-    MlpSwigluer::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
-    Combiner::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
+    dispatcher<NUM_DEVICES, MINIBATCH_SIZE>::dispatch(x, x_ptrs, dispatch_buffer, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, topk);
+    mlp_swigluer<MINIBATCH_SIZE>::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
+    combiner<NUM_DEVICES, MINIBATCH_SIZE>::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
 
     return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer};
 }
@@ -1031,25 +1026,6 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
 PYBIND11_MODULE(_C, m) {
     m.def("schedule", &schedule, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("capacity"), pybind11::arg("rank"));
-    m.def("dispatch", &Dispatcher::dispatch, "",
-          pybind11::arg("send_buffer"), pybind11::arg("send_buffer_ptrs"), pybind11::arg("recv_buffer"),
-          pybind11::arg("schedule_src_rank"), pybind11::arg("schedule_src_token_idx"),
-          pybind11::arg("tokens_per_expert"), pybind11::arg("dispatch_counter"), pybind11::arg("topk"));
-    m.def("combine", &Combiner::combine, "",
-          pybind11::arg("send_buffer"), pybind11::arg("recv_buffer"), pybind11::arg("recv_buffer_ptrs"),
-          pybind11::arg("schedule_dst_rank"), pybind11::arg("schedule_dst_token_idx"),
-          pybind11::arg("tokens_per_expert"), pybind11::arg("combine_counter"));
-    m.def("mlp_swiglu", &MlpSwigluer::mlp_swiglu, "",
-          pybind11::arg("x_shared"), pybind11::arg("x_routed"),
-          pybind11::arg("gate_shared"), pybind11::arg("gate_routed"),
-          pybind11::arg("up_shared"), pybind11::arg("up_routed"),
-          pybind11::arg("hidden_shared"), pybind11::arg("hidden_routed"),
-          pybind11::arg("y_shared"), pybind11::arg("y_routed"),
-          pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
-          pybind11::arg("w_shared_up"), pybind11::arg("w_routed_up"),
-          pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
-          pybind11::arg("tokens_per_expert"),
-          pybind11::arg("dispatch_counter"), pybind11::arg("mlp_swiglu_counter"), pybind11::arg("combine_counter"));
     m.def("dispatch_mlp_swiglu_combine", &dispatch_mlp_swiglu_combine, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("dispatch_buffer"), pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
