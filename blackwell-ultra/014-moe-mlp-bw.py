@@ -1,7 +1,7 @@
 """
 To run:
     make
-    python3 015-moe-mlp-bw.py
+    python3 014-moe-mlp-bw.py
 """
 
 import os
