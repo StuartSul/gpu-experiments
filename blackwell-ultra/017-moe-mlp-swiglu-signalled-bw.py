@@ -1,7 +1,7 @@
 """
 To run:
     make
-    python3 016-moe-bw.py
+    python3 017-moe-mlp-swiglu-signalled-bw.py
 """
 
 import os
