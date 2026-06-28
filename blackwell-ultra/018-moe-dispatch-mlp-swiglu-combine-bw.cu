@@ -4,8 +4,68 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 using namespace kittens;
+
+template <int DISPATCH_COMBINE_SMS>
+struct green_context_streams {
+    CUdevice device;
+    CUgreenCtx mlp_swiglu_context = nullptr;
+    CUgreenCtx dispatch_combine_context = nullptr;
+    CUstream mlp_swiglu_stream = nullptr;
+    CUstream dispatch_combine_stream = nullptr;
+    CUevent main_ready = nullptr;
+    CUevent mlp_swiglu_done = nullptr;
+    CUevent dispatch_combine_done = nullptr;
+
+    explicit green_context_streams(CUdevice device_) : device(device_) {
+        CUdevResource all_sms{};
+        CUdevResource dispatch_combine_sms{};
+        CUdevResource remaining_sms{};
+        CUCHECK(cuDeviceGetDevResource(device, &all_sms, CU_DEV_RESOURCE_TYPE_SM));
+
+        unsigned int num_groups = 1;
+        CUCHECK(cuDevSmResourceSplitByCount(&dispatch_combine_sms, &num_groups, &all_sms, &remaining_sms, 0, DISPATCH_COMBINE_SMS));
+        TORCH_CHECK(num_groups == 1);
+        TORCH_CHECK(dispatch_combine_sms.sm.smCount == DISPATCH_COMBINE_SMS);
+        TORCH_CHECK(remaining_sms.type == CU_DEV_RESOURCE_TYPE_SM && remaining_sms.sm.smCount >= 2);
+
+        CUdevResourceDesc mlp_swiglu_desc = nullptr;
+        CUdevResourceDesc dispatch_combine_desc = nullptr;
+        CUCHECK(cuDevResourceGenerateDesc(&mlp_swiglu_desc, &remaining_sms, 1));
+        CUCHECK(cuDevResourceGenerateDesc(&dispatch_combine_desc, &dispatch_combine_sms, 1));
+        CUCHECK(cuGreenCtxCreate(&mlp_swiglu_context, mlp_swiglu_desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
+        CUCHECK(cuGreenCtxCreate(&dispatch_combine_context, dispatch_combine_desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
+
+        CUCHECK(cuGreenCtxStreamCreate(&mlp_swiglu_stream, mlp_swiglu_context, CU_STREAM_NON_BLOCKING, 0));
+        CUCHECK(cuGreenCtxStreamCreate(&dispatch_combine_stream, dispatch_combine_context, CU_STREAM_NON_BLOCKING, 0));
+
+        CUCHECK(cuEventCreate(&main_ready, CU_EVENT_DISABLE_TIMING));
+        CUCHECK(cuEventCreate(&mlp_swiglu_done, CU_EVENT_DISABLE_TIMING));
+        CUCHECK(cuEventCreate(&dispatch_combine_done, CU_EVENT_DISABLE_TIMING));
+    }
+
+    ~green_context_streams() noexcept {
+        if (mlp_swiglu_stream != nullptr) (void)cuStreamSynchronize(mlp_swiglu_stream);
+        if (dispatch_combine_stream != nullptr) (void)cuStreamSynchronize(dispatch_combine_stream);
+        if (main_ready != nullptr) (void)cuEventDestroy(main_ready);
+        if (mlp_swiglu_done != nullptr) (void)cuEventDestroy(mlp_swiglu_done);
+        if (dispatch_combine_done != nullptr) (void)cuEventDestroy(dispatch_combine_done);
+        if (mlp_swiglu_stream != nullptr) (void)cuStreamDestroy(mlp_swiglu_stream);
+        if (dispatch_combine_stream != nullptr) (void)cuStreamDestroy(dispatch_combine_stream);
+        if (mlp_swiglu_context != nullptr) (void)cuGreenCtxDestroy(mlp_swiglu_context);
+        if (dispatch_combine_context != nullptr) (void)cuGreenCtxDestroy(dispatch_combine_context);
+    }
+
+    static __host__ green_context_streams &get() {
+        CUdevice device;
+        CUCHECK(cuCtxGetDevice(&device));
+        static green_context_streams gcs(device);
+        return gcs;
+    }
+};
 
 struct scheduler {
 
@@ -995,14 +1055,15 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
 ) {
     static constexpr int NUM_DEVICES = 4;
     static constexpr int MINIBATCH_SIZE = 4096;
+    static constexpr int DISPATCH_COMBINE_SMS = 8;
 
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
     const int num_minibatches = (buffer_capacity + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
-    const int shared_row_blocks = num_local_tokens / MlpSwigluer::config::Mb;
-    const int routed_row_blocks = buffer_capacity / MlpSwigluer::config::Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / MlpSwigluer::config::Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / MlpSwigluer::config::Nb);
+    const int shared_row_blocks = num_local_tokens / mlp_swigluer<MINIBATCH_SIZE>::config::Mb;
+    const int routed_row_blocks = buffer_capacity / mlp_swigluer<MINIBATCH_SIZE>::config::Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / mlp_swigluer<MINIBATCH_SIZE>::config::Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / mlp_swigluer<MINIBATCH_SIZE>::config::Nb);
     
     at::Tensor gate_shared = at::empty({x.size(0), w_shared_gate.size(0)}, x.options());
     at::Tensor gate_routed = at::empty({dispatch_buffer.size(0), w_routed_gate.size(1)}, dispatch_buffer.options());
@@ -1016,9 +1077,31 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     at::Tensor mlp_swiglu_counter = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
     at::Tensor combine_counter = at::zeros({num_minibatches}, tokens_per_expert.options());
 
-    dispatcher<NUM_DEVICES, MINIBATCH_SIZE>::dispatch(x, x_ptrs, dispatch_buffer, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, topk);
-    mlp_swigluer<MINIBATCH_SIZE>::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
-    combiner<NUM_DEVICES, MINIBATCH_SIZE>::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
+    cudaStream_t current_stream = at::cuda::getCurrentCUDAStream();
+    CUstream current_stream_cu = reinterpret_cast<CUstream>(current_stream);
+
+    green_context_streams<DISPATCH_COMBINE_SMS> &gcs = green_context_streams<DISPATCH_COMBINE_SMS>::get();
+    c10::DeviceIndex device_index = static_cast<c10::DeviceIndex>(gcs.device);
+    c10::cuda::CUDAStream dispatch_combine_stream = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(gcs.dispatch_combine_stream), device_index);
+    c10::cuda::CUDAStream mlp_swiglu_stream = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(gcs.mlp_swiglu_stream), device_index);
+
+    CUCHECK(cuEventRecord(gcs.main_ready, current_stream_cu));
+    CUCHECK(cuGreenCtxWaitEvent(gcs.dispatch_combine_context, gcs.main_ready));
+    CUCHECK(cuGreenCtxWaitEvent(gcs.mlp_swiglu_context, gcs.main_ready));
+
+    {
+        c10::cuda::CUDAStreamGuard stream_guard(dispatch_combine_stream);
+        dispatcher<NUM_DEVICES, MINIBATCH_SIZE>::dispatch(x, x_ptrs, dispatch_buffer, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, topk);
+        stream_guard.reset_stream(mlp_swiglu_stream);
+        mlp_swigluer<MINIBATCH_SIZE>::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
+        stream_guard.reset_stream(dispatch_combine_stream);
+        combiner<NUM_DEVICES, MINIBATCH_SIZE>::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
+    }
+
+    CUCHECK(cuGreenCtxRecordEvent(gcs.mlp_swiglu_context, gcs.mlp_swiglu_done));
+    CUCHECK(cuGreenCtxRecordEvent(gcs.dispatch_combine_context, gcs.dispatch_combine_done));
+    CUCHECK(cuStreamWaitEvent(current_stream_cu, gcs.mlp_swiglu_done, 0));
+    CUCHECK(cuStreamWaitEvent(current_stream_cu, gcs.dispatch_combine_done, 0));
 
     return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer};
 }
