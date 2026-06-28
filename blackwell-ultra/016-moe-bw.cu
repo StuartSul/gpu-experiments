@@ -10,6 +10,8 @@ using namespace kittens;
 namespace moe_swigluer {
 
 struct config {
+    static constexpr int MINIBATCH_SIZE = 4096;
+
     static constexpr int Mb = 256;
     static constexpr int Nb = 256;
     static constexpr int Kb = 64;
@@ -30,6 +32,9 @@ struct config {
 
     static constexpr int NUM_D_TILES = EPI_PIPE_DEPTH > 1 ? 2 : 1;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
+
+    static_assert(MINIBATCH_SIZE % Mb == 0,        "MINIBATCH_SIZE must be a multiple of Mb");
+    static_assert(MINIBATCH_SIZE % SWIGLU_Mb == 0, "MINIBATCH_SIZE must be a multiple of SWIGLU_Mb");
 };
 
 template <typename C>
@@ -55,12 +60,13 @@ struct globals {
     index_gl counters;
 
     __host__ inline dim3 grid() const {
-        const int row_blocks = x.rows() / C::Mb;
-        const int gate_up_tasks = row_blocks * (w_gate.rows() / C::Nb);
-        const int swiglu_tiles = (hidden.rows() / C::SWIGLU_Mb) * (hidden.cols() / C::SWIGLU_Nb);
+        const int num_minibatches = (x.rows() + C::MINIBATCH_SIZE - 1) / C::MINIBATCH_SIZE;
+        const int gate_up_tasks = (C::MINIBATCH_SIZE / C::Mb) * (w_gate.rows() / C::Nb);
+        const int swiglu_tiles = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (hidden.cols() / C::SWIGLU_Nb);
         const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
-        const int down_tasks = row_blocks * (w_down.rows() / C::Nb);
-        return dim3(C::CLUSTER_SIZE * (2 * gate_up_tasks + swiglu_tasks + down_tasks));
+        const int down_tasks = (C::MINIBATCH_SIZE / C::Mb) * (w_down.rows() / C::Nb);
+        const int tasks_per_minibatch = 2 * gate_up_tasks + swiglu_tasks + down_tasks;
+        return dim3(C::CLUSTER_SIZE * num_minibatches * tasks_per_minibatch);
     }
 };
 
@@ -70,6 +76,7 @@ __device__ __forceinline__ void swiglu(
     semaphore (&swiglu_inputs_arrived)[C::SWIGLU_PIPE_DEPTH],
     uint32_t &swiglu_bitfield,
     int cta_rank,
+    int minibatch_idx,
     int task_idx,
     uint64_t smem_base_addr
 ) {
@@ -87,8 +94,11 @@ __device__ __forceinline__ void swiglu(
     const int row_blocks = num_tokens / C::SWIGLU_Mb;
     const int col_blocks = g.hidden.cols() / C::SWIGLU_Nb;
     const int num_tiles = row_blocks * col_blocks;
-    const int first_tile_idx = task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
-    if (first_tile_idx >= num_tiles)
+    const int num_tiles_per_minibatch = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * col_blocks;
+    const int minibatch_first_tile_idx = minibatch_idx * num_tiles_per_minibatch;
+    const int minibatch_tile_end = min(num_tiles, minibatch_first_tile_idx + num_tiles_per_minibatch);
+    const int first_tile_idx = minibatch_first_tile_idx + task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
+    if (first_tile_idx >= minibatch_tile_end)
         return;
 
     int first_row, first_col;
@@ -98,7 +108,7 @@ __device__ __forceinline__ void swiglu(
         #pragma unroll
         for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
-            if (tile_idx < num_tiles) {
+            if (tile_idx < minibatch_tile_end) {
                 // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
@@ -127,7 +137,7 @@ __device__ __forceinline__ void swiglu(
     #pragma unroll
     for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
         const int tile_idx = first_tile_idx + stage;
-        if (tile_idx < num_tiles) {
+        if (tile_idx < minibatch_tile_end) {
             rt_fl<C::SWIGLU_Mb / C::NUM_WARPS, C::SWIGLU_Nb> gate, up, denominator;
             wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
             update_phasebit<0>(swiglu_bitfield, stage);
@@ -158,7 +168,7 @@ __device__ __forceinline__ void swiglu(
         #pragma unroll
         for (int stage = 0; stage < C::SWIGLU_PIPE_DEPTH; ++stage) {
             const int tile_idx = first_tile_idx + stage;
-            if (tile_idx < num_tiles) {
+            if (tile_idx < minibatch_tile_end) {
                 // This improves throughput
                 int row = first_row;
                 int col = first_col + stage;
@@ -181,6 +191,7 @@ __device__ __forceinline__ void expert_grouped_gemm(
     semaphore &gemm_outputs_finished,
     uint32_t &gemm_bitfield,
     int cta_rank,
+    int minibatch_idx,
     int task_idx,
     uint64_t smem_base_addr,
     expert_gemm_kind kind,
@@ -196,21 +207,25 @@ __device__ __forceinline__ void expert_grouped_gemm(
     const typename G::weight_gl &b_gmem     = kind == expert_gemm_kind::GATE ? g.w_gate : (kind == expert_gemm_kind::UP ? g.w_up : g.w_down);
     const typename G::activation_gl &d_gmem = kind == expert_gemm_kind::GATE ? g.gate   : (kind == expert_gemm_kind::UP ? g.up : g.y);
 
+    constexpr int minibatch_row_blocks = C::MINIBATCH_SIZE / C::Mb;
+    const int minibatch_row_offset = minibatch_idx * minibatch_row_blocks;
     const int iters_per_task = a_gmem.cols() / C::Kb;
     const int col_blocks     = b_gmem.rows() / C::Nb;
 
     int row_block_offset = 0;
     int3 tile_coord = {-1, -1, -1};
     for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
-        const int row_blocks = g.tokens_per_expert[{expert_idx}] / C::Mb;
+        const int expert_row_blocks = g.tokens_per_expert[{expert_idx}] / C::Mb;
+        const int first_row_block = max(minibatch_row_offset, row_block_offset);
+        const int row_blocks = max(0, min(minibatch_row_offset + minibatch_row_blocks, row_block_offset + expert_row_blocks) - first_row_block);
         const int num_tasks = row_blocks * col_blocks;
         if (task_idx < num_tasks) {
             const int2 swizzled = get_swizzled_2d_idx<C::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
-            tile_coord = {row_block_offset + swizzled.x, swizzled.y, expert_idx};
+            tile_coord = {first_row_block + swizzled.x, swizzled.y, expert_idx};
             break;
         }
         task_idx -= num_tasks;
-        row_block_offset += row_blocks;
+        row_block_offset += expert_row_blocks;
     }
     if (tile_coord.z < 0) return;
 
@@ -289,9 +304,11 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
 
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
-    const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
-    const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
-    const int swiglu_tasks = (swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+    const int minibatch_gate_up_tasks = (C::MINIBATCH_SIZE / C::Mb) * (g.w_gate.rows() / C::Nb);
+    const int minibatch_down_tasks    = (C::MINIBATCH_SIZE / C::Mb) * (g.w_down.rows() / C::Nb);
+    const int minibatch_swiglu_tiles  = (C::MINIBATCH_SIZE / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
+    const int minibatch_swiglu_tasks  = (minibatch_swiglu_tiles + C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH - 1) / (C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH);
+    const int tasks_per_minibatch = 2 * minibatch_gate_up_tasks + minibatch_swiglu_tasks + minibatch_down_tasks;
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
 
@@ -336,29 +353,32 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
             tma::expect_bytes(schedule_arrived[clc_stage], sizeof(clc_handle[clc_stage]));
         }
 
-        if (cluster_idx < gate_up_tasks) {
+        const int minibatch_idx  = cluster_idx / tasks_per_minibatch;
+        const int minibatch_task_idx = cluster_idx - minibatch_idx * tasks_per_minibatch;
+
+        if (minibatch_task_idx < minibatch_gate_up_tasks) {
             // Gate
             current_is_swiglu = false;
-            const int task_idx = cluster_idx;
+            const int task_idx = minibatch_task_idx;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
-        } else if (cluster_idx < gate_up_tasks * 2) {
+                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
+        } else if (minibatch_task_idx < minibatch_gate_up_tasks * 2) {
             // Up
             current_is_swiglu = false;
-            const int task_idx = cluster_idx - gate_up_tasks;
+            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
-        } else if (cluster_idx < gate_up_tasks * 2 + swiglu_tasks) {
+                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
+        } else if (minibatch_task_idx < minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks) {
             // Swiglu
             current_is_swiglu = true;
-            const int task_idx = cluster_idx - gate_up_tasks * 2;
-            swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, task_idx, smem_base_addr);
+            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks * 2;
+            swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr);
         } else {
             // Down
             current_is_swiglu = false;
-            const int task_idx = cluster_idx - gate_up_tasks * 2 - swiglu_tasks;
+            const int task_idx = minibatch_task_idx - minibatch_gate_up_tasks * 2 - minibatch_swiglu_tasks;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+                                   gemm_bitfield, cta_rank, minibatch_idx, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
         }
 
         wait(schedule_arrived[clc_stage], (task_iter / C::CLC_PIPE_DEPTH) % 2);
@@ -366,8 +386,13 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         cluster_idx = schedule.success ? static_cast<int>(schedule.x / C::CLUSTER_SIZE) : -1;
         __syncwarp();
         warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
-        if (current_is_swiglu && cluster_idx >= gate_up_tasks * 2 + swiglu_tasks)
-            everyone::tma::cluster::sync();
+
+        // SWIGLU -> GEMM requires a cluster-wide sync
+        if (current_is_swiglu && cluster_idx >= 0) {
+            const int next_minibatch_task_idx = cluster_idx - (cluster_idx / tasks_per_minibatch) * tasks_per_minibatch;
+            if (next_minibatch_task_idx >= minibatch_gate_up_tasks * 2 + minibatch_swiglu_tasks)
+                everyone::tma::cluster::sync();
+        }
     }
 }
 
