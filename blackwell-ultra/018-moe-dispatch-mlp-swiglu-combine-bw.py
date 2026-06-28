@@ -128,7 +128,7 @@ def main():
                 schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
             )
         torch.cuda.synchronize()
-    trace_path = f"trace_moe_green_rank{rank}.json"
+    trace_path = f"trace_moe_rank{rank}.json"
     prof.export_chrome_trace(trace_path)
     if rank == 0:
         print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
