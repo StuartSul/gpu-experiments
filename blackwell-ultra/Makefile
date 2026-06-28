@@ -11,7 +11,8 @@
 # SRC := 013-moe-swiglu-bw.cu
 # SRC := 014-moe-mlp-bw.cu
 # SRC := 015-moe-mlp-swiglu-bw.cu
-SRC := 017-moe-mlp-swiglu-signalled-bw.cu
+SRC := 016-moe-dispatch-combine-signalled-bw.cu
+# SRC := 017-moe-mlp-swiglu-signalled-bw.cu
 
 # Binaries
 CC := g++
