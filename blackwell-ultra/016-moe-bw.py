@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _C import moe_mlp_swiglu
 
 
+MINIBATCH_SIZE = 4096
 NUM_LOCAL_TOKENS = 7168
 HIDDEN_DIM = 7168
 INTERMEDIATE_DIM = 2048
@@ -49,6 +50,8 @@ def moe_mlp_swiglu_ref(x_shared, x_routed, w_shared_gate, w_routed_gate, w_share
 
 def main():
     E, H, I = NUM_LOCAL_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM
+    routed_capacity = NUM_LOCAL_TOKENS * TOPK * 2
+    num_minibatches = (routed_capacity + MINIBATCH_SIZE - 1) // MINIBATCH_SIZE
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -57,7 +60,6 @@ def main():
     tokens_per_expert_cpu = [NUM_LOCAL_TOKENS * TOPK // E] * E
     tokens_per_expert = torch.tensor(tokens_per_expert_cpu, dtype=torch.int32, device=device)
     total_routed_tokens = sum(tokens_per_expert_cpu)
-    routed_capacity = NUM_LOCAL_TOKENS * TOPK * 2
 
     # Generate inputs
     gen             = torch.Generator(device=device).manual_seed(1234)
@@ -69,12 +71,14 @@ def main():
     w_routed_up     = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
     w_shared_down   = torch.randn(H, I, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
     w_routed_down   = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
+    dispatch_counter = torch.full((num_minibatches,), 999999, dtype=torch.int32, device=device)
+    combine_counter = torch.zeros(num_minibatches, dtype=torch.int32, device=device)
     torch.cuda.synchronize()
 
     # Benchmark
     for _ in range(WARMUP_ITERS):
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed = moe_mlp_swiglu(
-            x_shared, x_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert
+            x_shared, x_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, combine_counter
         )
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
@@ -82,7 +86,7 @@ def main():
     start.record()
     for _ in range(TIMED_ITERS):
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed = moe_mlp_swiglu(
-            x_shared, x_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert
+            x_shared, x_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, combine_counter
         )
     end.record()
     torch.cuda.synchronize()

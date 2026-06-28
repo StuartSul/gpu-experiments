@@ -24,6 +24,9 @@ struct config {
     static constexpr int SWIGLU_PIPE_DEPTH = 3;
     static constexpr int CLC_PIPE_DEPTH = 1;
 
+    static constexpr int DISPATCH_Mb = 64;
+    static constexpr int DISPATCH_Nb = 256;
+
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_CONSUMERS = 1;
     static constexpr int NUM_PRODUCERS = 1;
@@ -35,6 +38,7 @@ struct config {
 
     static_assert(MINIBATCH_SIZE % Mb == 0,        "MINIBATCH_SIZE must be a multiple of Mb");
     static_assert(MINIBATCH_SIZE % SWIGLU_Mb == 0, "MINIBATCH_SIZE must be a multiple of SWIGLU_Mb");
+    static_assert(MINIBATCH_SIZE % DISPATCH_Mb == 0, "MINIBATCH_SIZE must be a multiple of DISPATCH_Mb");
 };
 
 template <typename C>
@@ -65,7 +69,9 @@ struct globals {
     weight_gl w_shared_down;
     weight_gl w_routed_down;
     index_gl tokens_per_expert;
-    index_gl counters;
+    index_gl mlp_swiglu_counter;
+    index_gl dispatch_counter;
+    index_gl combine_counter;
 
     __host__ inline dim3 grid() const {
         const int num_minibatches = (x_routed.rows() + C::MINIBATCH_SIZE - 1) / C::MINIBATCH_SIZE;
@@ -158,7 +164,7 @@ __device__ __forceinline__ void swiglu(
                 const int parent_task_idx = (row / (C::Mb / C::SWIGLU_Mb)) * intermediate_col_blocks + col / (C::Nb / C::SWIGLU_Nb);
                 while (true) {
                     int gate_up_counter;
-                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.counters[{gate_counter_offset + parent_task_idx}]) : "memory");
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.mlp_swiglu_counter[{gate_counter_offset + parent_task_idx}]) : "memory");
                     if (gate_up_counter >= 2 * C::CLUSTER_SIZE) break;
                     __nanosleep(16);
                 }
@@ -211,7 +217,7 @@ __device__ __forceinline__ void swiglu(
                 int col = first_col + stage;
                 if (col >= col_blocks)
                     ++row;
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{swiglu_counter_offset + row / (C::Mb / C::SWIGLU_Mb)}]), "r"(1) : "memory");
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.mlp_swiglu_counter[{swiglu_counter_offset + row / (C::Mb / C::SWIGLU_Mb)}]), "r"(1) : "memory");
             }
         }
     }
@@ -293,11 +299,25 @@ __device__ __forceinline__ void expert_grouped_gemm(
     if (warpgroup::groupid() == C::NUM_CONSUMERS) {
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
             if (kind == expert_gemm_kind::DOWN) {
-                const int swiglu_tiles_per_row_block = (C::Mb / C::SWIGLU_Mb) * (hidden_gmem.cols() / C::SWIGLU_Nb);
+                const int expected = (C::Mb / C::SWIGLU_Mb) * (hidden_gmem.cols() / C::SWIGLU_Nb);
                 int swiglu_counter;
                 while (true) {
-                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.counters[{swiglu_counter_offset + tile_coord.x}]) : "memory");
-                    if (swiglu_counter >= swiglu_tiles_per_row_block) break;
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.mlp_swiglu_counter[{swiglu_counter_offset + tile_coord.x}]) : "memory");
+                    if (swiglu_counter >= expected) break;
+                    __nanosleep(16);
+                }
+                asm volatile("{fence.acquire.gpu;}" ::: "memory");
+            } else if constexpr (!IS_SHARED) {
+                int num_tokens = 0;
+                for (int expert_idx = 0; expert_idx < g.w_routed_gate.depth(); ++expert_idx)
+                    num_tokens += g.tokens_per_expert[{expert_idx}];
+                const int minibatch_first_row = minibatch_idx * C::MINIBATCH_SIZE;
+                const int minibatch_rows = max(0, min(C::MINIBATCH_SIZE, num_tokens - minibatch_first_row));
+                const int expected = ((minibatch_rows + C::DISPATCH_Mb - 1) / C::DISPATCH_Mb) * (g.x_routed.cols() / C::DISPATCH_Nb);
+                int dispatch_counter;
+                while (true) {
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(dispatch_counter) : "l"(&g.dispatch_counter[{minibatch_idx}]) : "memory");
+                    if (dispatch_counter >= expected) break;
                     __nanosleep(16);
                 }
                 asm volatile("{fence.acquire.gpu;}" ::: "memory");
@@ -346,8 +366,13 @@ __device__ __forceinline__ void expert_grouped_gemm(
         epilogue_group::sync(4);
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
             if (kind != expert_gemm_kind::DOWN) {
+                // Up/gate is complete; signal Swiglu
                 tma::store_async_wait();
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.counters[{gate_counter_offset + tile_coord.x * col_blocks + tile_coord.y}]), "r"(1) : "memory");
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.mlp_swiglu_counter[{gate_counter_offset + tile_coord.x * col_blocks + tile_coord.y}]), "r"(1) : "memory");
+            } else if constexpr (!IS_SHARED) {
+                // Routed down is complete; signal combine
+                tma::store_async_wait();
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.combine_counter[{minibatch_idx}]), "r"(1) : "memory");
             }
         }
     }
@@ -498,7 +523,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const at::Tensor &w_routed_up,
     const at::Tensor &w_shared_down,
     const at::Tensor &w_routed_down,
-    const at::Tensor &tokens_per_expert
+    const at::Tensor &tokens_per_expert,
+    const at::Tensor &dispatch_counter,
+    at::Tensor combine_counter
 ) {
     using C = config;
     using G = globals<C>;
@@ -515,7 +542,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     const int routed_row_blocks = x_routed.size(0) / C::Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / C::Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / C::Nb);
-    at::Tensor counters = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
+    at::Tensor mlp_swiglu_counter = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
+    combine_counter.zero_();
 
     G g {
         .x_shared = kittens::py::tensor_to_gl<G::activation_gl>(x_shared),
@@ -535,7 +563,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         .w_shared_down = kittens::py::tensor_to_gl<G::weight_gl>(w_shared_down),
         .w_routed_down = kittens::py::tensor_to_gl<G::weight_gl>(w_routed_down),
         .tokens_per_expert = kittens::py::tensor_to_gl<G::index_gl>(tokens_per_expert),
-        .counters = kittens::py::tensor_to_gl<G::index_gl>(counters)
+        .mlp_swiglu_counter = kittens::py::tensor_to_gl<G::index_gl>(mlp_swiglu_counter),
+        .dispatch_counter = kittens::py::tensor_to_gl<G::index_gl>(dispatch_counter),
+        .combine_counter = kittens::py::tensor_to_gl<G::index_gl>(combine_counter)
     };
 
     kittens::py::launch_kernel<C, G, moe_mlp_swiglu_kernel<C>>(g);
@@ -551,5 +581,6 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
           pybind11::arg("w_shared_up"), pybind11::arg("w_routed_up"),
           pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
-          pybind11::arg("tokens_per_expert"));
+          pybind11::arg("tokens_per_expert"),
+          pybind11::arg("dispatch_counter"), pybind11::arg("combine_counter"));
 }
