@@ -24,6 +24,7 @@ NUM_LOCAL_EXPERTS = 4
 TOPK = 4
 
 WARMUP_ITERS = 5
+PROFILE_ITERS = 3
 TIMED_ITERS = 10
 
 
@@ -112,6 +113,25 @@ def main():
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
             schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
         )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Trace
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof:
+        for _ in range(PROFILE_ITERS):
+            gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
+                x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+                schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
+            )
+        torch.cuda.synchronize()
+    trace_path = f"trace_moe_green_rank{rank}.json"
+    prof.export_chrome_trace(trace_path)
+    if rank == 0:
+        print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
     torch.cuda.synchronize()
     dist.barrier()
 
