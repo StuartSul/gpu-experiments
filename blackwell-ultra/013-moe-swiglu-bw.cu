@@ -325,6 +325,7 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     tt<float, C::Mb / 2, C::Nb> d_tt = tm_alloc.template allocate<tt<float, C::Mb / 2, C::Nb>>(0);
     everyone::tma::cluster::sync();
 
+    bool current_is_swiglu;
     for (int task_iter = 0; cluster_idx >= 0; ++task_iter) {
         const int clc_stage = task_iter % C::CLC_PIPE_DEPTH;
         if (warpgroup::groupid() == C::NUM_CONSUMERS && warpgroup::warpid() == 1 && warp::elect_leader()) { // warp not used by the gemms
@@ -337,20 +338,24 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
 
         if (cluster_idx < gate_up_tasks) {
             // Gate
+            current_is_swiglu = false;
             const int task_idx = cluster_idx;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                    gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
         } else if (cluster_idx < gate_up_tasks * 2) {
             // Up
+            current_is_swiglu = false;
             const int task_idx = cluster_idx - gate_up_tasks;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                    gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
         } else if (cluster_idx < gate_up_tasks * 2 + swiglu_tasks) {
             // Swiglu
+            current_is_swiglu = true;
             const int task_idx = cluster_idx - gate_up_tasks * 2;
             swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, task_idx, smem_base_addr);
         } else {
             // Down
+            current_is_swiglu = false;
             const int task_idx = cluster_idx - gate_up_tasks * 2 - swiglu_tasks;
             expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                    gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
@@ -361,7 +366,8 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         cluster_idx = schedule.success ? static_cast<int>(schedule.x / C::CLUSTER_SIZE) : -1;
         __syncwarp();
         warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
-        everyone::tma::cluster::sync();
+        if (current_is_swiglu && cluster_idx >= gate_up_tasks * 2 + swiglu_tasks)
+            everyone::tma::cluster::sync();
     }
 }
 
