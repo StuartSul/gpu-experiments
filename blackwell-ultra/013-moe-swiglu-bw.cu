@@ -20,6 +20,7 @@ struct config {
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
     static constexpr int SWIGLU_PIPE_DEPTH = 3;
+    static constexpr int CLC_PIPE_DEPTH = 1;
 
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_CONSUMERS = 1;
@@ -80,7 +81,10 @@ __device__ __forceinline__ void swiglu(
     const int intermediate_col_blocks = g.w_gate.rows() / C::Nb;
     const int gate_up_tasks = (g.x.rows() / C::Mb) * intermediate_col_blocks;
 
-    const int row_blocks = g.hidden.rows() / C::SWIGLU_Mb;
+    int num_tokens = 0;
+    for (int expert_idx = 0; expert_idx < g.w_gate.depth(); ++expert_idx)
+        num_tokens += g.tokens_per_expert[{expert_idx}];
+    const int row_blocks = num_tokens / C::SWIGLU_Mb;
     const int col_blocks = g.hidden.cols() / C::SWIGLU_Nb;
     const int num_tiles = row_blocks * col_blocks;
     const int first_tile_idx = task_idx * C::CLUSTER_SIZE * C::SWIGLU_PIPE_DEPTH + cta_rank * C::SWIGLU_PIPE_DEPTH;
@@ -283,7 +287,7 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     extern __shared__ int __shm[];
     const uint64_t smem_base_addr = (reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023);
 
-    const int cluster_idx = clusterIdx().x;
+    int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
     const int gate_up_tasks = (g.x.rows() / C::Mb) * (g.w_gate.rows() / C::Nb);
     const int swiglu_tiles = (g.hidden.rows() / C::SWIGLU_Mb) * (g.hidden.cols() / C::SWIGLU_Nb);
@@ -291,6 +295,8 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
 
+    __shared__ clc::handle clc_handle[C::CLC_PIPE_DEPTH];
+    __shared__ semaphore schedule_arrived[C::CLC_PIPE_DEPTH], schedule_finished[C::CLC_PIPE_DEPTH];
     __shared__ semaphore swiglu_inputs_arrived[C::SWIGLU_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_finished[C::LOAD_PIPE_DEPTH];
@@ -308,31 +314,54 @@ __device__ __forceinline__ void moe_swiglu_kernel(const globals<C> &g) {
         }
         init_semaphore(gemm_outputs_arrived, 0, 1);
         init_semaphore(gemm_outputs_finished, 0, C::CLUSTER_SIZE);
+        #pragma unroll
+        for (int i = 0; i < C::CLC_PIPE_DEPTH; ++i) {
+            init_semaphore(schedule_arrived[i], 0, 1);
+            init_semaphore(schedule_finished[i], 0, C::CLUSTER_SIZE * C::NUM_WARPS);
+        }
     }
 
     tensor_allocator<1, C::CLUSTER_SIZE> tm_alloc{};
     tt<float, C::Mb / 2, C::Nb> d_tt = tm_alloc.template allocate<tt<float, C::Mb / 2, C::Nb>>(0);
     everyone::tma::cluster::sync();
 
-    if (cluster_idx < gate_up_tasks) {
-        // Gate
-        const int task_idx = cluster_idx;
-        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
-    } else if (cluster_idx < gate_up_tasks * 2) {
-        // Up
-        const int task_idx = cluster_idx - gate_up_tasks;
-        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
-    } else if (cluster_idx < gate_up_tasks * 2 + swiglu_tasks) {
-        // Swiglu
-        const int task_idx = cluster_idx - gate_up_tasks * 2;
-        swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, task_idx, smem_base_addr);
-    } else {
-        // Down
-        const int task_idx = cluster_idx - gate_up_tasks * 2 - swiglu_tasks;
-        expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
-                               gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+    for (int task_iter = 0; cluster_idx >= 0; ++task_iter) {
+        const int clc_stage = task_iter % C::CLC_PIPE_DEPTH;
+        if (warpgroup::groupid() == C::NUM_CONSUMERS && warpgroup::warpid() == 1 && warp::elect_leader()) { // warp not used by the gemms
+            if (cta_rank == 0) {
+                wait(schedule_finished[clc_stage], ((task_iter + C::CLC_PIPE_DEPTH) / C::CLC_PIPE_DEPTH) % 2);
+                clc::schedule(clc_handle[clc_stage], schedule_arrived[clc_stage]);
+            }
+            tma::expect_bytes(schedule_arrived[clc_stage], sizeof(clc_handle[clc_stage]));
+        }
+
+        if (cluster_idx < gate_up_tasks) {
+            // Gate
+            const int task_idx = cluster_idx;
+            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
+        } else if (cluster_idx < gate_up_tasks * 2) {
+            // Up
+            const int task_idx = cluster_idx - gate_up_tasks;
+            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
+        } else if (cluster_idx < gate_up_tasks * 2 + swiglu_tasks) {
+            // Swiglu
+            const int task_idx = cluster_idx - gate_up_tasks * 2;
+            swiglu<C>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, task_idx, smem_base_addr);
+        } else {
+            // Down
+            const int task_idx = cluster_idx - gate_up_tasks * 2 - swiglu_tasks;
+            expert_grouped_gemm<C>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
+                                   gemm_bitfield, cta_rank, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
+        }
+
+        wait(schedule_arrived[clc_stage], (task_iter / C::CLC_PIPE_DEPTH) % 2);
+        const auto schedule = clc::query(clc_handle[clc_stage]);
+        cluster_idx = schedule.success ? static_cast<int>(schedule.x / C::CLUSTER_SIZE) : -1;
+        __syncwarp();
+        warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
+        everyone::tma::cluster::sync();
     }
 }
 

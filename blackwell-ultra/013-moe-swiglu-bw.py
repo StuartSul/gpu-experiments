@@ -46,13 +46,15 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    # Scheduler output
-    tokens_per_expert = torch.full((E,), NUM_LOCAL_TOKENS * TOPK // E, dtype=torch.int32, device=device)
-    total_tokens = int(tokens_per_expert.sum())
+    # Synthetic post-dispatch schedule
+    tokens_per_expert_cpu = [NUM_LOCAL_TOKENS * TOPK // E] * E
+    tokens_per_expert = torch.tensor(tokens_per_expert_cpu, dtype=torch.int32, device=device)
+    total_tokens = sum(tokens_per_expert_cpu)
+    capacity = NUM_LOCAL_TOKENS * TOPK * 2
 
     # Generate inputs
     gen    = torch.Generator(device=device).manual_seed(1234)
-    x      = torch.randn(total_tokens, H, generator=gen, device=device, dtype=torch.bfloat16)
+    x      = torch.randn(capacity, H, generator=gen, device=device, dtype=torch.bfloat16)
     w_gate = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
     w_up   = torch.randn(E, I, H, generator=gen, device=device, dtype=torch.bfloat16) * H ** -0.5
     w_down = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.bfloat16) * I ** -0.5
@@ -77,6 +79,7 @@ def main():
     print("===========================================================================")
     print(f"experts: {E}   tokens/expert: {total_tokens // E} ({total_tokens} total)   "
           f"H: {H}   I: {I}   topk: {TOPK}   bf16")
+    print(f"capacity: {capacity} tokens")
     print(f"compute: {flops / 1e12:.3f} TFLOP")
     print(f"iters:   warmup {WARMUP_ITERS}, timed {TIMED_ITERS}\n", flush=True)
 
@@ -85,8 +88,9 @@ def main():
     print(f"moe_swiglu {ms:>7.3f}  {flops / 1e9 / ms:>9.1f}", flush=True)
 
     # Correctness check
-    refs = moe_swiglu_ref(x, w_gate, w_up, w_down, tokens_per_expert)
+    refs = moe_swiglu_ref(x[:total_tokens], w_gate, w_up, w_down, tokens_per_expert)
     for name, out, ref in zip(("gate", "up", "hidden", "y"), (gate, up, hidden, y), refs):
+        out = out[:total_tokens]
         diff = (out.float() - ref.float()).abs()
         print(f"\n{name}")
         print(f"out   abs mean {out.abs().mean().item():.4f}   abs max {out.abs().max().item():.4f}")
