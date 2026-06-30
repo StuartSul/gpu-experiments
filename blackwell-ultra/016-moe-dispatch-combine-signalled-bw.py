@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _C import dispatch, schedule, combine
+from _C import dispatch_combine, schedule
 
 
 MINIBATCH_SIZE = 4096
@@ -65,16 +65,17 @@ def main():
     tokens_ptrs = [dhdl.buffer_ptrs[i] for i in range(world_size)]
     dispatch_recv = torch.zeros(CAPACITY, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dispatch_counter = torch.zeros(num_minibatches, dtype=torch.int32, device=device)
-    combine_counter = torch.full((num_minibatches,), 999999, dtype=torch.int32, device=device)
+    combine_send = dispatch_recv
     combine_recv = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_recv.zero_()
     chdl = symm_mem.rendezvous(combine_recv, dist.group.WORLD.group_name)
     combine_recv_ptrs = [chdl.buffer_ptrs[i] for i in range(world_size)]
+    combine_counter = torch.full((num_minibatches,), 999999, dtype=torch.int32, device=device)
     torch.cuda.synchronize()
     dist.barrier()
 
     if rank == 0:
-        print("\nMoE Dispatch Bandwidth")
+        print("\nMoE Dispatch + Combine Bandwidth")
         print("===========================================================================")
         print(f"tokens/rank: {NUM_LOCAL_TOKENS} x {HIDDEN_DIM} bf16   experts: {NUM_EXPERTS} "
               f"({NUM_LOCAL_EXPERTS}/rank)   topk: {TOPK}")
@@ -101,34 +102,27 @@ def main():
     torch.cuda.synchronize()
     scheduler_ms = start.elapsed_time(end) / TIMED_ITERS
 
-    # Dispatcher benchmark
+    # Benchmark
     for _ in range(WARMUP_ITERS):
-        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, TOPK)
+        dispatch_combine(
+            tokens, tokens_ptrs, dispatch_recv, combine_send, combine_recv, combine_recv_ptrs,
+            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert,
+            dispatch_counter, combine_counter, TOPK
+        )
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    dist.barrier()  # release all ranks together so the dispatch is genuinely concurrent
+    dist.barrier()  # release all ranks together so communication is genuinely concurrent
     start.record()
     for _ in range(TIMED_ITERS):
-        dispatch(tokens, tokens_ptrs, dispatch_recv, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, TOPK)
+        dispatch_combine(
+            tokens, tokens_ptrs, dispatch_recv, combine_send, combine_recv, combine_recv_ptrs,
+            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert,
+            dispatch_counter, combine_counter, TOPK
+        )
     end.record()
     torch.cuda.synchronize()
-    dispatcher_ms = start.elapsed_time(end) / TIMED_ITERS
-    dist.barrier()
-
-    # Combiner benchmark
-    for _ in range(WARMUP_ITERS):
-        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    dist.barrier()
-    start.record()
-    for _ in range(TIMED_ITERS):
-        combine(dispatch_recv, combine_recv, combine_recv_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter)
-    end.record()
-    torch.cuda.synchronize()
-    combiner_ms = start.elapsed_time(end) / TIMED_ITERS
+    dispatch_combine_ms = start.elapsed_time(end) / TIMED_ITERS
     dist.barrier()
 
     # Finalize benchmark
@@ -148,14 +142,14 @@ def main():
     tokens_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(tokens_all, tokens)
     valid = schedule_peer_rank >= 0
-    dispatch_expected = torch.zeros_like(dispatch_recv)
-    dispatch_expected[valid] = tokens_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
-    dispatch_errors = (dispatch_recv != dispatch_expected).sum()
+    dispatch_expected = tokens_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
+    dispatch_errors = (dispatch_recv[valid] != dispatch_expected).sum()
+    dispatch_errors += torch.count_nonzero(dispatch_recv[~valid])
     dist.all_reduce(dispatch_errors, op=dist.ReduceOp.SUM)
 
     # Combine correctness check
-    combine_expected = tokens.unsqueeze(1).expand(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM)
-    combine_errors = (combine_recv.view(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM) != combine_expected).sum()
+    combine_expected = tokens.unsqueeze(1).expand(NUM_LOCAL_TOKENS, TOPK, HIDDEN_DIM).reshape(-1, HIDDEN_DIM)
+    combine_errors = (combine_recv != combine_expected).sum()
     dist.all_reduce(combine_errors, op=dist.ReduceOp.SUM)
 
     # Finalize correctness check
@@ -173,7 +167,7 @@ def main():
         num_tokens, 
         num_local_tokens, num_remote_tokens, 
         bytes_total, bytes_remote, bytes_finalize,
-        dispatcher_ms, combiner_ms, scheduler_ms, finalize_ms
+        dispatch_combine_ms, scheduler_ms, finalize_ms
     ], dtype=torch.float64, device=device)
     stats_all = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(stats_all, stats)
@@ -185,32 +179,25 @@ def main():
         print(f"dispatch correctness: {'PASSED' if dispatch_ok else 'FAILED (' + str(int(dispatch_errors.item())) + ' mismatches)'}")
         print(f"combine  correctness: {'PASSED' if combine_ok else 'FAILED (' + str(int(combine_errors.item())) + ' mismatches)'}")
         print(f"finalize correctness: {'PASSED' if finalize_ok else 'FAILED (' + str(int(finalize_errors.item())) + ' mismatches)'}\n")
-        print("rank  tokens  local  remote  disp(ms)  total(GB/s)  remote(GB/s)  comb(ms)  total(GB/s)  remote(GB/s)  sched(ms)  fin(ms)  fin(GB/s)")
-        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------  -------  ---------")
-        max_disp_s = 0.0
-        max_comb_s = 0.0
+        print("rank  tokens  local  remote  comm(ms)  total(GB/s)  remote(GB/s)  sched(ms)  fin(ms)  fin(GB/s)")
+        print("----  ------  -----  ------  --------  -----------  ------------  ---------  -------  ---------")
+        max_comm_s = 0.0
         sum_remote_bytes = 0.0
         sum_total_bytes = 0.0
         for rank, stats in enumerate(stats_all):
-            nt, lt, rt, bt, br, bf, dms, cms, sms, fms = stats.tolist()
-            disp_s = dms / 1000.0
-            comb_s = cms / 1000.0
+            nt, lt, rt, bt, br, bf, dcms, sms, fms = stats.tolist()
+            comm_s = dcms / 1000.0
             fin_s = fms / 1000.0
             print(f"{int(rank):>4}  {int(nt):>6}  {int(lt):>5}  {int(rt):>6}  "
-                  f"{dms:>8.3f}  {(bt / GiB) / disp_s:>11.2f}  {(br / GiB) / disp_s:>12.2f}  "
-                  f"{cms:>8.3f}  {(bt / GiB) / comb_s:>11.2f}  {(br / GiB) / comb_s:>12.2f}  "
+                  f"{dcms:>8.3f}  {(2 * bt / GiB) / comm_s:>11.2f}  {(2 * br / GiB) / comm_s:>12.2f}  "
                   f"{sms:>9.4f}  {fms:>7.3f}  {(bf / GiB) / fin_s:>9.2f}")
-            max_disp_s = max(max_disp_s, disp_s)
-            max_comb_s = max(max_comb_s, comb_s)
+            max_comm_s = max(max_comm_s, comm_s)
             sum_remote_bytes += br
             sum_total_bytes += bt
-        print("----  ------  -----  ------  --------  -----------  ------------  --------  -----------  ------------  ---------  -------  ---------")
-        print(f"dispatch (sum bytes / slowest rank): "
-              f"total {(sum_total_bytes / GiB) / max_disp_s:.2f} GB/s, "
-              f"remote {(sum_remote_bytes / GiB) / max_disp_s:.2f} GB/s")
-        print(f"combine  (sum bytes / slowest rank): "
-              f"total {(sum_total_bytes / GiB) / max_comb_s:.2f} GB/s, "
-              f"remote {(sum_remote_bytes / GiB) / max_comb_s:.2f} GB/s", flush=True)
+        print("----  ------  -----  ------  --------  -----------  ------------  ---------  -------  ---------")
+        print(f"dispatch + combine (sum bytes / slowest rank): "
+              f"total {(2 * sum_total_bytes / GiB) / max_comm_s:.2f} GB/s, "
+              f"remote {(2 * sum_remote_bytes / GiB) / max_comm_s:.2f} GB/s", flush=True)
 
     dist.barrier()
     del dhdl
