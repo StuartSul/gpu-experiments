@@ -210,7 +210,9 @@ struct globals {
     int topk;
 
     __host__ inline dim3 grid() const {
-        return dim3(dispatch_recv_buffer.cols() / config::Nb, dispatch_recv_buffer.rows() / config::Mb + combine_send_buffer.rows() / config::Mb);
+        const int col_blocks = dispatch_recv_buffer.cols() / config::Nb;
+        const int row_blocks = dispatch_recv_buffer.rows() / config::Mb + combine_send_buffer.rows() / config::Mb;
+        return dim3(col_blocks * row_blocks);
     }
     __host__ inline int dynamic_shared_memory() const {
         return static_cast<int>(sizeof(token_tile) + 1024);
@@ -218,77 +220,41 @@ struct globals {
 };
 
 __device__ inline void dispatch_combine_kernel(const globals &G) {
-    if (blockIdx.y < G.dispatch_recv_buffer.rows() / config::Mb) {
-        const int tid = threadIdx.x;
-        const int col_block_idx = blockIdx.x;
-        const int row_block_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int col_blocks = G.dispatch_recv_buffer.cols() / config::Nb;
+    const int dispatch_row_blocks = G.dispatch_recv_buffer.rows() / config::Mb;
+    const int dispatch_blocks = col_blocks * dispatch_row_blocks;
 
-        const int dst_row_idx = row_block_idx * config::Mb + tid;
-        const int src_rank = G.schedule_peer_rank[{dst_row_idx}];
-        const int src_row_idx = G.schedule_peer_token_idx[{dst_row_idx}] / G.topk;
-        const int minibatch_idx = dst_row_idx / config::MINIBATCH_SIZE;
+    const bool is_dispatch = blockIdx.x < dispatch_blocks;
+    const int task_idx = blockIdx.x - (is_dispatch ? 0 : dispatch_blocks);
+    const int row_block_idx = task_idx / col_blocks;
+    const int col_block_idx = task_idx % col_blocks;
+    const int row_idx = row_block_idx * config::Mb + tid;
+    const int peer_rank = G.schedule_peer_rank[{row_idx}];
+    const int peer_token_idx = G.schedule_peer_token_idx[{row_idx}];
+    const int minibatch_idx = row_idx / config::MINIBATCH_SIZE;
 
-        extern __shared__ int __shm[];
-        tma_swizzle_allocator allocator((int*)&__shm[0]);
-        globals::token_tile &token_tile = allocator.allocate<globals::token_tile>();
-        globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * config::Nb]);
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator((int*)&__shm[0]);
+    globals::token_tile &token_tile = allocator.allocate<globals::token_tile>();
+    globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * config::Nb]);
 
-        __shared__ semaphore inputs_arrived;
+    __shared__ semaphore inputs_arrived;
 
-        int num_tokens = 0;
-        for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
-            num_tokens += G.tokens_per_expert[{expert_idx}];
-        if (row_block_idx * config::Mb >= num_tokens) return;
+    int num_tokens = 0;
+    for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
+        num_tokens += G.tokens_per_expert[{expert_idx}];
+    if (row_block_idx * config::Mb >= num_tokens) return;
 
-        const int num_valid = __syncthreads_count(src_rank >= 0);
-        if (num_valid == 0) {
-            if (tid == 0)
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-            return; // whole recv block is padding
-        }
-
-        if (tid == 0) {
-            init_semaphore(inputs_arrived, 0, 1);
-            tma::expect_bytes(inputs_arrived, num_valid * sizeof(globals::token_vec));
-        }
-        __syncthreads();
-
-        if (src_rank >= 0)
-            tma::load_async(token_vec, G.dispatch_send_buffer[src_rank], {src_row_idx, col_block_idx}, inputs_arrived);
-        wait(inputs_arrived, 0);
-        if (src_rank >= 0) {
-            tma::store_async(G.dispatch_recv_buffer, token_vec, {dst_row_idx, col_block_idx});
-            tma::store_async_wait();
-        }
-        __syncthreads();
-        if (tid == 0)
+    const int num_valid = __syncthreads_count(peer_rank >= 0);
+    if (num_valid == 0) {
+        if (is_dispatch && tid == 0)
             asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-    } else {
-        const int tid = threadIdx.x;
-        const int col_block_idx = blockIdx.x;
-        const int row_block_idx = blockIdx.y - G.dispatch_recv_buffer.rows() / config::Mb;
+        return; // whole block is padding
+    }
 
-        const int src_row_idx = row_block_idx * config::Mb + tid;
-        const int dst_rank = G.schedule_peer_rank[{src_row_idx}];
-        const int dst_row_idx = G.schedule_peer_token_idx[{src_row_idx}];
-        const int minibatch_idx = src_row_idx / config::MINIBATCH_SIZE;
-
-        extern __shared__ int __shm[];
-        tma_swizzle_allocator allocator((int*)&__shm[0]);
-        globals::token_tile &token_tile = allocator.allocate<globals::token_tile>();
-        globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * config::Nb]);
-
-        __shared__ semaphore inputs_arrived;
-
-        int num_tokens = 0;
-        for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
-            num_tokens += G.tokens_per_expert[{expert_idx}];
-        if (row_block_idx * config::Mb >= num_tokens) return;
-
-        const int num_valid = __syncthreads_count(dst_rank >= 0);
-        if (num_valid == 0) return; // whole send block is padding
-
-        if (tid == 0) {
+    if (tid == 0) {
+        if (!is_dispatch) {
             const int minibatch_first_row = minibatch_idx * config::MINIBATCH_SIZE;
             const int minibatch_rows = max(0, min(config::MINIBATCH_SIZE, num_tokens - minibatch_first_row));
             const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.combine_send_buffer.cols() / config::MLP_Nb) * config::MLP_CLUSTER_SIZE;
@@ -299,17 +265,29 @@ __device__ inline void dispatch_combine_kernel(const globals &G) {
                 __nanosleep(16);
             }
             asm volatile("{fence.acquire.gpu;}" ::: "memory");
+        }
+        init_semaphore(inputs_arrived, 0, 1);
+        tma::expect_bytes(inputs_arrived, num_valid * sizeof(globals::token_vec));
+    }
+    __syncthreads();
 
-            init_semaphore(inputs_arrived, 0, 1);
-            tma::expect_bytes(inputs_arrived, num_valid * sizeof(globals::token_vec));
+    if (is_dispatch) {
+        if (peer_rank >= 0)
+            tma::load_async(token_vec, G.dispatch_send_buffer[peer_rank], {peer_token_idx / G.topk, col_block_idx}, inputs_arrived);
+        wait(inputs_arrived, 0);
+        if (peer_rank >= 0) {
+            tma::store_async(G.dispatch_recv_buffer, token_vec, {row_idx, col_block_idx});
+            tma::store_async_wait();
         }
         __syncthreads();
-
-        if (dst_rank >= 0)
-            tma::load_async(token_vec, G.combine_send_buffer, {src_row_idx, col_block_idx}, inputs_arrived);
+        if (tid == 0)
+            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
+    } else {
+        if (peer_rank >= 0)
+            tma::load_async(token_vec, G.combine_send_buffer, {row_idx, col_block_idx}, inputs_arrived);
         wait(inputs_arrived, 0);
-        if (dst_rank >= 0)
-            tma::store_async(G.combine_recv_buffer[dst_rank], token_vec, {dst_row_idx, col_block_idx});
+        if (peer_rank >= 0)
+            tma::store_async(G.combine_recv_buffer[peer_rank], token_vec, {peer_token_idx, col_block_idx});
     }
 }
 
