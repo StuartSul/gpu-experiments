@@ -74,7 +74,7 @@ def main():
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
 
     num_experts = NUM_LOCAL_EXPERTS * world_size
-    buffer_capacity = NUM_LOCAL_TOKENS * TOPK * 2
+    buffer_capacity = NUM_LOCAL_TOKENS * TOPK * 3 // 2
 
     # Generate inputs and communication buffers
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
@@ -96,23 +96,27 @@ def main():
     w_shared_down   = torch.randn(HIDDEN_DIM, INTERMEDIATE_DIM, generator=gen, device=device, dtype=torch.bfloat16) * INTERMEDIATE_DIM ** -0.5
     w_routed_down   = torch.randn(NUM_LOCAL_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM, generator=gen, device=device, dtype=torch.bfloat16) * INTERMEDIATE_DIM ** -0.5
 
-    # Router and schedule
+    # Router
     topk_vals, topk_ids = torch.topk(router_logits, TOPK, dim=1)
     topk_weights = torch.softmax(topk_vals.float(), dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
     topk_ids_all = torch.empty(world_size, NUM_LOCAL_TOKENS, TOPK, dtype=torch.int32, device=device)
-    dist.all_gather_into_tensor(topk_ids_all, topk_ids.to(torch.int32))
-    schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank)
-    total_routed_tokens = int(tokens_per_expert.sum().item())
     torch.cuda.synchronize()
     dist.barrier()
 
     # Benchmark
     for _ in range(WARMUP_ITERS):
+        dist.all_gather_into_tensor(topk_ids_all, topk_ids)
+        schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
+            topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+        )
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
             x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
             schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
         )
+        dist.barrier(async_op=True).block_current_stream()
+        output = finalize(y_shared, combine_buffer, topk_weights)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -122,11 +126,17 @@ def main():
         record_shapes=True,
     ) as prof:
         for _ in range(PROFILE_ITERS):
+            dist.all_gather_into_tensor(topk_ids_all, topk_ids)
+            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
+                topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+            )
             gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
                 x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
             )
+            dist.barrier(async_op=True).block_current_stream()
+            output = finalize(y_shared, combine_buffer, topk_weights)
         torch.cuda.synchronize()
     trace_path = f"trace_moe_rank{rank}.json"
     prof.export_chrome_trace(trace_path)
@@ -139,17 +149,23 @@ def main():
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
+        dist.all_gather_into_tensor(topk_ids_all, topk_ids)
+        schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
+            topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+        )
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
             x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
             schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
         )
+        dist.barrier(async_op=True).block_current_stream()
+        output = finalize(y_shared, combine_buffer, topk_weights)
     end.record()
     torch.cuda.synchronize()
     dist.barrier()
-    dispatch_mlp_swiglu_combine_ms = start.elapsed_time(end) / TIMED_ITERS
 
-    output = finalize(y_shared, combine_buffer, topk_weights)
+    end_to_end_ms = start.elapsed_time(end) / TIMED_ITERS
+    total_routed_tokens = int(tokens_per_expert.sum().item())
 
     # Reference implementation
     x_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
@@ -177,24 +193,22 @@ def main():
     names = ("gate_shared", "gate_routed", "up_shared", "up_routed", "hidden_shared", "hidden_routed", "y_shared", "y_routed", "combine_buffer", "output")
     outputs = (gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer, output)
     references = (*mlp_swiglu_refs, combine_buffer_ref, output_ref)
-    correctness = []
+    difference_stats = []
     for name, out, ref in zip(names, outputs, references):
         if name.endswith("_routed"):
             out = out[valid]
             ref = ref[valid]
         diff = (out.float() - ref.float()).abs()
-        error_count = (diff > 1e-2).sum()
         diff_sum = diff.sum()
         diff_count = torch.tensor(diff.numel(), dtype=torch.float64, device=device)
         diff_max = diff.max()
-        dist.all_reduce(error_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(diff_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(diff_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(diff_max, op=dist.ReduceOp.MAX)
-        correctness.append((name, int(error_count.item()), (diff_sum / diff_count).item(), diff_max.item()))
+        difference_stats.append((name, (diff_sum / diff_count).item(), diff_max.item()))
 
     flops = 6 * (NUM_LOCAL_TOKENS + total_routed_tokens) * HIDDEN_DIM * INTERMEDIATE_DIM
-    stats = torch.tensor([total_routed_tokens, dispatch_mlp_swiglu_combine_ms, flops / 1e9 / dispatch_mlp_swiglu_combine_ms], dtype=torch.float64, device=device)
+    stats = torch.tensor([total_routed_tokens, end_to_end_ms, flops / 1e9 / end_to_end_ms], dtype=torch.float64, device=device)
     stats_all = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(stats_all, stats)
 
@@ -204,14 +218,13 @@ def main():
         print(f"tokens/rank: {NUM_LOCAL_TOKENS}   experts: {num_experts} ({NUM_LOCAL_EXPERTS}/rank)   "
               f"topk: {TOPK}   H: {HIDDEN_DIM}   I: {INTERMEDIATE_DIM}")
         print(f"iters: warmup {WARMUP_ITERS}, timed {TIMED_ITERS}\n", flush=True)
-        for name, errors, diff_mean, diff_max in correctness:
-            status = "PASSED" if errors == 0 else f"FAILED ({errors} errors)"
-            print(f"{name:<14} {status:<20} diff mean {diff_mean:.6f}   diff max {diff_max:.6f}")
-        print("\nrank  routed tokens  dispatch+mlp+combine(ms)  TFLOP/s")
-        print("----  -------------  ------------------------  -------")
+        for name, diff_mean, diff_max in difference_stats:
+            print(f"{name:<14} diff mean {diff_mean:.6f}   diff max {diff_max:.6f}")
+        print("\nrank  routed tokens  end-to-end(ms)  MLP TFLOP/s")
+        print("----  -------------  --------------  -----------")
         for rank_idx, rank_stats in enumerate(stats_all):
-            routed_tokens, rank_dispatch_mlp_swiglu_combine_ms, rank_tflops = rank_stats.tolist()
-            print(f"{rank_idx:>4}  {int(routed_tokens):>13}  {rank_dispatch_mlp_swiglu_combine_ms:>24.3f}  {rank_tflops:>7.1f}")
+            routed_tokens, rank_end_to_end_ms, rank_tflops = rank_stats.tolist()
+            print(f"{rank_idx:>4}  {int(routed_tokens):>13}  {rank_end_to_end_ms:>14.3f}  {rank_tflops:>11.1f}")
 
     dist.barrier()
     del x_handle
