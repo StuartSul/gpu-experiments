@@ -177,16 +177,18 @@ struct config {
 
     static constexpr int Mb = 64;
     static constexpr int Nb = 256;
+    static constexpr int PIPE_DEPTH = 7;
 
     static constexpr int MLP_Mb = 256;
     static constexpr int MLP_Nb = 256;
     static constexpr int MLP_CLUSTER_SIZE = 2;
 
     static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 64;
+    static constexpr int NUM_THREADS = Mb;
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
     static_assert(MINIBATCH_SIZE % Mb == 0, "MINIBATCH_SIZE must be a multiple of Mb");
+    static_assert(PIPE_DEPTH * Mb * Nb * sizeof(bf16) <= DYNAMIC_SHARED_MEMORY, "Dispatch pipeline does not fit in shared memory");
 };
 
 struct globals {
@@ -210,84 +212,109 @@ struct globals {
     int topk;
 
     __host__ inline dim3 grid() const {
-        const int col_blocks = dispatch_recv_buffer.cols() / config::Nb;
-        const int row_blocks = dispatch_recv_buffer.rows() / config::Mb + combine_send_buffer.rows() / config::Mb;
-        return dim3(col_blocks * row_blocks);
-    }
-    __host__ inline int dynamic_shared_memory() const {
-        return static_cast<int>(sizeof(token_tile) + 1024);
+        const int num_tiles = (dispatch_recv_buffer.rows() / config::Mb) * (dispatch_recv_buffer.cols() / config::Nb);
+        return dim3(2 * ((num_tiles + config::PIPE_DEPTH - 1) / config::PIPE_DEPTH));
     }
 };
 
-__device__ inline void dispatch_combine_kernel(const globals &G) {
+__device__ __forceinline__ void dispatch_combine_kernel(const globals &G) {
+    extern __shared__ int __shm[];
+    const uint64_t smem_base_addr = (reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023);
+    auto &token_vecs = *reinterpret_cast<globals::token_vec (*)[config::PIPE_DEPTH][config::Mb]>(smem_base_addr);
+
+    __shared__ semaphore inputs_arrived[config::PIPE_DEPTH];
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int stage = 0; stage < config::PIPE_DEPTH; ++stage)
+            init_semaphore(inputs_arrived[stage], 0, 1);
+    } // no sync needed
+
     const int tid = threadIdx.x;
     const int col_blocks = G.dispatch_recv_buffer.cols() / config::Nb;
-    const int dispatch_row_blocks = G.dispatch_recv_buffer.rows() / config::Mb;
-    const int dispatch_blocks = col_blocks * dispatch_row_blocks;
-
-    const bool is_dispatch = blockIdx.x < dispatch_blocks;
-    const int task_idx = blockIdx.x - (is_dispatch ? 0 : dispatch_blocks);
-    const int row_block_idx = task_idx / col_blocks;
-    const int col_block_idx = task_idx % col_blocks;
-    const int row_idx = row_block_idx * config::Mb + tid;
-    const int peer_rank = G.schedule_peer_rank[{row_idx}];
-    const int peer_token_idx = G.schedule_peer_token_idx[{row_idx}];
-    const int minibatch_idx = row_idx / config::MINIBATCH_SIZE;
-
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
-    globals::token_tile &token_tile = allocator.allocate<globals::token_tile>();
-    globals::token_vec &token_vec = *reinterpret_cast<globals::token_vec*>(&token_tile.data[tid * config::Nb]);
-
-    __shared__ semaphore inputs_arrived;
+    const int num_tasks = gridDim.x / 2;
+    const bool is_dispatch = blockIdx.x < num_tasks;
+    const int first_tile_idx = (is_dispatch ? blockIdx.x : blockIdx.x - num_tasks) * config::PIPE_DEPTH;
 
     int num_tokens = 0;
     for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
         num_tokens += G.tokens_per_expert[{expert_idx}];
-    if (row_block_idx * config::Mb >= num_tokens) return;
+    const int num_active_stages = min(config::PIPE_DEPTH, num_tokens / config::Mb * col_blocks - first_tile_idx); // because we pad to 256
+    if (num_active_stages <= 0) return;
 
-    const int num_valid = __syncthreads_count(peer_rank >= 0);
-    if (num_valid == 0) {
-        if (is_dispatch && tid == 0)
-            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-        return; // whole block is padding
+    const int first_row_idx = first_tile_idx / col_blocks * config::Mb + tid;
+    const int first_col_block_idx = first_tile_idx % col_blocks;
+
+    int row_idx[config::PIPE_DEPTH], col_block_idx[config::PIPE_DEPTH], peer_rank[config::PIPE_DEPTH], peer_token_idx[config::PIPE_DEPTH], num_valid[config::PIPE_DEPTH];
+    #pragma unroll
+    for (int stage = 0, row = first_row_idx, col = first_col_block_idx; stage < config::PIPE_DEPTH; ++stage) {
+        const bool active = stage < num_active_stages;
+        row_idx[stage] = row;
+        col_block_idx[stage] = col;
+        peer_rank[stage] = active ? G.schedule_peer_rank[{row}] : -1;
+        peer_token_idx[stage] = active ? G.schedule_peer_token_idx[{row}] : -1;
+        num_valid[stage] = !active ? 0
+                         : (stage == 0 || col == 0) ? __syncthreads_count(peer_rank[stage] >= 0) // whole block reaches this, so it also orders init_semaphore too!
+                         : num_valid[stage - 1];
+        if (++col == col_blocks) { col = 0; row += config::Mb; }
     }
 
     if (tid == 0) {
         if (!is_dispatch) {
-            const int minibatch_first_row = minibatch_idx * config::MINIBATCH_SIZE;
-            const int minibatch_rows = max(0, min(config::MINIBATCH_SIZE, num_tokens - minibatch_first_row));
-            const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.combine_send_buffer.cols() / config::MLP_Nb) * config::MLP_CLUSTER_SIZE;
-            int combine_counter;
-            while (true) {
-                asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(combine_counter) : "l"(&G.combine_counter[{minibatch_idx}]) : "memory");
-                if (combine_counter >= expected) break;
-                __nanosleep(16);
+            const int first_minibatch_idx = first_row_idx / config::MINIBATCH_SIZE;
+            const int last_minibatch_idx = (first_tile_idx + num_active_stages - 1) / col_blocks * config::Mb / config::MINIBATCH_SIZE;
+            for (int minibatch_idx = first_minibatch_idx; minibatch_idx <= last_minibatch_idx; ++minibatch_idx) {
+                const int minibatch_rows = min(config::MINIBATCH_SIZE, num_tokens - minibatch_idx * config::MINIBATCH_SIZE);
+                const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.combine_send_buffer.cols() / config::MLP_Nb) * config::MLP_CLUSTER_SIZE;
+                int combine_counter;
+                while (true) {
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(combine_counter) : "l"(&G.combine_counter[{minibatch_idx}]) : "memory");
+                    if (combine_counter >= expected) break;
+                    __nanosleep(16);
+                }
             }
             asm volatile("{fence.acquire.gpu;}" ::: "memory");
         }
-        init_semaphore(inputs_arrived, 0, 1);
-        tma::expect_bytes(inputs_arrived, num_valid * sizeof(globals::token_vec));
+        #pragma unroll
+        for (int stage = 0; stage < config::PIPE_DEPTH; ++stage)
+            if (stage < num_active_stages)
+                tma::expect_bytes(inputs_arrived[stage], num_valid[stage] * sizeof(globals::token_vec)); // 0 bytes completes the phase immediately
     }
     __syncthreads();
 
-    if (is_dispatch) {
-        if (peer_rank >= 0)
-            tma::load_async(token_vec, G.dispatch_send_buffer[peer_rank], {peer_token_idx / G.topk, col_block_idx}, inputs_arrived);
-        wait(inputs_arrived, 0);
-        if (peer_rank >= 0) {
-            tma::store_async(G.dispatch_recv_buffer, token_vec, {row_idx, col_block_idx});
-            tma::store_async_wait();
+    #pragma unroll
+    for (int stage = 0; stage < config::PIPE_DEPTH; ++stage) {
+        if (peer_rank[stage] >= 0) {
+            if (is_dispatch)
+                tma::load_async(token_vecs[stage][tid], G.dispatch_send_buffer[peer_rank[stage]], {peer_token_idx[stage] / G.topk, col_block_idx[stage]}, inputs_arrived[stage]);
+            else
+                tma::load_async(token_vecs[stage][tid], G.combine_send_buffer, {row_idx[stage], col_block_idx[stage]}, inputs_arrived[stage]);
         }
+    }
+
+    #pragma unroll
+    for (int stage = 0; stage < config::PIPE_DEPTH; ++stage) {
+        if (stage < num_active_stages) {
+            wait(inputs_arrived[stage], 0);
+            if (peer_rank[stage] >= 0) {
+                if (is_dispatch)
+                    tma::store_async(G.dispatch_recv_buffer, token_vecs[stage][tid], {row_idx[stage], col_block_idx[stage]});
+                else
+                    tma::store_async(G.combine_recv_buffer[peer_rank[stage]], token_vecs[stage][tid], {peer_token_idx[stage], col_block_idx[stage]});
+            }
+        }
+    }
+
+    if (is_dispatch) {
+        tma::store_async_wait();
         __syncthreads();
-        if (tid == 0)
-            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-    } else {
-        if (peer_rank >= 0)
-            tma::load_async(token_vec, G.combine_send_buffer, {row_idx, col_block_idx}, inputs_arrived);
-        wait(inputs_arrived, 0);
-        if (peer_rank >= 0)
-            tma::store_async(G.combine_recv_buffer[peer_rank], token_vec, {peer_token_idx, col_block_idx});
+        if (tid == 0) {
+            const int tiles_per_minibatch = config::MINIBATCH_SIZE / config::Mb * col_blocks;
+            const int minibatch_idx = first_tile_idx / tiles_per_minibatch;
+            const int first_count = min(num_active_stages, (minibatch_idx + 1) * tiles_per_minibatch - first_tile_idx);
+            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(first_count) : "memory");
+            if (first_count < num_active_stages)
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx + 1}]), "r"(num_active_stages - first_count) : "memory");
+        }
     }
 }
 
