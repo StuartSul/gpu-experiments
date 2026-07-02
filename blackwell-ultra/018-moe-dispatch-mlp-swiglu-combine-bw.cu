@@ -199,7 +199,6 @@ struct config {
     static constexpr int DISPATCH_COMBINE_Mb = 64;
     static constexpr int DISPATCH_COMBINE_Nb = 256;
     static constexpr int DISPATCH_COMBINE_PIPE_DEPTH = 7;
-    static constexpr int DISPATCH_COMBINE_SMS = 24;
     
     // Kernel launch
     static constexpr int CLC_PIPE_DEPTH = 1;
@@ -213,7 +212,6 @@ struct config {
     static_assert(MINIBATCH_SIZE % MLP_Mb == 0, "MINIBATCH_SIZE must be a multiple of MLP_Mb");
     static_assert(MINIBATCH_SIZE % SWIGLU_Mb == 0, "MINIBATCH_SIZE must be a multiple of SWIGLU_Mb");
     static_assert(MINIBATCH_SIZE % DISPATCH_COMBINE_Mb == 0, "MINIBATCH_SIZE must be a multiple of DISPATCH_COMBINE_Mb");
-    static_assert(DISPATCH_COMBINE_SMS % CLUSTER_SIZE == 0, "DISPATCH_COMBINE_SMS must be a multiple of CLUSTER_SIZE");
 };
 
 struct globals {
@@ -264,6 +262,7 @@ struct globals {
     index_gl combine_counter;            // (num_minibatches,)
 
     const int topk;
+    const int num_comm_sms;
 
     __host__ inline dim3 grid() const {
         const int num_minibatches = (x_routed.rows() + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
@@ -279,7 +278,7 @@ struct globals {
         const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
         const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
         const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
-        return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + config::DISPATCH_COMBINE_SMS);
+        return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + num_comm_sms);
     }
 };
 
@@ -693,7 +692,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
     const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
     const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
     const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
-    const int comm_clusters = config::DISPATCH_COMBINE_SMS / config::CLUSTER_SIZE;
+    const int comm_clusters = g.num_comm_sms / config::CLUSTER_SIZE;
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
     uint32_t dispatch_combine_bitfield = 0xFFFF0000;
@@ -737,9 +736,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
         const int dispatch_combine_tiles = (g.x_routed.rows() / config::DISPATCH_COMBINE_Mb) * (g.x_routed.cols() / config::DISPATCH_COMBINE_Nb);
         const int dispatch_combine_tasks = (dispatch_combine_tiles + config::DISPATCH_COMBINE_PIPE_DEPTH - 1) / config::DISPATCH_COMBINE_PIPE_DEPTH;
-        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += config::DISPATCH_COMBINE_SMS)
+        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += g.num_comm_sms)
             dispatch_combine_kernel<true>(g, dispatch_combine_inputs_arrived, dispatch_combine_bitfield, task_idx, smem_base_addr);
-        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += config::DISPATCH_COMBINE_SMS)
+        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += g.num_comm_sms)
             dispatch_combine_kernel<false>(g, dispatch_combine_inputs_arrived, dispatch_combine_bitfield, task_idx, smem_base_addr);
         return;
     }
@@ -851,7 +850,8 @@ dispatch_mlp_swiglu_combine(
     const at::Tensor &tokens_per_expert,
 
     // Metadata
-    int topk
+    int topk,
+    int num_comm_sms
 ) {
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
@@ -906,7 +906,8 @@ dispatch_mlp_swiglu_combine(
         .mlp_swiglu_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(mlp_swiglu_counter),
         .dispatch_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(dispatch_counter),
         .combine_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(combine_counter),
-        .topk = topk
+        .topk = topk,
+        .num_comm_sms = num_comm_sms
     };
 
     kittens::py::launch_kernel<config, globals, dispatch_mlp_swiglu_combine_kernel>(g);
@@ -926,5 +927,6 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("w_shared_up"), pybind11::arg("w_routed_up"),
           pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
-          pybind11::arg("tokens_per_expert"), pybind11::arg("topk"));
+          pybind11::arg("tokens_per_expert"),
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
 }

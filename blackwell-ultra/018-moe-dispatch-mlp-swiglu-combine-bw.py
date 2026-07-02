@@ -22,6 +22,7 @@ HIDDEN_DIM = 7168
 INTERMEDIATE_DIM = 2048
 NUM_LOCAL_EXPERTS = 4
 TOPK = 8
+NUM_COMM_SMS = 48
 
 WARMUP_ITERS = 5
 PROFILE_ITERS = 3
@@ -113,7 +114,7 @@ def main():
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
             x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
+            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS
         )
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
@@ -133,7 +134,7 @@ def main():
             gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
                 x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
+                schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS
             )
             dist.barrier(async_op=True).block_current_stream()
             output = finalize(y_shared, combine_buffer, topk_weights)
@@ -156,7 +157,7 @@ def main():
         gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
             x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK
+            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS
         )
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
