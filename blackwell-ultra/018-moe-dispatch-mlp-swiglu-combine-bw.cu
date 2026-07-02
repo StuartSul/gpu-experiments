@@ -4,68 +4,8 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 
 using namespace kittens;
-
-template <int DISPATCH_COMBINE_SMS>
-struct green_context_streams {
-    CUdevice device;
-    CUgreenCtx mlp_swiglu_context = nullptr;
-    CUgreenCtx dispatch_combine_context = nullptr;
-    CUstream mlp_swiglu_stream = nullptr;
-    CUstream dispatch_combine_stream = nullptr;
-    CUevent main_ready = nullptr;
-    CUevent mlp_swiglu_done = nullptr;
-    CUevent dispatch_combine_done = nullptr;
-
-    explicit green_context_streams(CUdevice device_) : device(device_) {
-        CUdevResource all_sms{};
-        CUdevResource dispatch_combine_sms{};
-        CUdevResource remaining_sms{};
-        CUCHECK(cuDeviceGetDevResource(device, &all_sms, CU_DEV_RESOURCE_TYPE_SM));
-
-        unsigned int num_groups = 1;
-        CUCHECK(cuDevSmResourceSplitByCount(&dispatch_combine_sms, &num_groups, &all_sms, &remaining_sms, 0, DISPATCH_COMBINE_SMS));
-        TORCH_CHECK(num_groups == 1);
-        TORCH_CHECK(dispatch_combine_sms.sm.smCount == DISPATCH_COMBINE_SMS);
-        TORCH_CHECK(remaining_sms.type == CU_DEV_RESOURCE_TYPE_SM && remaining_sms.sm.smCount >= 2);
-
-        CUdevResourceDesc mlp_swiglu_desc = nullptr;
-        CUdevResourceDesc dispatch_combine_desc = nullptr;
-        CUCHECK(cuDevResourceGenerateDesc(&mlp_swiglu_desc, &remaining_sms, 1));
-        CUCHECK(cuDevResourceGenerateDesc(&dispatch_combine_desc, &dispatch_combine_sms, 1));
-        CUCHECK(cuGreenCtxCreate(&mlp_swiglu_context, mlp_swiglu_desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
-        CUCHECK(cuGreenCtxCreate(&dispatch_combine_context, dispatch_combine_desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
-
-        CUCHECK(cuGreenCtxStreamCreate(&mlp_swiglu_stream, mlp_swiglu_context, CU_STREAM_NON_BLOCKING, 0));
-        CUCHECK(cuGreenCtxStreamCreate(&dispatch_combine_stream, dispatch_combine_context, CU_STREAM_NON_BLOCKING, 0));
-
-        CUCHECK(cuEventCreate(&main_ready, CU_EVENT_DISABLE_TIMING));
-        CUCHECK(cuEventCreate(&mlp_swiglu_done, CU_EVENT_DISABLE_TIMING));
-        CUCHECK(cuEventCreate(&dispatch_combine_done, CU_EVENT_DISABLE_TIMING));
-    }
-
-    ~green_context_streams() noexcept {
-        if (mlp_swiglu_stream != nullptr) (void)cuStreamSynchronize(mlp_swiglu_stream);
-        if (dispatch_combine_stream != nullptr) (void)cuStreamSynchronize(dispatch_combine_stream);
-        if (main_ready != nullptr) (void)cuEventDestroy(main_ready);
-        if (mlp_swiglu_done != nullptr) (void)cuEventDestroy(mlp_swiglu_done);
-        if (dispatch_combine_done != nullptr) (void)cuEventDestroy(dispatch_combine_done);
-        if (mlp_swiglu_stream != nullptr) (void)cuStreamDestroy(mlp_swiglu_stream);
-        if (dispatch_combine_stream != nullptr) (void)cuStreamDestroy(dispatch_combine_stream);
-        if (mlp_swiglu_context != nullptr) (void)cuGreenCtxDestroy(mlp_swiglu_context);
-        if (dispatch_combine_context != nullptr) (void)cuGreenCtxDestroy(dispatch_combine_context);
-    }
-
-    static __host__ green_context_streams &get() {
-        CUdevice device;
-        CUCHECK(cuCtxGetDevice(&device));
-        static green_context_streams gcs(device);
-        return gcs;
-    }
-};
 
 struct scheduler {
 
@@ -201,16 +141,19 @@ static __device__ __forceinline__ void schedule_kernel(const globals &G) {
     }
 }
 
-static __host__ void schedule(
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor> schedule(
     const at::Tensor &topk_all,
-    at::Tensor &schedule_peer_rank, // must be initialized to -1
-    at::Tensor &schedule_peer_token_idx,
-    at::Tensor &tokens_per_expert,
-    at::Tensor &tokens_per_expert_and_peer, // must be zero'ed
+    const int num_local_experts,
+    const int capacity,
     const int rank
 ) {
     const int world_size = static_cast<int>(topk_all.size(0));
-    const int num_local_experts = static_cast<int>(tokens_per_expert.size(0));
+
+    at::Tensor schedule_peer_rank = at::empty({capacity}, topk_all.options().dtype(at::kInt));
+    at::Tensor schedule_peer_token_idx = at::empty({capacity}, topk_all.options().dtype(at::kInt));
+    at::Tensor tokens_per_expert = at::empty({num_local_experts}, topk_all.options().dtype(at::kInt));
+    at::Tensor tokens_per_expert_and_peer = at::zeros({num_local_experts * world_size}, topk_all.options().dtype(at::kInt));
+    schedule_peer_rank.fill_(-1);
 
     globals G {
         .topk = kittens::py::tensor_to_gl<globals::topk_gl>(topk_all),
@@ -228,321 +171,224 @@ static __host__ void schedule(
         <<<num_local_experts, 1, 0, stream>>>(G);
     kittens::py::global_kernel<config, globals, scheduler::schedule_kernel>
         <<<num_local_experts * world_size, config::NUM_THREADS, world_size * sizeof(int), stream>>>(G);
+
+    return {schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert};
 }
 
 }; // struct scheduler
 
 template <int NUM_DEVICES, int MINIBATCH_SIZE>
-struct dispatcher {
+struct dispatch_mlp_swiglu_combiner {
 
 struct config {
-    static constexpr int Mb = 64;
-    static constexpr int Nb = 256;
-
-    static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 64;
-
-    static_assert(MINIBATCH_SIZE % Mb == 0, "MINIBATCH_SIZE must be a multiple of Mb");
-};
-
-struct globals {
-    using token_tile = st_bf<config::Mb, config::Nb, false>;
-    using token_vec = sv_bf<config::Nb>;
-
-    using send_buffer_pgl = pgl<gl<bf16, 1, 1, -1, -1, token_vec>, NUM_DEVICES, false>;
-    using recv_buffer_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
-    using index_gl = gl<int, 1, 1, 1, -1>;
-
-    send_buffer_pgl send_buffer;     // (num_local_tokens, H)
-    recv_buffer_gl recv_buffer;      // (capacity, H)
-    index_gl schedule_src_rank;      // (capacity,)
-    index_gl schedule_src_token_idx; // (capacity,) original_token_idx * topk + k
-    index_gl tokens_per_expert;      // (num_local_experts,)
-    index_gl dispatch_counter;       // (num_minibatches,)
-
-    int topk;
-
-    __host__ inline dim3 grid() const {
-        return dim3(recv_buffer.cols() / config::Nb, recv_buffer.rows() / config::Mb);
-    }
-    __host__ inline int dynamic_shared_memory() const {
-        return static_cast<int>(sizeof(token_tile) + 1024);
-    }
-};
-
-static __device__ __forceinline__ void dispatch_kernel(const globals &G) {
-    const int tid = threadIdx.x;
-    const int col_block_idx = blockIdx.x;
-    const int row_block_idx = blockIdx.y;
-
-    const int dst_row_idx = row_block_idx * config::Mb + tid;
-    const int src_rank = G.schedule_src_rank[{dst_row_idx}];
-    const int src_row_idx = G.schedule_src_token_idx[{dst_row_idx}] / G.topk;
-    const int minibatch_idx = dst_row_idx / MINIBATCH_SIZE;
-
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
-    typename globals::token_tile &token_tile = allocator.allocate<typename globals::token_tile>();
-    typename globals::token_vec &token_vec = *reinterpret_cast<typename globals::token_vec*>(&token_tile.data[tid * config::Nb]);
-
-    __shared__ semaphore inputs_arrived;
-
-    int num_tokens = 0;
-    for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
-        num_tokens += G.tokens_per_expert[{expert_idx}];
-    if (row_block_idx * config::Mb >= num_tokens) return;
-
-    const int num_valid = __syncthreads_count(src_rank >= 0);
-    if (num_valid == 0) {
-        if (tid == 0)
-            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-        return; // whole recv block is padding
-    }
-
-    if (tid == 0) {
-        init_semaphore(inputs_arrived, 0, 1);
-        tma::expect_bytes(inputs_arrived, num_valid * sizeof(typename globals::token_vec));
-    }
-    __syncthreads();
-
-    if (src_rank >= 0)
-        tma::load_async(token_vec, G.send_buffer[src_rank], {src_row_idx, col_block_idx}, inputs_arrived);
-    wait(inputs_arrived, 0);
-    if (src_rank >= 0) {
-        tma::store_async(G.recv_buffer, token_vec, {dst_row_idx, col_block_idx});
-        tma::store_async_wait();
-    }
-    __syncthreads();
-    if (tid == 0)
-        asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(1) : "memory");
-}
-
-static __host__ void dispatch(
-    const at::Tensor &send_buffer,
-    const std::vector<int64_t> &send_buffer_ptrs,
-    const at::Tensor &recv_buffer,
-    const at::Tensor &schedule_src_rank,
-    const at::Tensor &schedule_src_token_idx,
-    const at::Tensor &tokens_per_expert,
-    at::Tensor dispatch_counter, // must be zero'ed
-    int topk
-) {
-    bf16 *send_buffer_data[NUM_DEVICES];
-    for (int i = 0; i < NUM_DEVICES; ++i)
-        send_buffer_data[i] = reinterpret_cast<bf16*>(send_buffer_ptrs[i]);
-
-    globals G {
-        .send_buffer = typename globals::send_buffer_pgl{send_buffer_data, nullptr, nullptr, static_cast<size_t>(send_buffer.size(0)), static_cast<size_t>(send_buffer.size(1))},
-        .recv_buffer = kittens::py::tensor_to_gl<typename globals::recv_buffer_gl>(recv_buffer),
-        .schedule_src_rank = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_src_rank),
-        .schedule_src_token_idx = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_src_token_idx),
-        .tokens_per_expert = kittens::py::tensor_to_gl<typename globals::index_gl>(tokens_per_expert),
-        .dispatch_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(dispatch_counter),
-        .topk = topk,
-    };
-
-    kittens::py::launch_kernel<config, globals, dispatch_kernel>(G);
-}
-
-}; // struct dispatcher
-
-template <int NUM_DEVICES, int MINIBATCH_SIZE>
-struct combiner {
-
-struct config {
-    static constexpr int Mb = 64;
-    static constexpr int Nb = 256;
-
+    // Grouped GEMM
     static constexpr int MLP_Mb = 256;
     static constexpr int MLP_Nb = 256;
-    static constexpr int MLP_CLUSTER_SIZE = 2;
-
-    static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int MIN_BLOCKS_PER_SM = 6;
-    static constexpr int NUM_THREADS = 64;
-};
-
-struct globals {
-    using token_tile = st_bf<config::Mb, config::Nb, false>;
-    using token_vec = sv_bf<config::Nb>;
-
-    using send_buffer_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
-    using recv_buffer_pgl = pgl<gl<bf16, 1, 1, -1, -1, token_vec>, NUM_DEVICES, false>;
-    using index_gl = gl<int, 1, 1, 1, -1>;
-
-    send_buffer_gl send_buffer;      // (capacity, H)
-    recv_buffer_pgl recv_buffer;     // (num_local_tokens * topk, H)
-    index_gl schedule_dst_rank;      // (capacity,)
-    index_gl schedule_dst_token_idx; // (capacity,)
-    index_gl tokens_per_expert;      // (num_local_experts,)
-    index_gl combine_counter;        // (num_minibatches,)
-
-    __host__ inline dim3 grid() const {
-        return dim3(send_buffer.cols() / config::Nb, send_buffer.rows() / config::Mb);
-    }
-    __host__ inline int dynamic_shared_memory() const {
-        return static_cast<int>(sizeof(token_tile) + 1024);
-    }
-};
-
-static __device__ __forceinline__ void combine_kernel(const globals &G) {
-    const int tid = threadIdx.x;
-    const int col_block_idx = blockIdx.x;
-    const int row_block_idx = blockIdx.y;
-
-    const int src_row_idx = row_block_idx * config::Mb + tid;
-    const int dst_rank = G.schedule_dst_rank[{src_row_idx}];
-    const int dst_row_idx = G.schedule_dst_token_idx[{src_row_idx}];
-    const int minibatch_idx = src_row_idx / MINIBATCH_SIZE;
-
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
-    typename globals::token_tile &token_tile = allocator.allocate<typename globals::token_tile>();
-    typename globals::token_vec &token_vec = *reinterpret_cast<typename globals::token_vec*>(&token_tile.data[tid * config::Nb]);
-
-    __shared__ semaphore inputs_arrived;
-
-    int num_tokens = 0;
-    for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
-        num_tokens += G.tokens_per_expert[{expert_idx}];
-    if (row_block_idx * config::Mb >= num_tokens) return;
-
-    const int num_valid = __syncthreads_count(dst_rank >= 0);
-    if (num_valid == 0) return; // whole send block is padding
-
-    if (tid == 0) {
-        const int minibatch_first_row = minibatch_idx * MINIBATCH_SIZE;
-        const int minibatch_rows = max(0, min(MINIBATCH_SIZE, num_tokens - minibatch_first_row));
-        const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.send_buffer.cols() / config::MLP_Nb) * config::MLP_CLUSTER_SIZE;
-        int combine_counter;
-        while (true) {
-            asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(combine_counter) : "l"(&G.combine_counter[{minibatch_idx}]) : "memory");
-            if (combine_counter >= expected) break;
-            __nanosleep(16);
-        }
-        asm volatile("{fence.acquire.gpu;}" ::: "memory");
-
-        init_semaphore(inputs_arrived, 0, 1);
-        tma::expect_bytes(inputs_arrived, num_valid * sizeof(typename globals::token_vec));
-    }
-    __syncthreads();
-
-    if (dst_rank >= 0)
-        tma::load_async(token_vec, G.send_buffer, {src_row_idx, col_block_idx}, inputs_arrived);
-    wait(inputs_arrived, 0);
-    if (dst_rank >= 0)
-        tma::store_async(G.recv_buffer[dst_rank], token_vec, {dst_row_idx, col_block_idx});
-}
-
-static __host__ void combine(
-    const at::Tensor &send_buffer,
-    const at::Tensor &recv_buffer,
-    const std::vector<int64_t> &recv_buffer_ptrs,
-    const at::Tensor &schedule_dst_rank,
-    const at::Tensor &schedule_dst_token_idx,
-    const at::Tensor &tokens_per_expert,
-    const at::Tensor &combine_counter
-) {
-    bf16 *recv_buffer_data[NUM_DEVICES];
-    for (int i = 0; i < NUM_DEVICES; ++i)
-        recv_buffer_data[i] = reinterpret_cast<bf16*>(recv_buffer_ptrs[i]);
-
-    globals G {
-        .send_buffer = kittens::py::tensor_to_gl<typename globals::send_buffer_gl>(send_buffer),
-        .recv_buffer = typename globals::recv_buffer_pgl{recv_buffer_data, nullptr, nullptr, static_cast<size_t>(recv_buffer.size(0)), static_cast<size_t>(recv_buffer.size(1))},
-        .schedule_dst_rank = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_dst_rank),
-        .schedule_dst_token_idx = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_dst_token_idx),
-        .tokens_per_expert = kittens::py::tensor_to_gl<typename globals::index_gl>(tokens_per_expert),
-        .combine_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(combine_counter),
-    };
-
-    kittens::py::launch_kernel<config, globals, combine_kernel>(G);
-}
-
-}; // struct combiner
-
-template <int MINIBATCH_SIZE>
-struct mlp_swigluer {
-
-struct config {
-    static constexpr int Mb = 256;
-    static constexpr int Nb = 256;
-    static constexpr int Kb = 64;
+    static constexpr int MLP_Kb = 64;
     static constexpr int SUPERGROUP_SIZE = 8;
     static constexpr int LOAD_PIPE_DEPTH = 5;
     static constexpr int EPI_PIPE_DEPTH = 4;
+    static constexpr int NUM_D_TILES = EPI_PIPE_DEPTH > 1 ? 2 : 1;
 
+    // Fused SwiGLU
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
     static constexpr int SWIGLU_PIPE_DEPTH = 3;
+
+    // Dispatch/Combine
+    static constexpr int DISPATCH_COMBINE_Mb = 64;
+    static constexpr int DISPATCH_COMBINE_Nb = 256;
+    static constexpr int DISPATCH_COMBINE_PIPE_DEPTH = 7;
+    static constexpr int DISPATCH_COMBINE_SMS = 24;
+    
+    // Kernel launch
     static constexpr int CLC_PIPE_DEPTH = 1;
-
-    static constexpr int DISPATCH_Mb = 64;
-    static constexpr int DISPATCH_Nb = 256;
-
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_CONSUMERS = 1;
     static constexpr int NUM_PRODUCERS = 1;
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
-
-    static constexpr int NUM_D_TILES = EPI_PIPE_DEPTH > 1 ? 2 : 1;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
-    static_assert(MINIBATCH_SIZE % Mb == 0,        "MINIBATCH_SIZE must be a multiple of Mb");
+    static_assert(MINIBATCH_SIZE % MLP_Mb == 0, "MINIBATCH_SIZE must be a multiple of MLP_Mb");
     static_assert(MINIBATCH_SIZE % SWIGLU_Mb == 0, "MINIBATCH_SIZE must be a multiple of SWIGLU_Mb");
-    static_assert(MINIBATCH_SIZE % DISPATCH_Mb == 0, "MINIBATCH_SIZE must be a multiple of DISPATCH_Mb");
+    static_assert(MINIBATCH_SIZE % DISPATCH_COMBINE_Mb == 0, "MINIBATCH_SIZE must be a multiple of DISPATCH_COMBINE_Mb");
+    static_assert(DISPATCH_COMBINE_SMS % CLUSTER_SIZE == 0, "DISPATCH_COMBINE_SMS must be a multiple of CLUSTER_SIZE");
 };
 
 struct globals {
-    using a_tile = st_bf<config::Mb / 2, config::Kb>;
-    using b_tile = st_bf<config::Nb / 2, config::Kb>;
-    using d_tile = st_bf<config::Mb / 2, config::Nb / config::EPI_PIPE_DEPTH>;
+    // Grouped GEMM
+    using a_tile = st_bf<config::MLP_Mb / 2, config::MLP_Kb>;
+    using b_tile = st_bf<config::MLP_Nb / 2, config::MLP_Kb>;
+    using d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::EPI_PIPE_DEPTH>;
+
+    // Fused SwiGLU
     using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;
 
-    using activation_gl = gl<bf16, 1, 1, -1, -1, a_tile, swiglu_tile>;
+    // Dispatch/Combine
+    using token_vec = sv_bf<config::DISPATCH_COMBINE_Nb>;
+
+    // Global layouts
+    using activation_gl = gl<bf16, 1, 1, -1, -1, a_tile, swiglu_tile, token_vec>;
+    using activation_pgl = pgl<activation_gl, NUM_DEVICES, false>;
     using weight_gl = gl<bf16, 1, -1, -1, -1, b_tile>;
     using index_gl = gl<int, 1, 1, 1, -1>;
 
-    activation_gl x_shared;
-    activation_gl x_routed;
-    activation_gl gate_shared;
-    activation_gl gate_routed;
-    activation_gl up_shared;
-    activation_gl up_routed;
-    activation_gl hidden_shared;
-    activation_gl hidden_routed;
-    activation_gl y_shared;
-    activation_gl y_routed;
-    weight_gl w_shared_gate;
-    weight_gl w_routed_gate;
-    weight_gl w_shared_up;
-    weight_gl w_routed_up;
-    weight_gl w_shared_down;
-    weight_gl w_routed_down;
-    index_gl tokens_per_expert;
-    index_gl mlp_swiglu_counter;
-    index_gl dispatch_counter;
-    index_gl combine_counter;
+    activation_gl x_shared;              // (num_local_tokens, H)
+    activation_gl x_routed;              // (capacity, H)
+    activation_gl gate_shared;           // (num_local_tokens, I)
+    activation_gl gate_routed;           // (capacity, I)
+    activation_gl up_shared;             // (num_local_tokens, I)
+    activation_gl up_routed;             // (capacity, I)
+    activation_gl hidden_shared;         // (num_local_tokens, I)
+    activation_gl hidden_routed;         // (capacity, I)
+    activation_gl y_shared;              // (num_local_tokens, H)
+    activation_gl y_routed;              // (capacity, H)
+
+    activation_pgl x_routed_send_buffer; // (num_local_tokens, H)
+    activation_pgl y_routed_recv_buffer; // (num_local_tokens * topk, H)
+
+    weight_gl w_shared_gate;             // (I, H)
+    weight_gl w_routed_gate;             // (num_local_experts, I, H)
+    weight_gl w_shared_up;               // (I, H)
+    weight_gl w_routed_up;               // (num_local_experts, I, H)
+    weight_gl w_shared_down;             // (H, I)
+    weight_gl w_routed_down;             // (num_local_experts, H, I)
+
+    index_gl schedule_peer_rank;         // (capacity,)
+    index_gl schedule_peer_token_idx;    // (capacity,)
+    index_gl tokens_per_expert;          // (num_local_experts,)
+
+    index_gl mlp_swiglu_counter;         // (shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks,)
+    index_gl dispatch_counter;           // (num_minibatches,)
+    index_gl combine_counter;            // (num_minibatches,)
+
+    const int topk;
 
     __host__ inline dim3 grid() const {
         const int num_minibatches = (x_routed.rows() + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
-        const int shared_row_blocks = x_shared.rows() / config::Mb;
-        const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::Mb;
-        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::Nb);
-        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::Nb);
+        const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
+        const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
+        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
+        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
         const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
         const int minibatch_routed_swiglu_tiles = (MINIBATCH_SIZE / config::SWIGLU_Mb) * (hidden_routed.cols() / config::SWIGLU_Nb);
         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
         const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
-        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::Nb);
-        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::Nb);
+        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
+        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
         const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
         const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
-        return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks));
+        return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + config::DISPATCH_COMBINE_SMS);
     }
 };
+
+template <bool IS_DISPATCH>
+static __device__ __forceinline__ void dispatch_combine_kernel(
+    const globals &G,
+    semaphore (&inputs_arrived)[config::DISPATCH_COMBINE_PIPE_DEPTH],
+    uint32_t &bitfield,
+    int task_idx,
+    uint64_t smem_base_addr
+) {
+    auto &token_vecs = *reinterpret_cast<typename globals::token_vec (*)[config::DISPATCH_COMBINE_PIPE_DEPTH][config::DISPATCH_COMBINE_Mb]>(smem_base_addr);
+
+    const int tid = threadIdx.x;
+    const bool is_worker = tid < config::DISPATCH_COMBINE_Mb; // only these threads move tokens, but all threads join the barriers and waits
+
+    const int col_blocks = G.x_routed.cols() / config::DISPATCH_COMBINE_Nb;
+    const int first_tile_idx = task_idx * config::DISPATCH_COMBINE_PIPE_DEPTH;
+
+    int num_tokens = 0;
+    for (int expert_idx = 0; expert_idx < G.tokens_per_expert.cols(); ++expert_idx)
+        num_tokens += G.tokens_per_expert[{expert_idx}];
+    const int num_valid_tiles = min(config::DISPATCH_COMBINE_PIPE_DEPTH, num_tokens / config::DISPATCH_COMBINE_Mb * col_blocks - first_tile_idx); // because we pad to 256
+    if (num_valid_tiles <= 0) return;
+
+    const int first_row_idx = first_tile_idx / col_blocks * config::DISPATCH_COMBINE_Mb + tid;
+    const int first_col_block_idx = first_tile_idx % col_blocks;
+
+    int row_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], col_block_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], peer_rank[config::DISPATCH_COMBINE_PIPE_DEPTH], 
+        peer_token_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], num_valid[config::DISPATCH_COMBINE_PIPE_DEPTH];
+    #pragma unroll
+    for (int stage = 0, row = first_row_idx, col = first_col_block_idx; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
+        const bool is_valid_tile = stage < num_valid_tiles;
+        row_idx[stage] = row;
+        col_block_idx[stage] = col;
+        peer_rank[stage] = is_valid_tile && is_worker ? G.schedule_peer_rank[{row}] : -1;
+        peer_token_idx[stage] = is_valid_tile && is_worker ? G.schedule_peer_token_idx[{row}] : -1;
+        num_valid[stage] = !is_valid_tile ? 0
+                         : (stage == 0 || col == 0) ? __syncthreads_count(peer_rank[stage] >= 0)
+                         : num_valid[stage - 1];
+        if (++col == col_blocks) { col = 0; row += config::DISPATCH_COMBINE_Mb; }
+    }
+
+    if (tid == 0) {
+        if (!IS_DISPATCH) {
+            // Wait until the routed down GEMMs have fully written every minibatch this task reads
+            const int first_minibatch_idx = first_row_idx / MINIBATCH_SIZE;
+            const int last_minibatch_idx = (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::DISPATCH_COMBINE_Mb / MINIBATCH_SIZE;
+            for (int minibatch_idx = first_minibatch_idx; minibatch_idx <= last_minibatch_idx; ++minibatch_idx) {
+                const int minibatch_rows = min(MINIBATCH_SIZE, num_tokens - minibatch_idx * MINIBATCH_SIZE);
+                const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.y_routed.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
+                int combine_counter;
+                while (true) {
+                    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(combine_counter) : "l"(&G.combine_counter[{minibatch_idx}]) : "memory");
+                    if (combine_counter >= expected) break;
+                    __nanosleep(16);
+                }
+            }
+            asm volatile("{fence.acquire.gpu;}" ::: "memory");
+        }
+        #pragma unroll
+        for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage)
+            if (stage < num_valid_tiles)
+                tma::expect_bytes(inputs_arrived[stage], num_valid[stage] * sizeof(typename globals::token_vec)); // 0 bytes completes the phase immediately
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
+        if (peer_rank[stage] >= 0) {
+            if constexpr (IS_DISPATCH)
+                tma::load_async(token_vecs[stage][tid], G.x_routed_send_buffer[peer_rank[stage]], {peer_token_idx[stage] / G.topk, col_block_idx[stage]}, inputs_arrived[stage]);
+            else
+                tma::load_async(token_vecs[stage][tid], G.y_routed, {row_idx[stage], col_block_idx[stage]}, inputs_arrived[stage]);
+        }
+    }
+
+    // Store each tile out as its loads arrive
+    #pragma unroll
+    for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
+        if (stage < num_valid_tiles) {
+            wait(inputs_arrived[stage], get_phasebit<0>(bitfield, stage)); // semaphores are reused across tasks
+            update_phasebit<0>(bitfield, stage);
+            if (peer_rank[stage] >= 0) {
+                if constexpr (IS_DISPATCH)
+                    tma::store_async(G.x_routed, token_vecs[stage][tid], {row_idx[stage], col_block_idx[stage]});
+                else
+                    tma::store_async(G.y_routed_recv_buffer[peer_rank[stage]], token_vecs[stage][tid], {peer_token_idx[stage], col_block_idx[stage]});
+            }
+        }
+    }
+
+    if constexpr (IS_DISPATCH) {
+        tma::store_async_wait();
+        __syncthreads();
+        if (tid == 0) {
+            const int tiles_per_minibatch = MINIBATCH_SIZE / config::DISPATCH_COMBINE_Mb * col_blocks; // a task straddles at most one minibatch boundary
+            const int minibatch_idx = first_tile_idx / tiles_per_minibatch;
+            const int first_count = min(num_valid_tiles, (minibatch_idx + 1) * tiles_per_minibatch - first_tile_idx);
+            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(first_count) : "memory");
+            if (first_count < num_valid_tiles)
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx + 1}]), "r"(num_valid_tiles - first_count) : "memory");
+        }
+    } else {
+        // The next task on this CTA reuses token_vecs; make sure outgoing stores are done reading shared memory
+        tma::store_async_read_wait();
+        __syncthreads();
+    }
+}
 
 template <bool IS_SHARED>
 static __device__ __forceinline__ void swiglu(
@@ -563,13 +409,13 @@ static __device__ __forceinline__ void swiglu(
     const typename globals::activation_gl &hidden_gmem = IS_SHARED ? g.hidden_shared : g.hidden_routed;
     const typename globals::weight_gl     &w_gate_gmem = IS_SHARED ? g.w_shared_gate : g.w_routed_gate;
 
-    const int shared_row_blocks = g.x_shared.rows() / config::Mb;
-    const int routed_row_blocks = g.x_routed.rows() / config::Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / config::Nb);
+    const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
+    const int routed_row_blocks = g.x_routed.rows() / config::MLP_Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
     const int gate_counter_offset = IS_SHARED ? 0 : shared_gate_up_tasks;
     const int swiglu_counter_offset = shared_gate_up_tasks + routed_gate_up_tasks + (IS_SHARED ? 0 : shared_row_blocks);
-    const int intermediate_col_blocks = w_gate_gmem.rows() / config::Nb;
+    const int intermediate_col_blocks = w_gate_gmem.rows() / config::MLP_Nb;
 
     int num_tokens;
     if constexpr (IS_SHARED) {
@@ -612,7 +458,7 @@ static __device__ __forceinline__ void swiglu(
                 }
                 tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
 
-                const int parent_task_idx = (row / (config::Mb / config::SWIGLU_Mb)) * intermediate_col_blocks + col / (config::Nb / config::SWIGLU_Nb);
+                const int parent_task_idx = (row / (config::MLP_Mb / config::SWIGLU_Mb)) * intermediate_col_blocks + col / (config::MLP_Nb / config::SWIGLU_Nb);
                 while (true) {
                     int gate_up_counter;
                     asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(gate_up_counter) : "l"(&g.mlp_swiglu_counter[{gate_counter_offset + parent_task_idx}]) : "memory");
@@ -668,7 +514,7 @@ static __device__ __forceinline__ void swiglu(
                 int col = first_col + stage;
                 if (col >= col_blocks)
                     ++row;
-                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.mlp_swiglu_counter[{swiglu_counter_offset + row / (config::Mb / config::SWIGLU_Mb)}]), "r"(1) : "memory");
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&g.mlp_swiglu_counter[{swiglu_counter_offset + row / (config::MLP_Mb / config::SWIGLU_Mb)}]), "r"(1) : "memory");
             }
         }
     }
@@ -689,7 +535,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     int task_idx,
     uint64_t smem_base_addr,
     expert_gemm_kind kind,
-    tt<float, config::Mb / 2, config::Nb> d_tt
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> d_tt
 ) {
     typename globals::a_tile (&a_smem)[config::LOAD_PIPE_DEPTH] = *reinterpret_cast<typename globals::a_tile (*)[config::LOAD_PIPE_DEPTH]>(smem_base_addr);
     typename globals::b_tile (&b_smem)[config::LOAD_PIPE_DEPTH] = *reinterpret_cast<typename globals::b_tile (*)[config::LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
@@ -708,29 +554,29 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     const typename globals::weight_gl     &b_gmem = kind == expert_gemm_kind::GATE ? w_gate_gmem : (kind == expert_gemm_kind::UP ? w_up_gmem : w_down_gmem);
     const typename globals::activation_gl &d_gmem = kind == expert_gemm_kind::GATE ? gate_gmem   : (kind == expert_gemm_kind::UP ? up_gmem : y_gmem);
 
-    const int iters_per_task = a_gmem.cols() / config::Kb;
-    const int col_blocks     = b_gmem.rows() / config::Nb;
-    const int shared_row_blocks = g.x_shared.rows() / config::Mb;
-    const int routed_row_blocks = g.x_routed.rows() / config::Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / config::Nb);
+    const int iters_per_task = a_gmem.cols() / config::MLP_Kb;
+    const int col_blocks     = b_gmem.rows() / config::MLP_Nb;
+    const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
+    const int routed_row_blocks = g.x_routed.rows() / config::MLP_Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
     const int gate_counter_offset = IS_SHARED ? 0 : shared_gate_up_tasks;
     const int swiglu_counter_offset = shared_gate_up_tasks + routed_gate_up_tasks + (IS_SHARED ? 0 : shared_row_blocks);
 
     int3 tile_coord = {-1, -1, -1};
     if constexpr (IS_SHARED) {
-        const int row_blocks = x_gmem.rows() / config::Mb;
+        const int row_blocks = x_gmem.rows() / config::MLP_Mb;
         const int num_tasks = row_blocks * col_blocks;
         if (task_idx < num_tasks) {
             const int2 swizzled = get_swizzled_2d_idx<config::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
             tile_coord = {swizzled.x, swizzled.y, 0};
         }
     } else {
-        constexpr int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::Mb;
+        constexpr int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
         const int minibatch_routed_row_offset = minibatch_idx * minibatch_routed_row_blocks;
         int row_block_offset = 0;
         for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
-            const int expert_row_blocks = g.tokens_per_expert[{expert_idx}] / config::Mb;
+            const int expert_row_blocks = g.tokens_per_expert[{expert_idx}] / config::MLP_Mb;
             const int first_row_block = max(minibatch_routed_row_offset, row_block_offset);
             const int row_blocks = max(0, min(minibatch_routed_row_offset + minibatch_routed_row_blocks, row_block_offset + expert_row_blocks) - first_row_block);
             const int num_tasks = row_blocks * col_blocks;
@@ -748,7 +594,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     if (warpgroup::groupid() == config::NUM_CONSUMERS) {
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
             if (kind == expert_gemm_kind::DOWN) {
-                const int expected = (config::Mb / config::SWIGLU_Mb) * (hidden_gmem.cols() / config::SWIGLU_Nb);
+                const int expected = (config::MLP_Mb / config::SWIGLU_Mb) * (hidden_gmem.cols() / config::SWIGLU_Nb);
                 int swiglu_counter;
                 while (true) {
                     asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(swiglu_counter) : "l"(&g.mlp_swiglu_counter[{swiglu_counter_offset + tile_coord.x}]) : "memory");
@@ -762,7 +608,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                     num_tokens += g.tokens_per_expert[{expert_idx}];
                 const int minibatch_first_row = minibatch_idx * MINIBATCH_SIZE;
                 const int minibatch_rows = max(0, min(MINIBATCH_SIZE, num_tokens - minibatch_first_row));
-                const int expected = ((minibatch_rows + config::DISPATCH_Mb - 1) / config::DISPATCH_Mb) * (g.x_routed.cols() / config::DISPATCH_Nb);
+                const int expected = ((minibatch_rows + config::DISPATCH_COMBINE_Mb - 1) / config::DISPATCH_COMBINE_Mb) * (g.x_routed.cols() / config::DISPATCH_COMBINE_Nb);
                 int dispatch_counter;
                 while (true) {
                     asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(dispatch_counter) : "l"(&g.dispatch_counter[{minibatch_idx}]) : "memory");
@@ -797,10 +643,10 @@ static __device__ __forceinline__ void expert_grouped_gemm(
         using epilogue_group = group<WARPGROUP_WARPS>;
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH);
-        rt_bf<config::Mb / 8, config::Nb / config::EPI_PIPE_DEPTH> d_reg[config::EPI_PIPE_DEPTH];
+        rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::EPI_PIPE_DEPTH> d_reg[config::EPI_PIPE_DEPTH];
         #pragma unroll
         for (int i = 0; i < config::EPI_PIPE_DEPTH; ++i)
-            warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, config::Mb / 2, config::Nb / config::EPI_PIPE_DEPTH>>(0, config::Nb / config::EPI_PIPE_DEPTH * i));
+            warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::EPI_PIPE_DEPTH * i));
         tensor_load_wait();
         warpgroup::sync(1);
         warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
@@ -827,7 +673,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     }
 }
 
-static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
+static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const globals &g) {
     warpgroup::increase_registers<256>();
 
     extern __shared__ int __shm[];
@@ -835,20 +681,22 @@ static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
 
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
-    const int shared_row_blocks = g.x_shared.rows() / config::Mb;
-    const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::Nb);
-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::Nb);
+    const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
+    const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
+    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
     const int shared_swiglu_tiles = (g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
     const int minibatch_routed_swiglu_tiles = (MINIBATCH_SIZE / config::SWIGLU_Mb) * (g.hidden_routed.cols() / config::SWIGLU_Nb);
     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
     const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
-    const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::Nb);
-    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::Nb);
+    const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
+    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
     const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
     const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
+    const int comm_clusters = config::DISPATCH_COMBINE_SMS / config::CLUSTER_SIZE;
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
+    uint32_t dispatch_combine_bitfield = 0xFFFF0000;
 
     __shared__ clc::handle clc_handle[config::CLC_PIPE_DEPTH];
     __shared__ semaphore schedule_arrived[config::CLC_PIPE_DEPTH], schedule_finished[config::CLC_PIPE_DEPTH];
@@ -856,6 +704,7 @@ static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
     __shared__ semaphore gemm_inputs_arrived[config::LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_finished[config::LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
+    __shared__ semaphore dispatch_combine_inputs_arrived[config::DISPATCH_COMBINE_PIPE_DEPTH];
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -874,11 +723,26 @@ static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
             init_semaphore(schedule_arrived[i], 0, 1);
             init_semaphore(schedule_finished[i], 0, config::CLUSTER_SIZE * config::NUM_WARPS);
         }
+        #pragma unroll
+        for (int i = 0; i < config::DISPATCH_COMBINE_PIPE_DEPTH; ++i) {
+            init_semaphore(dispatch_combine_inputs_arrived[i], 0, 1);
+        }
     }
 
     tensor_allocator<1, config::CLUSTER_SIZE> tm_alloc{};
-    tt<float, config::Mb / 2, config::Nb> d_tt = tm_alloc.template allocate<tt<float, config::Mb / 2, config::Nb>>(0);
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(0);
     everyone::tma::cluster::sync();
+
+    if (cluster_idx < comm_clusters) {
+        const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
+        const int dispatch_combine_tiles = (g.x_routed.rows() / config::DISPATCH_COMBINE_Mb) * (g.x_routed.cols() / config::DISPATCH_COMBINE_Nb);
+        const int dispatch_combine_tasks = (dispatch_combine_tiles + config::DISPATCH_COMBINE_PIPE_DEPTH - 1) / config::DISPATCH_COMBINE_PIPE_DEPTH;
+        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += config::DISPATCH_COMBINE_SMS)
+            dispatch_combine_kernel<true>(g, dispatch_combine_inputs_arrived, dispatch_combine_bitfield, task_idx, smem_base_addr);
+        for (int task_idx = comm_cta_idx; task_idx < dispatch_combine_tasks; task_idx += config::DISPATCH_COMBINE_SMS)
+            dispatch_combine_kernel<false>(g, dispatch_combine_inputs_arrived, dispatch_combine_bitfield, task_idx, smem_base_addr);
+        return;
+    }
 
     bool current_is_swiglu;
     for (int task_iter = 0; cluster_idx >= 0; ++task_iter) {
@@ -891,33 +755,34 @@ static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
             tma::expect_bytes(schedule_arrived[clc_stage], sizeof(clc_handle[clc_stage]));
         }
 
-        if (cluster_idx < shared_gate_up_tasks) {
+        const int comp_cluster_idx = cluster_idx - comm_clusters;
+        if (comp_cluster_idx < shared_gate_up_tasks) {
             // Shared gate
             current_is_swiglu = false;
-            const int task_idx = cluster_idx;
+            const int task_idx = comp_cluster_idx;
             expert_grouped_gemm<true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                       gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::GATE, d_tt);
-        } else if (cluster_idx < shared_gate_up_tasks * 2) {
+        } else if (comp_cluster_idx < shared_gate_up_tasks * 2) {
             // Shared up
             current_is_swiglu = false;
-            const int task_idx = cluster_idx - shared_gate_up_tasks;
+            const int task_idx = comp_cluster_idx - shared_gate_up_tasks;
             expert_grouped_gemm<true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                       gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::UP, d_tt);
-        } else if (cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks) {
+        } else if (comp_cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks) {
             // Shared Swiglu
             current_is_swiglu = true;
-            const int task_idx = cluster_idx - shared_gate_up_tasks * 2;
+            const int task_idx = comp_cluster_idx - shared_gate_up_tasks * 2;
             swiglu<true>(g, swiglu_inputs_arrived, swiglu_bitfield, cta_rank, 0, task_idx, smem_base_addr);
-        } else if (cluster_idx < shared_tasks) {
+        } else if (comp_cluster_idx < shared_tasks) {
             // Shared down
             current_is_swiglu = false;
-            const int task_idx = cluster_idx - shared_gate_up_tasks * 2 - shared_swiglu_tasks;
+            const int task_idx = comp_cluster_idx - shared_gate_up_tasks * 2 - shared_swiglu_tasks;
             expert_grouped_gemm<true>(g, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished,
                                       gemm_bitfield, cta_rank, 0, task_idx, smem_base_addr, expert_gemm_kind::DOWN, d_tt);
         } else {
             // Routed expert with minibatching
-            const int minibatch_idx = (cluster_idx - shared_tasks) / minibatch_tasks;
-            const int minibatch_task_idx = (cluster_idx - shared_tasks) - minibatch_idx * minibatch_tasks;
+            const int minibatch_idx = (comp_cluster_idx - shared_tasks) / minibatch_tasks;
+            const int minibatch_task_idx = (comp_cluster_idx - shared_tasks) - minibatch_idx * minibatch_tasks;
 
             if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                 // Routed gate
@@ -952,84 +817,19 @@ static __device__ __forceinline__ void mlp_swiglu_kernel(const globals &g) {
         warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
 
         // SWIGLU -> GEMM requires a cluster-wide sync
-        const int next_minibatch_task_idx = (cluster_idx - shared_tasks) - ((cluster_idx - shared_tasks) / minibatch_tasks) * minibatch_tasks;
-        const bool next_is_shared_swiglu = cluster_idx >= shared_gate_up_tasks * 2 && cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks;
-        const bool next_is_routed_swiglu = next_minibatch_task_idx >= minibatch_routed_gate_up_tasks * 2 && next_minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks;;
+        const int next_comp_cluster_idx = cluster_idx - comm_clusters;
+        const int next_minibatch_task_idx = (next_comp_cluster_idx - shared_tasks) - ((next_comp_cluster_idx - shared_tasks) / minibatch_tasks) * minibatch_tasks;
+        const bool next_is_shared_swiglu = next_comp_cluster_idx >= shared_gate_up_tasks * 2 && next_comp_cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks;
+        const bool next_is_routed_swiglu = next_comp_cluster_idx >= shared_tasks && next_minibatch_task_idx >= minibatch_routed_gate_up_tasks * 2 && next_minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks;
         if (current_is_swiglu && cluster_idx >= 0 && !next_is_shared_swiglu && !next_is_routed_swiglu)
             everyone::tma::cluster::sync();
     }
 }
 
-static __host__ void mlp_swiglu(
-    const at::Tensor &x_shared,
-    const at::Tensor &x_routed,
-    at::Tensor &gate_shared,
-    at::Tensor &gate_routed,
-    at::Tensor &up_shared,
-    at::Tensor &up_routed,
-    at::Tensor &hidden_shared,
-    at::Tensor &hidden_routed,
-    at::Tensor &y_shared,
-    at::Tensor &y_routed,
-    const at::Tensor &w_shared_gate,
-    const at::Tensor &w_routed_gate,
-    const at::Tensor &w_shared_up,
-    const at::Tensor &w_routed_up,
-    const at::Tensor &w_shared_down,
-    const at::Tensor &w_routed_down,
-    const at::Tensor &tokens_per_expert,
-    const at::Tensor &dispatch_counter,
-    at::Tensor mlp_swiglu_counter, // must be zero'ed
-    at::Tensor combine_counter // must be zero'ed
-) {
-    globals g {
-        .x_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(x_shared),
-        .x_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(x_routed),
-        .gate_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(gate_shared),
-        .gate_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(gate_routed),
-        .up_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(up_shared),
-        .up_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(up_routed),
-        .hidden_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(hidden_shared),
-        .hidden_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(hidden_routed),
-        .y_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(y_shared),
-        .y_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(y_routed),
-        .w_shared_gate = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_gate),
-        .w_shared_up = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_up),
-        .w_shared_down = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_down),
-        .w_routed_down = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_down),
-        .tokens_per_expert = kittens::py::tensor_to_gl<typename globals::index_gl>(tokens_per_expert),
-        .mlp_swiglu_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(mlp_swiglu_counter),
-        .dispatch_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(dispatch_counter),
-        .combine_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(combine_counter)
-    };
-
-    kittens::py::launch_kernel<config, globals, mlp_swiglu_kernel>(g);
-}
-
-}; // struct mlp_swigluer
-
-__host__ std::tuple<at::Tensor, at::Tensor, at::Tensor> schedule(
-    const at::Tensor &topk_all,
-    const int num_local_experts,
-    const int capacity,
-    const int rank
-) {
-    const int world_size = static_cast<int>(topk_all.size(0));
-
-    at::Tensor schedule_peer_rank = at::empty({capacity}, topk_all.options().dtype(at::kInt));
-    at::Tensor schedule_peer_token_idx = at::empty({capacity}, topk_all.options().dtype(at::kInt));
-    at::Tensor tokens_per_expert = at::empty({num_local_experts}, topk_all.options().dtype(at::kInt));
-    at::Tensor tokens_per_expert_and_peer = at::zeros({num_local_experts * world_size}, topk_all.options().dtype(at::kInt));
-    schedule_peer_rank.fill_(-1);
-
-    scheduler::schedule(topk_all, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, tokens_per_expert_and_peer, rank);
-    
-    return {schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert};
-}
-
-__host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_mlp_swiglu_combine(
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, 
+                           at::Tensor, at::Tensor, at::Tensor, 
+                           at::Tensor, at::Tensor, at::Tensor> 
+dispatch_mlp_swiglu_combine(
     // Inputs and communication buffers
     const at::Tensor &x,
     const std::vector<int64_t> &x_ptrs,
@@ -1053,17 +853,21 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     // Metadata
     int topk
 ) {
-    static constexpr int NUM_DEVICES = 4;
-    static constexpr int MINIBATCH_SIZE = 4096;
-    static constexpr int DISPATCH_COMBINE_SMS = 24;
-
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
+    const int model_dim = x.size(1);
     const int num_minibatches = (buffer_capacity + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
-    const int shared_row_blocks = num_local_tokens / mlp_swigluer<MINIBATCH_SIZE>::config::Mb;
-    const int routed_row_blocks = buffer_capacity / mlp_swigluer<MINIBATCH_SIZE>::config::Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / mlp_swigluer<MINIBATCH_SIZE>::config::Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / mlp_swigluer<MINIBATCH_SIZE>::config::Nb);
+    const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
+    const int routed_row_blocks = buffer_capacity / config::MLP_Mb;
+    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::MLP_Nb);
+
+    bf16 *x_routed_send_buffer_data[NUM_DEVICES];
+    bf16 *y_routed_recv_buffer_data[NUM_DEVICES];
+    for (int i = 0; i < NUM_DEVICES; ++i) {
+        x_routed_send_buffer_data[i] = reinterpret_cast<bf16*>(x_ptrs[i]);
+        y_routed_recv_buffer_data[i] = reinterpret_cast<bf16*>(combine_buffer_ptrs[i]);
+    }
     
     at::Tensor gate_shared = at::empty({x.size(0), w_shared_gate.size(0)}, x.options());
     at::Tensor gate_routed = at::empty({dispatch_buffer.size(0), w_routed_gate.size(1)}, dispatch_buffer.options());
@@ -1077,39 +881,45 @@ __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
     at::Tensor mlp_swiglu_counter = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks + shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
     at::Tensor combine_counter = at::zeros({num_minibatches}, tokens_per_expert.options());
 
-    cudaStream_t current_stream = at::cuda::getCurrentCUDAStream();
-    CUstream current_stream_cu = reinterpret_cast<CUstream>(current_stream);
+    globals g {
+        .x_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(x),
+        .x_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(dispatch_buffer),
+        .gate_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(gate_shared),
+        .gate_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(gate_routed),
+        .up_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(up_shared),
+        .up_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(up_routed),
+        .hidden_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(hidden_shared),
+        .hidden_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(hidden_routed),
+        .y_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(y_shared),
+        .y_routed = kittens::py::tensor_to_gl<typename globals::activation_gl>(y_routed),
+        .x_routed_send_buffer = typename globals::activation_pgl{x_routed_send_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens), static_cast<size_t>(model_dim)},
+        .y_routed_recv_buffer = typename globals::activation_pgl{y_routed_recv_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens * topk), static_cast<size_t>(model_dim)},
+        .w_shared_gate = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_gate),
+        .w_routed_gate = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_gate),
+        .w_shared_up = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_up),
+        .w_routed_up = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_up),
+        .w_shared_down = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_shared_down),
+        .w_routed_down = kittens::py::tensor_to_gl<typename globals::weight_gl>(w_routed_down),
+        .schedule_peer_rank = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_peer_rank),
+        .schedule_peer_token_idx = kittens::py::tensor_to_gl<typename globals::index_gl>(schedule_peer_token_idx),
+        .tokens_per_expert = kittens::py::tensor_to_gl<typename globals::index_gl>(tokens_per_expert),
+        .mlp_swiglu_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(mlp_swiglu_counter),
+        .dispatch_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(dispatch_counter),
+        .combine_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(combine_counter),
+        .topk = topk
+    };
 
-    green_context_streams<DISPATCH_COMBINE_SMS> &gcs = green_context_streams<DISPATCH_COMBINE_SMS>::get();
-    c10::DeviceIndex device_index = static_cast<c10::DeviceIndex>(gcs.device);
-    c10::cuda::CUDAStream dispatch_combine_stream = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(gcs.dispatch_combine_stream), device_index);
-    c10::cuda::CUDAStream mlp_swiglu_stream = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(gcs.mlp_swiglu_stream), device_index);
-
-    CUCHECK(cuEventRecord(gcs.main_ready, current_stream_cu));
-    CUCHECK(cuGreenCtxWaitEvent(gcs.dispatch_combine_context, gcs.main_ready));
-    CUCHECK(cuGreenCtxWaitEvent(gcs.mlp_swiglu_context, gcs.main_ready));
-
-    {
-        c10::cuda::CUDAStreamGuard stream_guard(dispatch_combine_stream);
-        dispatcher<NUM_DEVICES, MINIBATCH_SIZE>::dispatch(x, x_ptrs, dispatch_buffer, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, dispatch_counter, topk);
-        stream_guard.reset_stream(mlp_swiglu_stream);
-        mlp_swigluer<MINIBATCH_SIZE>::mlp_swiglu(x, dispatch_buffer, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert, dispatch_counter, mlp_swiglu_counter, combine_counter);
-        stream_guard.reset_stream(dispatch_combine_stream);
-        combiner<NUM_DEVICES, MINIBATCH_SIZE>::combine(y_routed, combine_buffer, combine_buffer_ptrs, schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, combine_counter);
-    }
-
-    CUCHECK(cuGreenCtxRecordEvent(gcs.mlp_swiglu_context, gcs.mlp_swiglu_done));
-    CUCHECK(cuGreenCtxRecordEvent(gcs.dispatch_combine_context, gcs.dispatch_combine_done));
-    CUCHECK(cuStreamWaitEvent(current_stream_cu, gcs.mlp_swiglu_done, 0));
-    CUCHECK(cuStreamWaitEvent(current_stream_cu, gcs.dispatch_combine_done, 0));
+    kittens::py::launch_kernel<config, globals, dispatch_mlp_swiglu_combine_kernel>(g);
 
     return {gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer};
 }
 
+}; // struct dispatch_mlp_swiglu_combiner
+
 PYBIND11_MODULE(_C, m) {
-    m.def("schedule", &schedule, "",
+    m.def("schedule", &scheduler::schedule, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("capacity"), pybind11::arg("rank"));
-    m.def("dispatch_mlp_swiglu_combine", &dispatch_mlp_swiglu_combine, "",
+    m.def("dispatch_mlp_swiglu_combine", &dispatch_mlp_swiglu_combiner<4, 4096>::dispatch_mlp_swiglu_combine, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("dispatch_buffer"), pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
           pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
