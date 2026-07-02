@@ -177,7 +177,7 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor> schedule(
 
 }; // struct scheduler
 
-template <int NUM_DEVICES, int MINIBATCH_SIZE>
+template <int NUM_DEVICES>
 struct dispatch_mlp_swiglu_combiner {
 
 struct config {
@@ -208,10 +208,6 @@ struct config {
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
-
-    static_assert(MINIBATCH_SIZE % MLP_Mb == 0, "MINIBATCH_SIZE must be a multiple of MLP_Mb");
-    static_assert(MINIBATCH_SIZE % SWIGLU_Mb == 0, "MINIBATCH_SIZE must be a multiple of SWIGLU_Mb");
-    static_assert(MINIBATCH_SIZE % DISPATCH_COMBINE_Mb == 0, "MINIBATCH_SIZE must be a multiple of DISPATCH_COMBINE_Mb");
 };
 
 struct globals {
@@ -263,15 +259,16 @@ struct globals {
 
     const int topk;
     const int num_comm_sms;
+    const int minibatch_size;
 
     __host__ inline dim3 grid() const {
-        const int num_minibatches = (x_routed.rows() + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
+        const int num_minibatches = (x_routed.rows() + minibatch_size - 1) / minibatch_size;
         const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
-        const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
+        const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
         const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
         const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
         const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
-        const int minibatch_routed_swiglu_tiles = (MINIBATCH_SIZE / config::SWIGLU_Mb) * (hidden_routed.cols() / config::SWIGLU_Nb);
+        const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_routed.cols() / config::SWIGLU_Nb);
         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
         const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
         const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
@@ -325,10 +322,10 @@ static __device__ __forceinline__ void dispatch_combine_kernel(
     if (tid == 0) {
         if (!IS_DISPATCH) {
             // Wait until the routed down GEMMs have fully written every minibatch this task reads
-            const int first_minibatch_idx = first_row_idx / MINIBATCH_SIZE;
-            const int last_minibatch_idx = (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::DISPATCH_COMBINE_Mb / MINIBATCH_SIZE;
+            const int first_minibatch_idx = first_row_idx / G.minibatch_size;
+            const int last_minibatch_idx = (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::DISPATCH_COMBINE_Mb / G.minibatch_size;
             for (int minibatch_idx = first_minibatch_idx; minibatch_idx <= last_minibatch_idx; ++minibatch_idx) {
-                const int minibatch_rows = min(MINIBATCH_SIZE, num_tokens - minibatch_idx * MINIBATCH_SIZE);
+                const int minibatch_rows = min(G.minibatch_size, num_tokens - minibatch_idx * G.minibatch_size);
                 const int expected = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (G.y_routed.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
                 int combine_counter;
                 while (true) {
@@ -375,7 +372,7 @@ static __device__ __forceinline__ void dispatch_combine_kernel(
         tma::store_async_wait();
         __syncthreads();
         if (tid == 0) {
-            const int tiles_per_minibatch = MINIBATCH_SIZE / config::DISPATCH_COMBINE_Mb * col_blocks; // a task straddles at most one minibatch boundary
+            const int tiles_per_minibatch = G.minibatch_size / config::DISPATCH_COMBINE_Mb * col_blocks; // a task straddles at most one minibatch boundary
             const int minibatch_idx = first_tile_idx / tiles_per_minibatch;
             const int first_count = min(num_valid_tiles, (minibatch_idx + 1) * tiles_per_minibatch - first_tile_idx);
             asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&G.dispatch_counter[{minibatch_idx}]), "r"(first_count) : "memory");
@@ -432,7 +429,7 @@ static __device__ __forceinline__ void swiglu(
         first_tile_idx = task_idx * config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH + cta_rank * config::SWIGLU_PIPE_DEPTH;
         tile_end = num_tiles;
     } else {
-        const int num_tiles_per_minibatch = (MINIBATCH_SIZE / config::SWIGLU_Mb) * col_blocks;
+        const int num_tiles_per_minibatch = (g.minibatch_size / config::SWIGLU_Mb) * col_blocks;
         const int minibatch_first_tile_idx = minibatch_idx * num_tiles_per_minibatch;
         first_tile_idx = minibatch_first_tile_idx + task_idx * config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH + cta_rank * config::SWIGLU_PIPE_DEPTH;
         tile_end = min(num_tiles, minibatch_first_tile_idx + num_tiles_per_minibatch);
@@ -571,7 +568,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
             tile_coord = {swizzled.x, swizzled.y, 0};
         }
     } else {
-        constexpr int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
+        const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
         const int minibatch_routed_row_offset = minibatch_idx * minibatch_routed_row_blocks;
         int row_block_offset = 0;
         for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
@@ -605,8 +602,8 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                 int num_tokens = 0;
                 for (int expert_idx = 0; expert_idx < g.w_routed_gate.depth(); ++expert_idx)
                     num_tokens += g.tokens_per_expert[{expert_idx}];
-                const int minibatch_first_row = minibatch_idx * MINIBATCH_SIZE;
-                const int minibatch_rows = max(0, min(MINIBATCH_SIZE, num_tokens - minibatch_first_row));
+                const int minibatch_first_row = minibatch_idx * g.minibatch_size;
+                const int minibatch_rows = max(0, min(g.minibatch_size, num_tokens - minibatch_first_row));
                 const int expected = ((minibatch_rows + config::DISPATCH_COMBINE_Mb - 1) / config::DISPATCH_COMBINE_Mb) * (g.x_routed.cols() / config::DISPATCH_COMBINE_Nb);
                 int dispatch_counter;
                 while (true) {
@@ -681,11 +678,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
-    const int minibatch_routed_row_blocks = MINIBATCH_SIZE / config::MLP_Mb;
+    const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
     const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
     const int shared_swiglu_tiles = (g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
-    const int minibatch_routed_swiglu_tiles = (MINIBATCH_SIZE / config::SWIGLU_Mb) * (g.hidden_routed.cols() / config::SWIGLU_Nb);
+    const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_routed.cols() / config::SWIGLU_Nb);
     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
     const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_PIPE_DEPTH);
     const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
@@ -851,12 +848,13 @@ dispatch_mlp_swiglu_combine(
 
     // Metadata
     int topk,
-    int num_comm_sms
+    int num_comm_sms,
+    int minibatch_size
 ) {
     const int num_local_tokens = x.size(0);
     const int buffer_capacity = dispatch_buffer.size(0);
     const int model_dim = x.size(1);
-    const int num_minibatches = (buffer_capacity + MINIBATCH_SIZE - 1) / MINIBATCH_SIZE;
+    const int num_minibatches = (buffer_capacity + minibatch_size - 1) / minibatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = buffer_capacity / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
@@ -907,7 +905,8 @@ dispatch_mlp_swiglu_combine(
         .dispatch_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(dispatch_counter),
         .combine_counter = kittens::py::tensor_to_gl<typename globals::index_gl>(combine_counter),
         .topk = topk,
-        .num_comm_sms = num_comm_sms
+        .num_comm_sms = num_comm_sms,
+        .minibatch_size = minibatch_size
     };
 
     kittens::py::launch_kernel<config, globals, dispatch_mlp_swiglu_combine_kernel>(g);
@@ -920,7 +919,7 @@ dispatch_mlp_swiglu_combine(
 PYBIND11_MODULE(_C, m) {
     m.def("schedule", &scheduler::schedule, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("capacity"), pybind11::arg("rank"));
-    m.def("dispatch_mlp_swiglu_combine", &dispatch_mlp_swiglu_combiner<4, 4096>::dispatch_mlp_swiglu_combine, "",
+    m.def("dispatch_mlp_swiglu_combine", &dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("dispatch_buffer"), pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
           pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
@@ -928,5 +927,5 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("w_shared_down"), pybind11::arg("w_routed_down"),
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("tokens_per_expert"),
-          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"), pybind11::arg("minibatch_size"));
 }
