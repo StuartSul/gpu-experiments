@@ -14,6 +14,7 @@
 # SRC := 016-moe-dispatch-combine-signalled-bw.cu
 # SRC := 017-moe-mlp-swiglu-signalled-bw.cu
 SRC := 018-moe-dispatch-mlp-swiglu-combine-bw.cu
+# SRC := 020-clc-priority-yield.cu
 
 # Binaries
 CC := g++
@@ -124,3 +125,17 @@ $(OUT): $(SRC)
 
 clean:
 	rm -f $(OUT) $(basename $(SRC)).ptx $(basename $(SRC)).out
+
+# 020: standalone CLC + stream-priority scheduling experiment (no python harness)
+CLC020_SRC := 020-clc-priority-yield.cu
+CLC020_OUT := $(basename $(CLC020_SRC)).out
+
+$(CLC020_OUT): $(CLC020_SRC)
+	$(NVCC) $(CLC020_SRC) $(NVCCFLAGS_COMMON) -o $(CLC020_OUT)
+
+020: $(CLC020_OUT)
+
+run020: $(CLC020_OUT)
+	./$(CLC020_OUT)
+
+.PHONY: 020 run020
