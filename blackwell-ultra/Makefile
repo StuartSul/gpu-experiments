@@ -13,7 +13,8 @@
 # SRC := 015-moe-mlp-swiglu-bw.cu
 # SRC := 016-moe-dispatch-combine-signalled-bw.cu
 # SRC := 017-moe-mlp-swiglu-signalled-bw.cu
-SRC := 018-moe-dispatch-mlp-swiglu-combine-bw.cu
+# SRC := 018-moe-dispatch-mlp-swiglu-combine-bw.cu
+SRC := 019-moe-dispatch-combine-mxfp8-signalled.cu
 # SRC := 020-clc-priority-yield.cu
 
 # Binaries
