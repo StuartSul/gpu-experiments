@@ -24,6 +24,7 @@ NUM_LOCAL_EXPERTS = 4
 TOPK = 8
 NUM_COMM_SMS = 32
 MINIBATCH_SIZE = 4096
+MACROBATCH_SIZE = 32 * MINIBATCH_SIZE
 
 WARMUP_ITERS = 5
 PROFILE_ITERS = 3
@@ -76,7 +77,7 @@ def main():
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
 
     num_experts = NUM_LOCAL_EXPERTS * world_size
-    buffer_capacity = NUM_LOCAL_TOKENS * TOPK * 3 // 2
+    schedule_capacity = NUM_LOCAL_TOKENS * TOPK * max(2, world_size // 4)
 
     # Generate inputs and communication buffers
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
@@ -85,7 +86,6 @@ def main():
     x.normal_(generator=gen)
     x_handle = symm_mem.rendezvous(x, dist.group.WORLD.group_name)
     x_ptrs = [x_handle.buffer_ptrs[i] for i in range(world_size)]
-    dispatch_buffer = torch.empty(buffer_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_buffer = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_buffer_handle = symm_mem.rendezvous(combine_buffer, dist.group.WORLD.group_name)
     combine_buffer_ptrs = [combine_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
@@ -109,13 +109,14 @@ def main():
     # Benchmark
     for _ in range(WARMUP_ITERS):
         dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-        schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
-            topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+        schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
+            topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
         )
-        gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
-            x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
+        x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
+            x, x_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS, MINIBATCH_SIZE
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
         )
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
@@ -129,13 +130,14 @@ def main():
     ) as prof:
         for _ in range(PROFILE_ITERS):
             dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
-                topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
+                topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
             )
-            gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
-                x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
+            x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
+                x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS, MINIBATCH_SIZE
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
             )
             dist.barrier(async_op=True).block_current_stream()
             output = finalize(y_shared, combine_buffer, topk_weights)
@@ -152,13 +154,14 @@ def main():
     start.record()
     for _ in range(TIMED_ITERS):
         dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-        schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert = schedule(
-            topk_ids_all, NUM_LOCAL_EXPERTS, buffer_capacity, rank
+        schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
+            topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
         )
-        gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
-            x, x_ptrs, dispatch_buffer, combine_buffer, combine_buffer_ptrs,
+        x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
+            x, x_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            schedule_peer_rank, schedule_peer_token_idx, tokens_per_expert, TOPK, NUM_COMM_SMS, MINIBATCH_SIZE
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
         )
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
@@ -167,21 +170,21 @@ def main():
     dist.barrier()
 
     end_to_end_ms = start.elapsed_time(end) / TIMED_ITERS
-    total_routed_tokens = int(tokens_per_expert.sum().item())
+    total_routed_tokens = int(num_tokens.item())
 
     # Reference implementation
     x_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(x_all, x)
     valid = schedule_peer_rank >= 0
-    x_routed_ref = torch.empty_like(dispatch_buffer)
+    x_routed_ref = torch.empty(schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     x_routed_ref[valid] = x_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
     mlp_swiglu_refs = mlp_swiglu_ref(
         x, x_routed_ref, w_shared_gate, w_routed_gate, w_shared_up,
         w_routed_up, w_shared_down, w_routed_down, tokens_per_expert
     )
-    schedule_peer_rank_all = torch.empty(world_size, buffer_capacity, dtype=torch.int32, device=device)
+    schedule_peer_rank_all = torch.empty(world_size, schedule_capacity, dtype=torch.int32, device=device)
     schedule_peer_token_idx_all = torch.empty_like(schedule_peer_rank_all)
-    y_routed_all = torch.empty(world_size, buffer_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    y_routed_all = torch.empty(world_size, schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(schedule_peer_rank_all, schedule_peer_rank)
     dist.all_gather_into_tensor(schedule_peer_token_idx_all, schedule_peer_token_idx)
     dist.all_gather_into_tensor(y_routed_all, mlp_swiglu_refs[-1])
@@ -192,14 +195,19 @@ def main():
     output_ref = finalize(mlp_swiglu_refs[-2], combine_buffer_ref, topk_weights)
 
     # Correctness checks for all returned tensors and final output
+    # The routed buffers end up holding the last macrobatch's rows
+    num_macrobatches = max(1, (total_routed_tokens + MACROBATCH_SIZE - 1) // MACROBATCH_SIZE)
+    last_macrobatch_start = (num_macrobatches - 1) * MACROBATCH_SIZE
+    last_macrobatch_rows = total_routed_tokens - last_macrobatch_start
     names = ("gate_shared", "gate_routed", "up_shared", "up_routed", "hidden_shared", "hidden_routed", "y_shared", "y_routed", "combine_buffer", "output")
     outputs = (gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer, output)
     references = (*mlp_swiglu_refs, combine_buffer_ref, output_ref)
     difference_stats = []
     for name, out, ref in zip(names, outputs, references):
         if name.endswith("_routed"):
-            out = out[valid]
-            ref = ref[valid]
+            last_macrobatch_valid = valid[last_macrobatch_start:total_routed_tokens]
+            out = out[:last_macrobatch_rows][last_macrobatch_valid]
+            ref = ref[last_macrobatch_start:total_routed_tokens][last_macrobatch_valid]
         diff = (out.float() - ref.float()).abs()
         diff_sum = diff.sum()
         diff_count = torch.tensor(diff.numel(), dtype=torch.float64, device=device)
