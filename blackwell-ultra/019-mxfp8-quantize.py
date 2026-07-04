@@ -1,7 +1,7 @@
 """
 To run:
     make
-    python3 021-mxfp8-quantize.py [M] [N]
+    python3 019-mxfp8-quantize.py [M] [N]
 """
 
 import os
