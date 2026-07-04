@@ -15,8 +15,9 @@
 # SRC := 017-moe-mlp-swiglu-signalled-bw.cu
 # SRC := 018-moe-dispatch-mlp-swiglu-combine-bw.cu
 # SRC := 019-mxfp8-quantize.cu
-SRC := 020-mxfp8-quantize-persistent.cu
+# SRC := 020-mxfp8-quantize-persistent.cu
 # SRC := 021-clc-priority-yield.cu
+SRC := 022-moe-dispatch-mlp-swiglu-combine-mxfp8-bw.cu
 
 # Binaries
 CC := g++
