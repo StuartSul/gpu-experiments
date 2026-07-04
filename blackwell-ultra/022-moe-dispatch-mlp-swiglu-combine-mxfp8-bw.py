@@ -163,7 +163,7 @@ def main():
         )
         (x_routed, gate_shared, gate_routed, up_shared, up_routed,
          hidden_fp8_shared, hidden_sc_shared, hidden_fp8_routed, hidden_sc_routed,
-         y_shared, y_routed, combine_buffer) = dispatch_mlp_swiglu_combine(
+         y_shared, y_routed, _) = dispatch_mlp_swiglu_combine(
             x, x_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate_fp8, w_shared_gate_sc, w_routed_gate_fp8, w_routed_gate_sc,
             w_shared_up_fp8, w_shared_up_sc, w_routed_up_fp8, w_routed_up_sc,
