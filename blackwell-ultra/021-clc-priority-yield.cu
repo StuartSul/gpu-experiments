@@ -7,7 +7,7 @@ Observation:
 
 How to run (sort -n to sort by time):
     make
-    ./020-clc-priority-yield.out | sort -n
+    ./021-clc-priority-yield.out | sort -n
 */
 
 #include <chrono>
