@@ -153,7 +153,7 @@ def main():
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
             topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
         )
-        (x_fp8_routed, x_sc_routed, x_fp8_t_routed, x_sc_t_routed,
+        (x_fp8_t_routed, x_sc_t_routed,
          gate_shared, gate_fp8_routed, gate_sc_routed,
          up_shared, up_fp8_routed, up_sc_routed,
          hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
@@ -168,7 +168,7 @@ def main():
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
         return (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                x_fp8_routed, x_sc_routed, x_fp8_t_routed, x_sc_t_routed,
+                x_fp8_t_routed, x_sc_t_routed,
                 gate_shared, gate_fp8_routed, gate_sc_routed,
                 up_shared, up_fp8_routed, up_sc_routed,
                 hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
@@ -200,7 +200,7 @@ def main():
     start.record()
     for _ in range(TIMED_ITERS):
         (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-         x_fp8_routed, x_sc_routed, x_fp8_t_routed, x_sc_t_routed,
+         x_fp8_t_routed, x_sc_t_routed,
          gate_shared, gate_fp8_routed, gate_sc_routed,
          up_shared, up_fp8_routed, up_sc_routed,
          hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
@@ -240,12 +240,10 @@ def main():
     output_ref = finalize(y_shared_ref, combine_buffer_ref, topk_weights)
 
     # Dequantize the fused kernel's quantized outputs and build dequantized references
-    x_routed_dequant = dequant(x_fp8_routed, scale_unswizzle(x_sc_routed))
     x_routed_t_dequant = dequant(x_fp8_t_routed, scale_unswizzle(x_sc_t_routed))
     gate_routed_dequant = dequant(gate_fp8_routed, scale_unswizzle(gate_sc_routed))
     up_routed_dequant = dequant(up_fp8_routed, scale_unswizzle(up_sc_routed))
     hidden_routed_t_dequant = dequant(hidden_fp8_t_routed, scale_unswizzle(hidden_sc_t_routed))
-    x_routed_dequant_ref = dequant(*mxfp8_quantize_ref(x_routed_ref))
     x_routed_t_dequant_ref = dequant(*mxfp8_quantize_ref(x_routed_ref.T.contiguous()))
     gate_routed_dequant_ref = dequant(*mxfp8_quantize_ref(gate_routed_ref))
     up_routed_dequant_ref = dequant(*mxfp8_quantize_ref(up_routed_ref))
@@ -265,7 +263,6 @@ def main():
 
     difference_stats = []
     for name, out, ref in (
-        ("x_routed", *get_valid_rows(x_routed_dequant, x_routed_dequant_ref)),
         ("x_routed_t", *get_valid_cols(x_routed_t_dequant, x_routed_t_dequant_ref)),
         ("gate_shared", gate_shared, gate_shared_ref),
         ("gate_routed", *get_valid_rows(gate_routed_dequant, gate_routed_dequant_ref)),

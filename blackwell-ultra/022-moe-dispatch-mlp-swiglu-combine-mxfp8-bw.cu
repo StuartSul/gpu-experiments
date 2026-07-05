@@ -1356,7 +1356,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
 
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-                           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+                           at::Tensor, at::Tensor, at::Tensor>
 dispatch_mlp_swiglu_combine(
     // Inputs and communication buffers
     const at::Tensor &x,
@@ -1479,7 +1479,7 @@ dispatch_mlp_swiglu_combine(
 
     kittens::py::launch_kernel<config, globals, dispatch_mlp_swiglu_combine_kernel>(g);
 
-    return {x_fp8_routed, x_sc_routed, x_fp8_t_routed, x_sc_t_routed,
+    return {x_fp8_t_routed, x_sc_t_routed,
             gate_shared, gate_fp8_routed, gate_sc_routed,
             up_shared, up_fp8_routed, up_sc_routed,
             hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
