@@ -219,31 +219,54 @@ struct globals {
     }
 };
 
-static __device__ __forceinline__ uint32_t mxfp8_scale_from_amax2(bf16_2 amax, float &scale_inv) {
+static __device__ __forceinline__ void mxfp8_quantize_single_block(
+    const bf16_2 (&values_bf16)[16],
+    uint32_t (&values_fp8)[8],
+    uint32_t &scale_byte
+) {
+    bf16_2 amax = __habs2(values_bf16[0]);
+    #pragma unroll
+    for (int i = 1; i < 16; i++)
+        amax = __hmax2(amax, __habs2(values_bf16[i]));
+
+    // Compute the e8m0 scale, rounding towards positive infinity and saturating to finite (https://arxiv.org/pdf/2506.08027)
     const float scale = max(__bfloat162float(__hmax(amax.x, amax.y)) * 0.002232142857f, 0.000000000001f);
     uint16_t scale_fp8x2;
-    // Round towards positive infinity and saturate to finite (https://arxiv.org/pdf/2506.08027)
     asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}" : "=h"(scale_fp8x2) : "f"(scale), "f"(scale));
-    scale_inv = __uint_as_float((254u - (scale_fp8x2 & 0xFF)) << 23); // directly build float32 reciprocal without division
-    return static_cast<uint32_t>(scale_fp8x2 & 0xFF);
+    scale_byte = scale_fp8x2 & 0xFF;
+    const float scale_inv = __uint_as_float((254u - scale_byte) << 23); // directly build float32 reciprocal without division
+
+    // Quantize
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const float2 v01_fp32 = __bfloat1622float2(values_bf16[i * 2]);
+        const float2 v23_fp32 = __bfloat1622float2(values_bf16[i * 2 + 1]);
+        uint16_t v01_fp8, v23_fp8;
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v01_fp8) : "f"(v01_fp32.x * scale_inv), "f"(v01_fp32.y * scale_inv));
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v23_fp8) : "f"(v23_fp32.x * scale_inv), "f"(v23_fp32.y * scale_inv));
+        values_fp8[i] = static_cast<uint32_t>(v01_fp8) | (static_cast<uint32_t>(v23_fp8) << 16);
+    }
 }
 
-static __device__ __forceinline__ uint32_t mxfp8_quantize4(bf16_2 v01_bf16, bf16_2 v23_bf16, float scale_inv) {
-    const float2 v01_fp32 = __bfloat1622float2(v01_bf16);
-    const float2 v23_fp32 = __bfloat1622float2(v23_bf16);
-    uint16_t v01_fp8, v23_fp8;
-    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v01_fp8) : "f"(v01_fp32.x * scale_inv), "f"(v01_fp32.y * scale_inv));
-    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v23_fp8) : "f"(v23_fp32.x * scale_inv), "f"(v23_fp32.y * scale_inv));
-    return static_cast<uint32_t>(v01_fp8) | (static_cast<uint32_t>(v23_fp8) << 16);
+static __device__ __forceinline__ void mxfp8_dequantize_single_block(
+    const uint32_t (&values_fp8)[8],
+    const uint32_t scale_byte,
+    float2 (&values_fp32)[16]
+) {
+    const float scale = __uint_as_float(scale_byte << 23);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const uint16_t v01_fp8 = static_cast<uint16_t>(values_fp8[i] >> (h * 16));
+            const __half2_raw v01_fp16 = __nv_cvt_fp8x2_to_halfraw2(v01_fp8, __NV_E4M3); // no direct conversion from fp8 -> fp32
+            const float2 v01_fp32 = __half22float2(*reinterpret_cast<const __half2 *>(&v01_fp16));
+            values_fp32[i * 2 + h] = float2{v01_fp32.x * scale, v01_fp32.y * scale};
+        }
+    }
 }
 
-static __device__ __forceinline__ float2 mxfp8_dequant2(uint16_t v01_fp8, float scale) {
-    const __half2_raw v01_fp16 = __nv_cvt_fp8x2_to_halfraw2(v01_fp8, __NV_E4M3); // no direct conversion from fp8 -> fp32
-    const float2 v01_fp32 = __half22float2(*reinterpret_cast<const __half2 *>(&v01_fp16));
-    return float2{v01_fp32.x * scale, v01_fp32.y * scale};
-}
-
-template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, bool SYNC_ALL = false>
+template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED>
 static __device__ __forceinline__ void mxfp8_quantize_tile(
     const globals::x_bf16_tile &x_bf16_tile,
     const globals::x_fp8_tile &x_fp8_tile,
@@ -294,9 +317,7 @@ static __device__ __forceinline__ void mxfp8_quantize_tile(
             }
         }
 
-        if constexpr (SYNC_ALL)
-            __syncthreads();
-        else if (!transposed)
+        if (!transposed)
             group<TILE_SIZE / WARP_THREADS>::sync(barrier_id); // in-place writes may begin
 
         // Perform MXFP8 quantization
@@ -308,19 +329,15 @@ static __device__ __forceinline__ void mxfp8_quantize_tile(
             for (int j = 0; j < NUM_K_BLOCKS; j++) {
                 int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
 
-                bf16_2 amax = __habs2(x_bf16_reg[i][j][0]);
-                #pragma unroll
-                for (int k = 1; k < PACKED_PER_K_BLOCK; k++)
-                    amax = __hmax2(amax, __habs2(x_bf16_reg[i][j][k]));
-
-                float scale_inv;
-                scale_word |= mxfp8_scale_from_amax2(amax, scale_inv) << (k_block_idx * 8);
+                uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
+                uint32_t scale_byte;
+                mxfp8_quantize_single_block(x_bf16_reg[i][j], x_fp8_reg, scale_byte);
+                scale_word |= scale_byte << (k_block_idx * 8);
 
                 #pragma unroll
-                for (int k = 0; k < PACKED_PER_K_BLOCK; k += 2) {
-                    int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*2) % K_BLOCK_SIZE;
-                    const uint32_t packed = mxfp8_quantize4(x_bf16_reg[i][j][k], x_bf16_reg[i][j][k+1], scale_inv);
-                    move<int>::sts(fp8_dst_addr + row*TILE_SIZE + col, std::bit_cast<int>(packed));
+                for (int k = 0; k < PACKED_PER_K_BLOCK / 2; k++) {
+                    int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*4) % K_BLOCK_SIZE;
+                    move<int>::sts(fp8_dst_addr + row*TILE_SIZE + col, std::bit_cast<int>(x_fp8_reg[k]));
                 }
             }
 
@@ -783,17 +800,13 @@ static __device__ __forceinline__ void swiglu(
     int task_idx,
     uint64_t smem_base_addr
 ) {
-    using ab_tile = std::conditional_t<IS_SHARED, typename globals::swiglu_tile, typename globals::mlp_fp8_tile>;
+    using gate_up_tile = std::conditional_t<IS_SHARED, typename globals::swiglu_tile, typename globals::quant_fp8_tile>;
 
-    auto (&a_smem)[config::SWIGLU_PIPE_DEPTH]    = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
-    auto (&b_smem)[config::SWIGLU_PIPE_DEPTH]    = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&a_smem) + sizeof(a_smem));
-    auto &hidden_bf16_stage                      = *reinterpret_cast<typename globals::quant_bf16_tile *>(reinterpret_cast<uint64_t>(&b_smem) + sizeof(b_smem));
-    auto &hidden_fp8_stage                       = *reinterpret_cast<typename globals::mlp_fp8_tile *>(reinterpret_cast<uint64_t>(&hidden_bf16_stage) + sizeof(hidden_bf16_stage));
-    auto &hidden_fp8_t_stage                     = *reinterpret_cast<typename globals::quant_fp8_tile *>(reinterpret_cast<uint64_t>(&hidden_fp8_stage) + sizeof(hidden_fp8_stage));
-    auto (&a_sc_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&hidden_fp8_t_stage) + sizeof(hidden_fp8_t_stage));
-    auto (&b_sc_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&a_sc_smem) + sizeof(a_sc_smem));
-    auto &hidden_sc_stage                        = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&b_sc_smem) + sizeof(b_sc_smem));
-    auto &hidden_sc_t_stage                      = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&hidden_sc_stage) + sizeof(hidden_sc_stage));
+    auto (&gate_smem)[config::SWIGLU_PIPE_DEPTH]    = *reinterpret_cast<gate_up_tile (*)[config::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
+    auto (&up_smem)[config::SWIGLU_PIPE_DEPTH]      = *reinterpret_cast<gate_up_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&gate_smem) + sizeof(gate_smem));
+    auto &hidden_bf16_smem                          = *reinterpret_cast<typename globals::quant_bf16_tile *>(reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem));
+    auto (&gate_sc_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&hidden_bf16_smem) + sizeof(hidden_bf16_smem));
+    auto (&up_sc_smem)[config::SWIGLU_PIPE_DEPTH]   = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&gate_sc_smem) + sizeof(gate_sc_smem));
 
     const int intermediate_dim = g.hidden_shared.cols();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
@@ -845,15 +858,15 @@ static __device__ __forceinline__ void swiglu(
                 barrier_wait(g.mlp_swiglu_counter, gate_counter_offset + parent_task_idx, 2 * config::CLUSTER_SIZE);
 
                 if constexpr (IS_SHARED) {
-                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
-                    tma::load_async(a_smem[stage], g.gate_shared, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                    tma::load_async(b_smem[stage], g.up_shared,   {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(gate_smem[stage]) + sizeof(up_smem[stage]));
+                    tma::load_async(gate_smem[stage], g.gate_shared, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(up_smem[stage], g.up_shared,   {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
                 } else {
-                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]) + sizeof(a_sc_smem[stage]) + sizeof(b_sc_smem[stage]));
-                    tma::load_async(a_smem[stage], g.gate_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                    tma::load_async(a_sc_smem[stage], g.gate_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
-                    tma::load_async(b_smem[stage], g.up_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                    tma::load_async(b_sc_smem[stage], g.up_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(gate_smem[stage]) + sizeof(up_smem[stage]) + sizeof(gate_sc_smem[stage]) + sizeof(up_sc_smem[stage]));
+                    tma::load_async(gate_smem[stage], g.gate_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(gate_sc_smem[stage], g.gate_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(up_smem[stage], g.up_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(up_sc_smem[stage], g.up_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
                 }
             }
         }
@@ -876,64 +889,91 @@ static __device__ __forceinline__ void swiglu(
             }
 
             if constexpr (!IS_SHARED) {
-                if (threadIdx.x == 0) {
-                    if (stage == 0) tma::store_async_read_wait();
-                    else            tma::store_async_read_wait<4>();
+                constexpr int MXFP8_Kb = 32;
+                const int tile_row = threadIdx.x % config::SWIGLU_Mb; // 2 threads per row
+                const int tile_col_half = threadIdx.x / config::SWIGLU_Mb; // first half vs second half
+
+                const uint32_t gate_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&gate_smem[stage]));
+                const uint32_t up_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&up_smem[stage]));
+                const uint32_t hidden_bf16_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&hidden_bf16_smem));
+
+                int gate_scale_word, up_scale_word;
+                const int scale_word_offset = (tile_row % 32) * 16 + (tile_row / 32) * 4;
+                move<int>::lds(gate_scale_word, static_cast<uint32_t>(__cvta_generic_to_shared(&gate_sc_smem[stage])) + scale_word_offset);
+                move<int>::lds(up_scale_word, static_cast<uint32_t>(__cvta_generic_to_shared(&up_sc_smem[stage])) + scale_word_offset);
+
+                const int k_block_pair = ((tile_row >> 1) & 1) ^ tile_col_half;
+                uint32_t hidden_scale_byte[2];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) { // 64 elements per thread = 2 32-element blocks per thread
+                    const int k_block_idx = k_block_pair * 2 + ((tile_row + j) & 1);
+
+                    // Load this block's gate/up values
+                    uint32_t gate_fp8[8], up_fp8[8];
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int col = k_block_idx * MXFP8_Kb + ((tile_row / 4 + k) % 8) * 4;
+                        move<int>::lds(reinterpret_cast<int &>(gate_fp8[k]), gate_fp8_addr + tile_row * config::SWIGLU_Nb + col);
+                        move<int>::lds(reinterpret_cast<int &>(up_fp8[k]), up_fp8_addr + tile_row * config::SWIGLU_Nb + col);
+                    }
+
+                    // Dequantize
+                    float2 gate_fp32[16], up_fp32[16];
+                    mxfp8_quantize::mxfp8_dequantize_single_block(gate_fp8, (static_cast<uint32_t>(gate_scale_word) >> (k_block_idx * 8)) & 0xFF, gate_fp32);
+                    mxfp8_quantize::mxfp8_dequantize_single_block(up_fp8, (static_cast<uint32_t>(up_scale_word) >> (k_block_idx * 8)) & 0xFF, up_fp32);
+                    
+                    // Apply SwiGLU
+                    bf16_2 hidden_bf16[16];
+                    #pragma unroll
+                    for (int k = 0; k < 16; ++k) {
+                        const float2 hidden_fp32 {
+                            gate_fp32[k].x / (1.0f + exp2f(-1.4426950408889634f * gate_fp32[k].x)) * up_fp32[k].x,
+                            gate_fp32[k].y / (1.0f + exp2f(-1.4426950408889634f * gate_fp32[k].y)) * up_fp32[k].y
+                        };
+                        hidden_bf16[k] = __float22bfloat162_rn(hidden_fp32);
+                    }
+
+                    // Quantize
+                    uint32_t hidden_fp8[8];
+                    mxfp8_quantize::mxfp8_quantize_single_block(hidden_bf16, hidden_fp8, hidden_scale_byte[j]);
+                    const uint32_t *hidden_bf16_words = reinterpret_cast<const uint32_t *>(hidden_bf16);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int col = k_block_idx * MXFP8_Kb + ((tile_row / 4 + k) % 8) * 4;
+                        move<float2>::sts(hidden_bf16_addr + (tile_row * config::SWIGLU_Nb + col) * static_cast<int>(sizeof(bf16)),
+                                          float2{__uint_as_float(hidden_bf16_words[k * 2]), __uint_as_float(hidden_bf16_words[k * 2 + 1])});
+                        move<int>::sts(gate_fp8_addr + tile_row * config::SWIGLU_Nb + col, std::bit_cast<int>(hidden_fp8[k]));
+                    }
                 }
-                __syncthreads();
+                __syncthreads(); // the scale tiles and the up tile may be overwritten
 
-                if (threadIdx.x < 128) mxfp8_quantize::mxfp8_quantize_tile<true, false, true>(a_smem[stage], gate_fp8_stage, gate_sc_stage, gate_fp8_stage, gate_sc_stage, threadIdx.x, 1);
-                else                   mxfp8_quantize::mxfp8_quantize_tile<true, false, true>(b_smem[stage], up_fp8_stage, up_sc_stage, up_fp8_stage, up_sc_stage, threadIdx.x - 128, 2);
-                __syncthreads();
+                // Store this thread's two hidden scale bytes
+                const uint16_t hidden_scale_pair = static_cast<uint16_t>(hidden_scale_byte[tile_row & 1] | (hidden_scale_byte[(tile_row + 1) & 1] << 8));
+                move<bf16>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&gate_sc_smem[stage])) + scale_word_offset + k_block_pair * 2, std::bit_cast<bf16>(hidden_scale_pair));
 
-                if (threadIdx.x == 0) {
-                    tma::store_async(g.gate_fp8_routed, gate_fp8_stage, {row - macrobatch_row_block_offset, col});
-                    tma::store_async(g.gate_sc_routed, gate_sc_stage, {row - macrobatch_row_block_offset, col, 0, 0});
-                    tma::store_async(g.up_fp8_routed, up_fp8_stage, {row - macrobatch_row_block_offset, col});
-                    tma::store_async(g.up_sc_routed, up_sc_stage, {row - macrobatch_row_block_offset, col, 0, 0});
-                }
-
-                compute_group::load(gate, a_smem[stage]);
-                compute_group::load(up, b_smem[stage]);
-                compute_group::mul(denominator, gate, -1.4426950408889634f);
-                compute_group::exp2(denominator, denominator);
-                compute_group::add(denominator, denominator, 1.0f);
-                compute_group::div(gate, gate, denominator);
-                compute_group::mul(gate, gate, up);
-                compute_group::store(a_smem[stage], gate);
-                __syncthreads();
-
-                auto &hidden_bf16_tile = a_smem[stage];
-                auto &hidden_fp8_tile = *reinterpret_cast<typename globals::quant_fp8_tile *>(&a_smem[stage]);
-                auto &hidden_sc_tile = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&a_smem[stage]) + sizeof(typename globals::quant_fp8_tile));
-                auto &hidden_fp8_t_tile = *reinterpret_cast<typename globals::quant_fp8_tile *>(&b_smem[stage]);
-                auto &hidden_sc_t_tile = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&b_smem[stage]) + sizeof(typename globals::quant_fp8_tile));
-                compute_group::store(hidden_bf16_tile, gate);
-                __syncthreads();
-
-                if (threadIdx.x < 128) mxfp8_quantize::mxfp8_quantize_tile<true, false, true>(hidden_bf16_tile, hidden_fp8_tile, hidden_sc_tile, hidden_fp8_tile, hidden_sc_tile, threadIdx.x, 1);
-                else                   mxfp8_quantize::mxfp8_quantize_tile<false, true, true>(hidden_bf16_tile, hidden_fp8_tile, hidden_sc_tile, hidden_fp8_t_tile, hidden_sc_t_tile, threadIdx.x - 128, 1);
+                // Transpose-quantize
+                mxfp8_quantize::mxfp8_quantize_tile<false, true>(hidden_bf16_smem, up_smem[stage], up_sc_smem[stage], up_smem[stage], up_sc_smem[stage], threadIdx.x, 1);
                 __syncthreads();
 
                 if (threadIdx.x == 0) {
-                    tma::store_async(g.hidden_fp8_routed, hidden_fp8_tile, {row - macrobatch_row_block_offset, col});
-                    tma::store_async(g.hidden_sc_routed, hidden_sc_tile, {row - macrobatch_row_block_offset, col, 0, 0});
-                    tma::store_async(g.hidden_fp8_t_routed, hidden_fp8_t_tile, {col, row - macrobatch_row_block_offset});
-                    tma::store_async(g.hidden_sc_t_routed, hidden_sc_t_tile, {col, row - macrobatch_row_block_offset, 0, 0});
+                    tma::store_async(g.hidden_fp8_routed, gate_smem[stage], {row - macrobatch_row_block_offset, col});
+                    tma::store_async(g.hidden_sc_routed, gate_sc_smem[stage], {row - macrobatch_row_block_offset, col, 0, 0});
+                    tma::store_async(g.hidden_fp8_t_routed, up_smem[stage], {col, row - macrobatch_row_block_offset});
+                    tma::store_async(g.hidden_sc_t_routed, up_sc_smem[stage], {col, row - macrobatch_row_block_offset, 0, 0});
                 }
             } else { // BF16 path (shared expert)
                 rt_fl<config::SWIGLU_Mb / config::NUM_WARPS, config::SWIGLU_Nb> gate, up, denominator;
-                compute_group::load(gate, a_smem[stage]);
-                compute_group::load(up, b_smem[stage]);
+                compute_group::load(gate, gate_smem[stage]);
+                compute_group::load(up, up_smem[stage]);
                 compute_group::mul(denominator, gate, -1.4426950408889634f);
                 compute_group::exp2(denominator, denominator);
                 compute_group::add(denominator, denominator, 1.0f);
                 compute_group::div(gate, gate, denominator);
                 compute_group::mul(gate, gate, up);
-                compute_group::store(a_smem[stage], gate);
+                compute_group::store(gate_smem[stage], gate);
                 __syncthreads();
                 if (threadIdx.x == 0)
-                    tma::store_async(g.hidden_shared, a_smem[stage], {row - macrobatch_row_block_offset, col});
+                    tma::store_async(g.hidden_shared, gate_smem[stage], {row - macrobatch_row_block_offset, col});
             }
         }
     }
@@ -997,7 +1037,13 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     }();
     const typename globals::sc_gl &a_sc_gmem = kind == expert_gemm_kind::DOWN ? g.hidden_sc_routed : g.x_sc_routed;
     const typename globals::sc_gl &b_sc_gmem = kind == expert_gemm_kind::GATE ? g.w_routed_gate_sc : (kind == expert_gemm_kind::UP ? g.w_routed_up_sc : g.w_routed_down_sc);
-    const typename globals::activation_bf16_gl &d_gmem = kind == expert_gemm_kind::GATE ? gate_gmem : (kind == expert_gemm_kind::UP ? up_gmem : y_gmem);
+
+    const typename globals::activation_bf16_gl &d_gmem = [&]() -> const auto & {
+        if constexpr (IS_SHARED) return kind == expert_gemm_kind::GATE ? g.gate_shared : (kind == expert_gemm_kind::UP ? g.up_shared : g.y_shared);
+        else                     return g.y_routed;
+    }();
+    const typename globals::activation_fp8_gl &d_fp8_gmem = kind == expert_gemm_kind::GATE ? g.gate_fp8_routed : g.up_fp8_routed;
+    const typename globals::sc_gl &d_sc_gmem = kind == expert_gemm_kind::GATE ? g.gate_sc_routed : g.up_sc_routed;
 
     const int iters_per_task = a_gmem.cols() / (IS_SHARED ? config::MLP_BF16_Kb : config::MLP_FP8_Kb);
     const int col_blocks     = b_gmem.rows() / config::MLP_Nb;
@@ -1113,22 +1159,81 @@ static __device__ __forceinline__ void expert_grouped_gemm(
         }
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
-        wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH));
-        update_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH);
-        rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::EPI_PIPE_DEPTH> d_reg[config::EPI_PIPE_DEPTH];
-        #pragma unroll
-        for (int i = 0; i < config::EPI_PIPE_DEPTH; ++i)
-            warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::EPI_PIPE_DEPTH * i));
-        tensor_load_wait();
-        warpgroup::sync(1);
-        warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
-        #pragma unroll
-        for (int i = 0; i < config::EPI_PIPE_DEPTH; ++i) {
-            warpgroup::tma::store_async_read_wait<config::NUM_D_TILES - 1>();
+        wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
+        update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
+        if (!IS_SHARED && kind != expert_gemm_kind::DOWN) {
+            constexpr int NUM_MXFP8_BLOCKS = config::MLP_Nb / 32; // staged through the MLP_NUM_FP8_D_TILES-deep ring
+            bf16_2 d_reg[NUM_MXFP8_BLOCKS][16];
+            #pragma unroll
+            for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
+                float2 tmp[16];
+                asm volatile(R"(
+                    tcgen05.ld.sync.aligned.32x32b.x32.b32
+                    {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
+                     %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
+                    )"
+                    : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
+                      "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
+                      "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
+                      "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
+                      "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
+                      "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
+                      "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
+                      "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
+                    : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16) + i * 32));
+                #pragma unroll
+                for (int j = 0; j < 16; ++j)
+                    d_reg[i][j] = __float22bfloat162_rn(tmp[j]);
+            }
+            tensor_load_wait();
+            tensor_before_thread_sync();
             warpgroup::sync(1);
-            warpgroup::store(d_smem[i % config::NUM_D_TILES], d_reg[i]);
+            warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+
+            // Fused quantization
+            uint32_t scale_word = 0;
+            const int tile_row = warpgroup::laneid();
+            #pragma unroll
+            for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
+                uint32_t d_fp8[8];
+                uint32_t d_scale_byte;
+                mxfp8_quantize::mxfp8_quantize_single_block(d_reg[i], d_fp8, d_scale_byte);
+                scale_word |= d_scale_byte << ((i % 4) * 8);
+                warpgroup::tma::store_async_read_wait<config::MLP_NUM_FP8_D_TILES - 1>();
+                warpgroup::sync(1);
+                const uint32_t d_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&d_fp8_smem[i % config::MLP_NUM_FP8_D_TILES]));
+                #pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    move<float4>::sts(globals::mlp_fp8_d_tile::idx(d_fp8_addr, {tile_row, m * 16}),
+                        float4{__uint_as_float(d_fp8[m * 4]), __uint_as_float(d_fp8[m * 4 + 1]), __uint_as_float(d_fp8[m * 4 + 2]), __uint_as_float(d_fp8[m * 4 + 3])});
+                }
+                if (i % 4 == 3) {
+                    move<int>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&d_sc_smem[i / 4])) + (tile_row % 32) * 16 + (tile_row / 32) * 4, std::bit_cast<int>(scale_word));
+                    scale_word = 0;
+                }
+                warpgroup::sync(1);
+                if (warpgroup::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_fp8_gmem, d_fp8_smem[i % config::MLP_NUM_FP8_D_TILES], {2 * tile_coord.x + cta_rank, NUM_MXFP8_BLOCKS * tile_coord.y + i});
+                    if (i % 4 == 3)
+                        tma::store_async(d_sc_gmem, d_sc_smem[i / 4], {2 * tile_coord.x + cta_rank, 2 * tile_coord.y + i / 4, 0, 0});
+                }
+            }
+        } else {
+            rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
+            #pragma unroll
+            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
+                warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH * i));
+            tensor_load_wait();
             warpgroup::sync(1);
-            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_smem[i % config::NUM_D_TILES], {2 * tile_coord.x + cta_rank, config::EPI_PIPE_DEPTH * tile_coord.y + i});
+            warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+            #pragma unroll
+            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+                warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
+                warpgroup::sync(1);
+                warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
+                warpgroup::sync(1);
+                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+            }
         }
         epilogue_group::sync(4);
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
