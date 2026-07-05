@@ -219,8 +219,32 @@ struct globals {
     }
 };
 
+static __device__ __forceinline__ uint32_t mxfp8_scale_from_amax2(bf16_2 amax, float &scale_inv) {
+    const float scale = max(__bfloat162float(__hmax(amax.x, amax.y)) * 0.002232142857f, 0.000000000001f);
+    uint16_t scale_fp8x2;
+    // Round towards positive infinity and saturate to finite (https://arxiv.org/pdf/2506.08027)
+    asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}" : "=h"(scale_fp8x2) : "f"(scale), "f"(scale));
+    scale_inv = __uint_as_float((254u - (scale_fp8x2 & 0xFF)) << 23); // directly build float32 reciprocal without division
+    return static_cast<uint32_t>(scale_fp8x2 & 0xFF);
+}
+
+static __device__ __forceinline__ uint32_t mxfp8_quantize4(bf16_2 v01_bf16, bf16_2 v23_bf16, float scale_inv) {
+    const float2 v01_fp32 = __bfloat1622float2(v01_bf16);
+    const float2 v23_fp32 = __bfloat1622float2(v23_bf16);
+    uint16_t v01_fp8, v23_fp8;
+    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v01_fp8) : "f"(v01_fp32.x * scale_inv), "f"(v01_fp32.y * scale_inv));
+    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(v23_fp8) : "f"(v23_fp32.x * scale_inv), "f"(v23_fp32.y * scale_inv));
+    return static_cast<uint32_t>(v01_fp8) | (static_cast<uint32_t>(v23_fp8) << 16);
+}
+
+static __device__ __forceinline__ float2 mxfp8_dequant2(uint16_t v01_fp8, float scale) {
+    const __half2_raw v01_fp16 = __nv_cvt_fp8x2_to_halfraw2(v01_fp8, __NV_E4M3); // no direct conversion from fp8 -> fp32
+    const float2 v01_fp32 = __half22float2(*reinterpret_cast<const __half2 *>(&v01_fp16));
+    return float2{v01_fp32.x * scale, v01_fp32.y * scale};
+}
+
 template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, bool SYNC_ALL = false>
-__device__ __forceinline__ void mxfp8_quantize_tile(
+static __device__ __forceinline__ void mxfp8_quantize_tile(
     const globals::x_bf16_tile &x_bf16_tile,
     const globals::x_fp8_tile &x_fp8_tile,
     const globals::x_sc_tile &x_sc_tile,
@@ -289,23 +313,13 @@ __device__ __forceinline__ void mxfp8_quantize_tile(
                 for (int k = 1; k < PACKED_PER_K_BLOCK; k++)
                     amax = __hmax2(amax, __habs2(x_bf16_reg[i][j][k]));
 
-                // Compute the e8m0 scale, rounding towards positive infinity and saturating to finite (https://arxiv.org/pdf/2506.08027)
-                float scale = max(__bfloat162float(__hmax(amax.x, amax.y)) * 0.002232142857f, 0.000000000001f);
-                uint16_t sc;
-                asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}" : "=h"(sc) : "f"(scale), "f"(scale));
-                scale_word |= static_cast<uint32_t>(sc & 0xFF) << (k_block_idx * 8);
-                const float scale_inv = __uint_as_float((254u - (sc & 0xFF)) << 23); // directly build float32 reciprocal without division
+                float scale_inv;
+                scale_word |= mxfp8_scale_from_amax2(amax, scale_inv) << (k_block_idx * 8);
 
-                // Quantize (round-to-nearest-even, saturating to finite)
                 #pragma unroll
                 for (int k = 0; k < PACKED_PER_K_BLOCK; k += 2) {
                     int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*2) % K_BLOCK_SIZE;
-                    const float2 v01 = __bfloat1622float2(x_bf16_reg[i][j][k]);
-                    const float2 v23 = __bfloat1622float2(x_bf16_reg[i][j][k+1]);
-                    uint16_t lo, hi;
-                    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(lo) : "f"(v01.x * scale_inv), "f"(v01.y * scale_inv));
-                    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(hi) : "f"(v23.x * scale_inv), "f"(v23.y * scale_inv));
-                    const uint32_t packed = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+                    const uint32_t packed = mxfp8_quantize4(x_bf16_reg[i][j][k], x_bf16_reg[i][j][k+1], scale_inv);
                     move<int>::sts(fp8_dst_addr + row*TILE_SIZE + col, std::bit_cast<int>(packed));
                 }
             }
@@ -319,7 +333,7 @@ __device__ __forceinline__ void mxfp8_quantize_tile(
 }
 
 template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED>
-__device__ inline void mxfp8_quantize_kernel(const globals &G) {
+static __device__ __forceinline__ void mxfp8_quantize_kernel(const globals &G) {
     // Allocate shared memory
     extern __shared__ int __shm[];
     const uint64_t smem_base_addr = (reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023);
@@ -421,11 +435,11 @@ struct config {
     static constexpr int MLP_Nb = 256;
     static constexpr int MLP_FP8_Kb = 128;
     static constexpr int MLP_BF16_Kb = 64;
-
-    static constexpr int SUPERGROUP_SIZE = 8;
-    static constexpr int LOAD_PIPE_DEPTH = 6;
-    static constexpr int EPI_PIPE_DEPTH = 16;
-    static constexpr int NUM_D_TILES = 4;
+    static constexpr int MLP_SUPERGROUP_SIZE = 8;
+    static constexpr int MLP_LOAD_PIPE_DEPTH = 6;
+    static constexpr int MLP_EPI_PIPE_DEPTH = 8;
+    static constexpr int MLP_NUM_BF16_D_TILES = 3;
+    static constexpr int MLP_NUM_FP8_D_TILES = 4;
 
     // MXFP8 quantize
     static constexpr int QUANT_Mb = 128;
@@ -459,7 +473,8 @@ struct globals {
     using mlp_fp8_tile = st_fp8e4m3<config::MLP_Mb / 2, config::MLP_FP8_Kb>;
     using mlp_bf16_tile = st_bf<config::MLP_Mb / 2, config::MLP_BF16_Kb>;
     using mlp_sc_tile = st_fp8e8m0<32, 16, false>;
-    using mlp_d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::EPI_PIPE_DEPTH>;
+    using mlp_bf16_d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>;
+    using mlp_fp8_d_tile = st_fp8e4m3<config::MLP_Mb / 2, 32>;
 
     // MXFP8 quantize
     using quant_bf16_tile = mxfp8_quantize::globals::x_bf16_tile; // st_bf<128, 128, false>
@@ -473,9 +488,9 @@ struct globals {
     using dispatch_combine_vec = sv_bf<config::DISPATCH_COMBINE_Nb>;
 
     // Global layouts
-    using activation_bf16_gl = gl<bf16, 1, 1, -1, -1, dispatch_combine_vec, quant_bf16_tile, mlp_d_tile, swiglu_tile, mlp_bf16_tile>;
+    using activation_bf16_gl = gl<bf16, 1, 1, -1, -1, dispatch_combine_vec, quant_bf16_tile, mlp_bf16_d_tile, swiglu_tile, mlp_bf16_tile>;
     using activation_bf16_pgl = pgl<activation_bf16_gl, NUM_DEVICES, false>;
-    using activation_fp8_gl = gl<fp8e4m3, 1, 1, -1, -1, mlp_fp8_tile, quant_fp8_tile>;
+    using activation_fp8_gl = gl<fp8e4m3, 1, 1, -1, -1, mlp_fp8_tile, quant_fp8_tile, mlp_fp8_d_tile>;
     using weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_tile>;
     using weight_fp8_gl = gl<fp8e4m3, 1, -1, -1, -1, mlp_fp8_tile>;
     using sc_gl = gl<fp8e8m0, -1, -1, 32, 16, mlp_sc_tile>;
@@ -488,11 +503,9 @@ struct globals {
     activation_fp8_gl x_fp8_t_routed;         // (H, macrobatch_size)
     sc_gl x_sc_t_routed;                      // (H / 128, macrobatch_size / 128, 32, 16)
     activation_bf16_gl gate_shared;           // (num_local_tokens, I)
-    activation_bf16_gl gate_routed;           // (macrobatch_size, I)
     activation_fp8_gl gate_fp8_routed;        // (macrobatch_size, I)
     sc_gl gate_sc_routed;                     // (macrobatch_size / 128, I / 128, 32, 16)
     activation_bf16_gl up_shared;             // (num_local_tokens, I)
-    activation_bf16_gl up_routed;             // (macrobatch_size, I)
     activation_fp8_gl up_fp8_routed;          // (macrobatch_size, I)
     sc_gl up_sc_routed;                       // (macrobatch_size / 128, I / 128, 32, 16)
     activation_bf16_gl hidden_shared;         // (num_local_tokens, I)
@@ -770,25 +783,26 @@ static __device__ __forceinline__ void swiglu(
     int task_idx,
     uint64_t smem_base_addr
 ) {
-    using ab_tile = std::conditional_t<IS_SHARED, typename globals::swiglu_tile, typename globals::quant_bf16_tile>;
+    using ab_tile = std::conditional_t<IS_SHARED, typename globals::swiglu_tile, typename globals::mlp_fp8_tile>;
 
-    auto (&a_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
-    auto (&b_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
-    auto &gate_fp8_stage = *reinterpret_cast<typename globals::quant_fp8_tile *>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
-    auto &gate_sc_stage = *reinterpret_cast<typename globals::quant_sc_tile *>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(gate_fp8_stage));
-    auto &up_fp8_stage = *reinterpret_cast<typename globals::quant_fp8_tile *>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(gate_fp8_stage) + sizeof(gate_sc_stage));
-    auto &up_sc_stage = *reinterpret_cast<typename globals::quant_sc_tile *>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + 2 * sizeof(gate_fp8_stage) + sizeof(gate_sc_stage));
+    auto (&a_smem)[config::SWIGLU_PIPE_DEPTH]    = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(smem_base_addr);
+    auto (&b_smem)[config::SWIGLU_PIPE_DEPTH]    = *reinterpret_cast<ab_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&a_smem) + sizeof(a_smem));
+    auto &hidden_bf16_stage                      = *reinterpret_cast<typename globals::quant_bf16_tile *>(reinterpret_cast<uint64_t>(&b_smem) + sizeof(b_smem));
+    auto &hidden_fp8_stage                       = *reinterpret_cast<typename globals::mlp_fp8_tile *>(reinterpret_cast<uint64_t>(&hidden_bf16_stage) + sizeof(hidden_bf16_stage));
+    auto &hidden_fp8_t_stage                     = *reinterpret_cast<typename globals::quant_fp8_tile *>(reinterpret_cast<uint64_t>(&hidden_fp8_stage) + sizeof(hidden_fp8_stage));
+    auto (&a_sc_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&hidden_fp8_t_stage) + sizeof(hidden_fp8_t_stage));
+    auto (&b_sc_smem)[config::SWIGLU_PIPE_DEPTH] = *reinterpret_cast<typename globals::quant_sc_tile (*)[config::SWIGLU_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&a_sc_smem) + sizeof(a_sc_smem));
+    auto &hidden_sc_stage                        = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&b_sc_smem) + sizeof(b_sc_smem));
+    auto &hidden_sc_t_stage                      = *reinterpret_cast<typename globals::quant_sc_tile *>(reinterpret_cast<uint64_t>(&hidden_sc_stage) + sizeof(hidden_sc_stage));
 
-    const typename globals::activation_bf16_gl &gate_gmem      = IS_SHARED ? g.gate_shared : g.gate_routed;
-    const typename globals::activation_bf16_gl &up_gmem        = IS_SHARED ? g.up_shared : g.up_routed;
-
+    const int intermediate_dim = g.hidden_shared.cols();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
     const int routed_row_blocks = g.schedule_peer_rank.cols() / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
     const int gate_counter_offset = IS_SHARED ? 0 : shared_gate_up_tasks;
     const int swiglu_counter_offset = shared_gate_up_tasks + routed_gate_up_tasks + (IS_SHARED ? 0 : shared_row_blocks);
-    const int intermediate_col_blocks = gate_gmem.cols() / config::MLP_Nb;
+    const int intermediate_col_blocks = intermediate_dim / config::MLP_Nb;
     const int global_minibatch_idx = macrobatch_idx * (g.macrobatch_size / g.minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (g.macrobatch_size / config::SWIGLU_Mb);
 
@@ -797,7 +811,7 @@ static __device__ __forceinline__ void swiglu(
     else                     num_tokens = g.num_tokens[{0}];
 
     const int row_blocks = num_tokens / config::SWIGLU_Mb;
-    const int col_blocks = gate_gmem.cols() / config::SWIGLU_Nb;
+    const int col_blocks = intermediate_dim / config::SWIGLU_Nb;
     const int num_tiles = row_blocks * col_blocks;
     int first_tile_idx, tile_end;
     if constexpr (IS_SHARED) {
@@ -827,13 +841,20 @@ static __device__ __forceinline__ void swiglu(
                     ++row;
                     col -= col_blocks;
                 }
-                tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
-
                 const int parent_task_idx = (row / (config::MLP_Mb / config::SWIGLU_Mb)) * intermediate_col_blocks + col / (config::MLP_Nb / config::SWIGLU_Nb);
                 barrier_wait(g.mlp_swiglu_counter, gate_counter_offset + parent_task_idx, 2 * config::CLUSTER_SIZE);
 
-                tma::load_async(a_smem[stage], gate_gmem, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                tma::load_async(b_smem[stage], up_gmem,   {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                if constexpr (IS_SHARED) {
+                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]));
+                    tma::load_async(a_smem[stage], g.gate_shared, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(b_smem[stage], g.up_shared,   {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                } else {
+                    tma::expect_bytes(swiglu_inputs_arrived[stage], sizeof(a_smem[stage]) + sizeof(b_smem[stage]) + sizeof(a_sc_smem[stage]) + sizeof(b_sc_smem[stage]));
+                    tma::load_async(a_smem[stage], g.gate_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(a_sc_smem[stage], g.gate_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(b_smem[stage], g.up_fp8_routed, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(b_sc_smem[stage], g.up_sc_routed, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                }
             }
         }
     }
@@ -843,7 +864,6 @@ static __device__ __forceinline__ void swiglu(
     for (int stage = 0; stage < config::SWIGLU_PIPE_DEPTH; ++stage) {
         const int tile_idx = first_tile_idx + stage;
         if (tile_idx < tile_end) {
-            rt_fl<config::SWIGLU_Mb / config::NUM_WARPS, config::SWIGLU_Nb> gate, up, denominator;
             wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
             update_phasebit<0>(swiglu_bitfield, stage);
 
@@ -902,6 +922,7 @@ static __device__ __forceinline__ void swiglu(
                     tma::store_async(g.hidden_sc_t_routed, hidden_sc_t_tile, {col, row - macrobatch_row_block_offset, 0, 0});
                 }
             } else { // BF16 path (shared expert)
+                rt_fl<config::SWIGLU_Mb / config::NUM_WARPS, config::SWIGLU_Nb> gate, up, denominator;
                 compute_group::load(gate, a_smem[stage]);
                 compute_group::load(up, b_smem[stage]);
                 compute_group::mul(denominator, gate, -1.4426950408889634f);
@@ -939,9 +960,9 @@ enum class expert_gemm_kind { GATE, UP, DOWN };
 template <bool IS_SHARED>
 static __device__ __forceinline__ void expert_grouped_gemm(
     const globals &g,
-    semaphore (&gemm_inputs_arrived)[config::LOAD_PIPE_DEPTH],
-    semaphore (&gemm_scales_arrived)[config::LOAD_PIPE_DEPTH],
-    semaphore (&gemm_inputs_finished)[config::LOAD_PIPE_DEPTH],
+    semaphore (&gemm_inputs_arrived)[config::MLP_LOAD_PIPE_DEPTH],
+    semaphore (&gemm_scales_arrived)[config::MLP_LOAD_PIPE_DEPTH],
+    semaphore (&gemm_inputs_finished)[config::MLP_LOAD_PIPE_DEPTH],
     semaphore &gemm_outputs_arrived,
     semaphore &gemm_outputs_finished,
     uint32_t &gemm_bitfield,
@@ -952,21 +973,19 @@ static __device__ __forceinline__ void expert_grouped_gemm(
     uint64_t smem_base_addr,
     expert_gemm_kind kind,
     const tt<float, config::MLP_Mb / 2, config::MLP_Nb> &d_tt,
-    const full_tt_fp8e8m0<16 * config::LOAD_PIPE_DEPTH> &a_sc_tt,
-    const full_tt_fp8e8m0<32 * config::LOAD_PIPE_DEPTH> &b_sc_tt
+    const full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH> &a_sc_tt,
+    const full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH> &b_sc_tt
 ) {
     // Shared expert runs in BF16, routed experts run in MXFP8
     using ab_tile = std::conditional_t<IS_SHARED, typename globals::mlp_bf16_tile, typename globals::mlp_fp8_tile>;
 
-    auto (&a_smem)[config::LOAD_PIPE_DEPTH]       = *reinterpret_cast<ab_tile (*)[config::LOAD_PIPE_DEPTH]>(smem_base_addr);
-    auto (&b_smem)[config::LOAD_PIPE_DEPTH]       = *reinterpret_cast<ab_tile (*)[config::LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
-    auto (&a_sc_smem)[config::LOAD_PIPE_DEPTH]    = *reinterpret_cast<typename globals::mlp_sc_tile (*)[config::LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
-    auto (&b_sc_smem)[config::LOAD_PIPE_DEPTH][2] = *reinterpret_cast<typename globals::mlp_sc_tile (*)[config::LOAD_PIPE_DEPTH][2]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem));
-    auto (&d_smem)[config::NUM_D_TILES]           = *reinterpret_cast<typename globals::mlp_d_tile (*)[config::NUM_D_TILES]>((smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
-
-    const typename globals::activation_bf16_gl &gate_gmem = IS_SHARED ? g.gate_shared : g.gate_routed;
-    const typename globals::activation_bf16_gl &up_gmem   = IS_SHARED ? g.up_shared : g.up_routed;
-    const typename globals::activation_bf16_gl &y_gmem    = IS_SHARED ? g.y_shared : g.y_routed;
+    auto (&a_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<ab_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr);
+    auto (&b_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<ab_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
+    auto (&a_sc_smem)[config::MLP_LOAD_PIPE_DEPTH]    = *reinterpret_cast<typename globals::mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
+    auto (&b_sc_smem)[config::MLP_LOAD_PIPE_DEPTH][2] = *reinterpret_cast<typename globals::mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH][2]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem));
+    auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES]      = *reinterpret_cast<typename globals::mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>((smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
+    auto (&d_fp8_smem)[config::MLP_NUM_FP8_D_TILES]   = *reinterpret_cast<typename globals::mlp_fp8_d_tile (*)[config::MLP_NUM_FP8_D_TILES]>(&d_bf16_smem[0]);
+    auto (&d_sc_smem)[2]                              = *reinterpret_cast<typename globals::mlp_sc_tile (*)[2]>(reinterpret_cast<uint64_t>(&d_fp8_smem) + sizeof(d_fp8_smem));
 
     const auto &a_gmem = [&]() -> const auto & {
         if constexpr (IS_SHARED) return kind == expert_gemm_kind::DOWN ? g.hidden_shared : g.x_shared;
@@ -996,7 +1015,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
         const int row_blocks = g.x_shared.rows() / config::MLP_Mb;
         const int num_tasks = row_blocks * col_blocks;
         if (task_idx < num_tasks) {
-            const int2 swizzled = get_swizzled_2d_idx<config::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
+            const int2 swizzled = get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
             tile_coord = {swizzled.x, swizzled.y, 0};
         }
     } else {
@@ -1009,7 +1028,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
             const int row_blocks = max(0, min(global_minibatch_routed_first_row_block + minibatch_routed_row_blocks, global_row_block_offset + expert_row_blocks) - global_first_row_block);
             const int num_tasks = row_blocks * col_blocks;
             if (task_idx < num_tasks) {
-                const int2 swizzled = get_swizzled_2d_idx<config::SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
+                const int2 swizzled = get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
                 tile_coord = {global_first_row_block + swizzled.x - macrobatch_row_block_offset, swizzled.y, expert_idx};
                 break;
             }
@@ -1041,7 +1060,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                 tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, idx},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                 tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.z, tile_coord.y * 2 + cta_rank, idx}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                 update_phasebit<1>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<config::LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
         } else if (warpgroup::warpid() == 2 && warp::elect_leader()) {
             if constexpr (!IS_SHARED) wait_for_a_operand();
@@ -1053,18 +1072,18 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                     tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_gmem, {tile_coord.z * (b_gmem.rows() / config::QUANT_Mb) + tile_coord.y * 2 + cta_rank, idx, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                 }
                 update_phasebit<1>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<config::LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
         } else if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
             int input_ring = 0;
-            wait(gemm_outputs_finished, get_phasebit<1>(gemm_bitfield, config::LOAD_PIPE_DEPTH));
-            update_phasebit<1>(gemm_bitfield, config::LOAD_PIPE_DEPTH);
+            wait(gemm_outputs_finished, get_phasebit<1>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
+            update_phasebit<1>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
             tensor_after_thread_sync();
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 if constexpr (!IS_SHARED) {
                     tma::expect_bytes(gemm_scales_arrived[input_ring], config::CLUSTER_SIZE * 3 * sizeof(typename globals::mlp_sc_tile));
-                    wait(gemm_scales_arrived[input_ring], get_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH + 1 + input_ring));
-                    update_phasebit<0>(gemm_bitfield, config::LOAD_PIPE_DEPTH + 1 + input_ring);
+                    wait(gemm_scales_arrived[input_ring], get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring));
+                    update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring);
                     auto a_sc_tt_subtile = a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16);
                     auto b_sc_tt_subtile_0 = b_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 32);
                     auto b_sc_tt_subtile_1 = b_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 32 + 16);
@@ -1088,7 +1107,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                     else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring], gemm_inputs_finished[input_ring]);
                 }
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<config::LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
             detail::tcgen05::commit<config::CLUSTER_SIZE>(gemm_outputs_arrived);
         }
@@ -1167,9 +1186,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
     __shared__ semaphore drain_schedule_arrived[config::CLC_DRAIN_PIPE_DEPTH];
     __shared__ semaphore quant_inputs_arrived[config::QUANT_PIPE_DEPTH];
     __shared__ semaphore swiglu_inputs_arrived[config::SWIGLU_PIPE_DEPTH];
-    __shared__ semaphore gemm_inputs_arrived[config::LOAD_PIPE_DEPTH];
-    __shared__ semaphore gemm_scales_arrived[config::LOAD_PIPE_DEPTH];
-    __shared__ semaphore gemm_inputs_finished[config::LOAD_PIPE_DEPTH];
+    __shared__ semaphore gemm_inputs_arrived[config::MLP_LOAD_PIPE_DEPTH];
+    __shared__ semaphore gemm_scales_arrived[config::MLP_LOAD_PIPE_DEPTH];
+    __shared__ semaphore gemm_inputs_finished[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
     __shared__ semaphore dispatch_combine_inputs_arrived[config::DISPATCH_COMBINE_PIPE_DEPTH];
 
@@ -1183,7 +1202,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
             init_semaphore(swiglu_inputs_arrived[i], 0, 1);
         }
         #pragma unroll
-        for (int i = 0; i < config::LOAD_PIPE_DEPTH; ++i) {
+        for (int i = 0; i < config::MLP_LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(gemm_inputs_arrived[i], 0, 1);
             init_semaphore(gemm_scales_arrived[i], 0, 1);
             init_semaphore(gemm_inputs_finished[i], 0, 1);
@@ -1207,8 +1226,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_kernel(const 
 
     tensor_allocator<1, config::CLUSTER_SIZE> tm_alloc{};
     tt<float, config::MLP_Mb / 2, config::MLP_Nb> d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(0);
-    full_tt_fp8e8m0<16 * config::LOAD_PIPE_DEPTH> a_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<16 * config::LOAD_PIPE_DEPTH>>(256);
-    full_tt_fp8e8m0<32 * config::LOAD_PIPE_DEPTH> b_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<32 * config::LOAD_PIPE_DEPTH>>(384);
+    full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH> a_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH>>(256);
+    full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH> b_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH>>(384);
     everyone::tma::cluster::sync();
 
     if (cluster_idx < comm_clusters) {
@@ -1411,11 +1430,9 @@ dispatch_mlp_swiglu_combine(
     at::Tensor x_fp8_t_routed = at::empty({model_dim, macrobatch_size}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor x_sc_t_routed = at::empty({model_dim / 128, macrobatch_size / 128, 32, 16}, x.options().dtype(at::kByte));
     at::Tensor gate_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
-    at::Tensor gate_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
     at::Tensor gate_fp8_routed = at::empty({macrobatch_size, intermediate_dim}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor gate_sc_routed = at::empty({macrobatch_size / 128, intermediate_dim / 128, 32, 16}, x.options().dtype(at::kByte));
     at::Tensor up_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
-    at::Tensor up_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
     at::Tensor up_fp8_routed = at::empty({macrobatch_size, intermediate_dim}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor up_sc_routed = at::empty({macrobatch_size / 128, intermediate_dim / 128, 32, 16}, x.options().dtype(at::kByte));
     at::Tensor hidden_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
@@ -1438,11 +1455,9 @@ dispatch_mlp_swiglu_combine(
         .x_fp8_t_routed = kittens::py::tensor_to_gl<typename globals::activation_fp8_gl>(x_fp8_t_routed),
         .x_sc_t_routed = kittens::py::tensor_to_gl<typename globals::sc_gl>(x_sc_t_routed),
         .gate_shared = kittens::py::tensor_to_gl<typename globals::activation_bf16_gl>(gate_shared),
-        .gate_routed = kittens::py::tensor_to_gl<typename globals::activation_bf16_gl>(gate_routed),
         .gate_fp8_routed = kittens::py::tensor_to_gl<typename globals::activation_fp8_gl>(gate_fp8_routed),
         .gate_sc_routed = kittens::py::tensor_to_gl<typename globals::sc_gl>(gate_sc_routed),
         .up_shared = kittens::py::tensor_to_gl<typename globals::activation_bf16_gl>(up_shared),
-        .up_routed = kittens::py::tensor_to_gl<typename globals::activation_bf16_gl>(up_routed),
         .up_fp8_routed = kittens::py::tensor_to_gl<typename globals::activation_fp8_gl>(up_fp8_routed),
         .up_sc_routed = kittens::py::tensor_to_gl<typename globals::sc_gl>(up_sc_routed),
         .hidden_shared = kittens::py::tensor_to_gl<typename globals::activation_bf16_gl>(hidden_shared),
