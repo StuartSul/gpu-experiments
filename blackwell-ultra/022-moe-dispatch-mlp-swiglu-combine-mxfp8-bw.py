@@ -22,9 +22,9 @@ HIDDEN_DIM = 7168
 INTERMEDIATE_DIM = 2048
 NUM_LOCAL_EXPERTS = 4
 TOPK = 8
-NUM_COMM_SMS = 44
-MINIBATCH_SIZE = 4096
-MACROBATCH_SIZE = 32 * MINIBATCH_SIZE
+NUM_COMM_SMS = 40
+MINIBATCH_SIZE = 16384
+MACROBATCH_SIZE = 8 * MINIBATCH_SIZE
 
 WARMUP_ITERS = 5
 PROFILE_ITERS = 3
@@ -97,7 +97,9 @@ def mlp_swiglu_ref(
         _x = x_routed[offset:offset + num_tokens]
         gate_routed[offset:offset + num_tokens] = mxfp8_gemm(_x, w_routed_gate[expert_idx])
         up_routed[offset:offset + num_tokens] = mxfp8_gemm(_x, w_routed_up[expert_idx])
-        hidden_routed[offset:offset + num_tokens] = (F.silu(gate_routed[offset:offset + num_tokens].float()) * up_routed[offset:offset + num_tokens].float()).to(torch.bfloat16)
+        gate_dequant = dequant(*mxfp8_quantize_ref(gate_routed[offset:offset + num_tokens]))
+        up_dequant = dequant(*mxfp8_quantize_ref(up_routed[offset:offset + num_tokens]))
+        hidden_routed[offset:offset + num_tokens] = (F.silu(gate_dequant.float()) * up_dequant.float()).to(torch.bfloat16)
         y_routed[offset:offset + num_tokens] = mxfp8_gemm(hidden_routed[offset:offset + num_tokens], w_routed_down[expert_idx])
         offset += num_tokens
 
