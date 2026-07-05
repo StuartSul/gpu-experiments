@@ -39,15 +39,15 @@ def finalize(y_shared, combine_buffer, topk_weights):
 
 
 def mlp_swiglu_ref(
-    x_shared, x_routed, 
-    w_shared_gate, w_routed_gate, 
-    w_shared_up, w_routed_up, 
-    w_shared_down, w_routed_down, 
+    x_shared, x_routed,
+    w_shared_gate, w_routed_gate,
+    w_shared_up, w_routed_up,
+    w_shared_down, w_routed_down,
     tokens_per_expert
 ):
     gate_shared = x_shared @ w_shared_gate.T
     up_shared = x_shared @ w_shared_up.T
-    hidden_shared = (F.silu(gate_shared.float()) * up_shared.float()).to(x_shared.dtype)
+    hidden_shared = (F.silu(gate_shared.float()) * up_shared.float()).to(torch.bfloat16)
     y_shared = hidden_shared @ w_shared_down.T
 
     gate_routed = torch.empty(x_routed.size(0), w_routed_gate.size(1), device=x_routed.device, dtype=x_routed.dtype)
@@ -106,13 +106,12 @@ def main():
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Benchmark
-    for _ in range(WARMUP_ITERS):
+    def run_once():
         dist.all_gather_into_tensor(topk_ids_all, topk_ids)
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
             topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
         )
-        x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
+        x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, _ = dispatch_mlp_swiglu_combine(
             x, x_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
@@ -120,6 +119,13 @@ def main():
         )
         dist.barrier(async_op=True).block_current_stream()
         output = finalize(y_shared, combine_buffer, topk_weights)
+        return (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                x_routed, gate_shared, gate_routed, up_shared, up_routed,
+                hidden_shared, hidden_routed, y_shared, y_routed, output)
+
+    # Benchmark
+    for _ in range(WARMUP_ITERS):
+        run_once()
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -129,18 +135,7 @@ def main():
         record_shapes=True,
     ) as prof:
         for _ in range(PROFILE_ITERS):
-            dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
-                topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
-            )
-            x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
-                x, x_ptrs, combine_buffer, combine_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
-            )
-            dist.barrier(async_op=True).block_current_stream()
-            output = finalize(y_shared, combine_buffer, topk_weights)
+            run_once()
         torch.cuda.synchronize()
     trace_path = f"trace_moe_rank{rank}.json"
     prof.export_chrome_trace(trace_path)
@@ -153,18 +148,9 @@ def main():
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        dist.all_gather_into_tensor(topk_ids_all, topk_ids)
-        schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
-            topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
-        )
-        x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, combine_buffer = dispatch_mlp_swiglu_combine(
-            x, x_ptrs, combine_buffer, combine_buffer_ptrs,
-            w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
-        )
-        dist.barrier(async_op=True).block_current_stream()
-        output = finalize(y_shared, combine_buffer, topk_weights)
+        (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+         x_routed, gate_shared, gate_routed, up_shared, up_routed,
+         hidden_shared, hidden_routed, y_shared, y_routed, output) = run_once()
     end.record()
     torch.cuda.synchronize()
     dist.barrier()
