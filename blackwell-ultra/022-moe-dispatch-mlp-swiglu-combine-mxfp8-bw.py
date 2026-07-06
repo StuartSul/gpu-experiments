@@ -121,10 +121,10 @@ def main():
     # Generate inputs and communication buffers
     gen = torch.Generator(device=device).manual_seed(1234 + rank)
     router_logits = torch.randn(NUM_LOCAL_TOKENS, num_experts, generator=gen, device=device)
-    x = symm_mem.empty(NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-    x.normal_(generator=gen)
-    x_handle = symm_mem.rendezvous(x, dist.group.WORLD.group_name)
-    x_ptrs = [x_handle.buffer_ptrs[i] for i in range(world_size)]
+    x_buffer = symm_mem.empty(NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    x_buffer.normal_(generator=gen)
+    x_buffer_handle = symm_mem.rendezvous(x_buffer, dist.group.WORLD.group_name)
+    x_buffer_ptrs = [x_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
     combine_buffer = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_buffer_handle = symm_mem.rendezvous(combine_buffer, dist.group.WORLD.group_name)
     combine_buffer_ptrs = [combine_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
@@ -160,7 +160,7 @@ def main():
          up_shared, up_fp8_routed, up_sc_routed,
          hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
          y_shared, y_routed) = dispatch_mlp_swiglu_combine(
-            x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+            x_buffer, x_buffer_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate_fp8, w_routed_gate_sc,
             w_shared_up, w_routed_up_fp8, w_routed_up_sc,
             w_shared_down, w_routed_down_fp8, w_routed_down_sc,
@@ -216,12 +216,12 @@ def main():
 
     # Reference implementation
     x_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-    dist.all_gather_into_tensor(x_all, x)
+    dist.all_gather_into_tensor(x_all, x_buffer)
     valid = schedule_peer_rank >= 0
     x_routed_ref = torch.zeros(schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     x_routed_ref[valid] = x_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
     mlp_swiglu_refs = mlp_swiglu_ref(
-        x, x_routed_ref,
+        x_buffer, x_routed_ref,
         w_shared_gate, w_routed_gate,
         w_shared_up, w_routed_up,
         w_shared_down, w_routed_down,
@@ -306,7 +306,7 @@ def main():
             print(f"{rank_idx:>4}  {int(routed_tokens):>13}  {rank_end_to_end_ms:>14.3f}  {rank_tflops:>11.1f}")
 
     dist.barrier()
-    del x_handle
+    del x_buffer_handle
     del combine_buffer_handle
     gc.collect()
     dist.destroy_process_group()
