@@ -32,7 +32,7 @@ TIMED_ITERS = 10
 
 
 @torch.compile
-def finalize(y_shared, combine_buffer, topk_weights):
+def fwd_epilogue(y_shared, combine_buffer, topk_weights):
     num_local_tokens, topk = topk_weights.shape
     y_routed = combine_buffer.view(num_local_tokens, topk, -1).float()
     return (y_shared.float() + (y_routed * topk_weights.unsqueeze(-1)).sum(dim=1)).to(torch.bfloat16)
@@ -168,7 +168,7 @@ def main():
             TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
         )
         dist.barrier(async_op=True).block_current_stream()
-        output = finalize(y_shared, combine_buffer, topk_weights)
+        output = fwd_epilogue(y_shared, combine_buffer, topk_weights)
         return (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 x_fp8_t_routed, x_sc_t_routed,
                 gate_shared, gate_fp8_routed, gate_sc_routed,
@@ -239,7 +239,7 @@ def main():
     for dst_rank in range(world_size):
         dst_valid = schedule_peer_rank_all[dst_rank] == rank
         combine_buffer_ref[schedule_peer_token_idx_all[dst_rank, dst_valid].long()] = y_routed_all[dst_rank, dst_valid]
-    output_ref = finalize(y_shared_ref, combine_buffer_ref, topk_weights)
+    output_ref = fwd_epilogue(y_shared_ref, combine_buffer_ref, topk_weights)
 
     # Dequantize the fused kernel's quantized outputs and build dequantized references
     x_routed_t_dequant = dequant(x_fp8_t_routed, scale_unswizzle(x_sc_t_routed))
