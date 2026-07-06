@@ -926,10 +926,8 @@ static __device__ __forceinline__ void swiglu(
                     bf16_2 hidden_bf16[16];
                     #pragma unroll
                     for (int k = 0; k < 16; ++k) {
-                        const float2 hidden_fp32 {
-                            gate_fp32[k].x / (1.0f + exp2f(-1.4426950408889634f * gate_fp32[k].x)) * up_fp32[k].x,
-                            gate_fp32[k].y / (1.0f + exp2f(-1.4426950408889634f * gate_fp32[k].y)) * up_fp32[k].y
-                        };
+                        const float2 hidden_fp32 {gate_fp32[k].x / (1.0f + __expf(-gate_fp32[k].x)) * up_fp32[k].x,
+                                                  gate_fp32[k].y / (1.0f + __expf(-gate_fp32[k].y)) * up_fp32[k].y};
                         hidden_bf16[k] = __float22bfloat162_rn(hidden_fp32);
                     }
 
@@ -965,8 +963,8 @@ static __device__ __forceinline__ void swiglu(
                 rt_fl<config::SWIGLU_Mb / config::NUM_WARPS, config::SWIGLU_Nb> gate, up, denominator;
                 compute_group::load(gate, gate_smem[stage]);
                 compute_group::load(up, up_smem[stage]);
-                compute_group::mul(denominator, gate, -1.4426950408889634f);
-                compute_group::exp2(denominator, denominator);
+                compute_group::mul(denominator, gate, -1.0f);
+                compute_group::exp(denominator, denominator);
                 compute_group::add(denominator, denominator, 1.0f);
                 compute_group::div(gate, gate, denominator);
                 compute_group::mul(gate, gate, up);
