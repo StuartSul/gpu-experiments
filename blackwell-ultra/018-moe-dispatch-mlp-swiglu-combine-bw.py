@@ -83,7 +83,7 @@ def mlp_swiglu_bwd_ref(
     _silu = gate_shared.float() * _sigmoid
     d_gate_shared = (((1.0 - _silu) * _sigmoid + _silu) * (up_shared.float() * d_hidden_shared.float())).to(torch.bfloat16)
     d_up_shared = (d_hidden_shared.float() * _silu).to(torch.bfloat16)
-    d_x_shared = d_gate_shared @ w_shared_gate + d_up_shared @ w_shared_up
+    d_x_shared = torch.cat((d_gate_shared, d_up_shared), 1) @ torch.cat((w_shared_gate, w_shared_up), 0)
     d_w_shared_gate = d_gate_shared.T @ x_shared
     d_w_shared_up = d_up_shared.T @ x_shared
     d_w_shared_down = d_y_shared.T @ hidden_shared
@@ -103,7 +103,7 @@ def mlp_swiglu_bwd_ref(
         _silu = gate_routed[offset:offset + num_tokens].float() * _sigmoid
         d_gate_routed[offset:offset + num_tokens] = (((1.0 - _silu) * _sigmoid + _silu) * (up_routed[offset:offset + num_tokens].float() * d_hidden_routed[offset:offset + num_tokens].float())).to(torch.bfloat16)
         d_up_routed[offset:offset + num_tokens] = (d_hidden_routed[offset:offset + num_tokens].float() * _silu).to(torch.bfloat16)
-        d_x_routed[offset:offset + num_tokens] = d_gate_routed[offset:offset + num_tokens] @ w_routed_gate[expert_idx] + d_up_routed[offset:offset + num_tokens] @ w_routed_up[expert_idx]
+        d_x_routed[offset:offset + num_tokens] = torch.cat((d_gate_routed[offset:offset + num_tokens], d_up_routed[offset:offset + num_tokens]), 1) @ torch.cat((w_routed_gate[expert_idx], w_routed_up[expert_idx]), 0)
         d_w_routed_gate[expert_idx] = d_gate_routed[offset:offset + num_tokens].T @ x_routed[offset:offset + num_tokens]
         d_w_routed_up[expert_idx] = d_up_routed[offset:offset + num_tokens].T @ x_routed[offset:offset + num_tokens]
         d_w_routed_down[expert_idx] = d_y_routed[offset:offset + num_tokens].T @ hidden_routed[offset:offset + num_tokens]
