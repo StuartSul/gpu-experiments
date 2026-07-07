@@ -1606,6 +1606,239 @@ dispatch_mlp_swiglu_combine(
 
 }; // struct dispatch_mlp_swiglu_combiner
 
+struct utilities {
+
+struct config_fwd_epilogue {
+    static constexpr int CLUSTER_SIZE = 1;
+    static constexpr int NUM_THREADS = 256;
+    static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
+};
+
+struct globals_fwd_epilogue {
+    static constexpr int Nb = 1024;
+    static constexpr int TOKENS_PER_CTA = 2;
+
+    using token_vec = sv_bf<Nb>;
+    using activation_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
+    using weight_gl = gl<float, 1, 1, -1, -1>;
+
+    activation_gl y_shared;        // (num_local_tokens, H)
+    activation_gl combine_buffer;  // (num_local_tokens * topk, H)
+    weight_gl topk_weights;        // (num_local_tokens, topk)
+    activation_gl output;          // (num_local_tokens, H)
+
+    __host__ inline dim3 grid() const { return dim3(y_shared.cols() / Nb, y_shared.rows() / TOKENS_PER_CTA); }
+    __host__ inline int dynamic_shared_memory() const {
+        return TOKENS_PER_CTA * ((topk_weights.cols() + 1) * sizeof(token_vec) + topk_weights.cols() * sizeof(float)) + 1024;
+    }
+};
+
+static __device__ inline void fwd_epilogue_kernel(const globals_fwd_epilogue &g) {
+    constexpr int TOKENS_PER_CTA = globals_fwd_epilogue::TOKENS_PER_CTA;
+    using compute_group = group<config_fwd_epilogue::NUM_WARPS>;
+
+    const int tid = threadIdx.x;
+    const int topk = g.topk_weights.cols();
+    const int num_tokens_per_stage = topk + 1;
+    const int col_block_idx = blockIdx.x;
+    const int first_token_idx = blockIdx.y * TOKENS_PER_CTA;
+
+    extern __shared__ int __shm[];
+    auto *vecs = reinterpret_cast<globals_fwd_epilogue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
+    float *weights = reinterpret_cast<float*>(vecs + TOKENS_PER_CTA * num_tokens_per_stage); // (TOKENS_PER_CTA, topk)
+
+    __shared__ semaphore inputs_arrived[TOKENS_PER_CTA];
+    if (tid == 0) {
+        #pragma unroll
+        for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
+            init_semaphore(inputs_arrived[stage], 0, 1);
+            tma::expect_bytes(inputs_arrived[stage], num_tokens_per_stage * sizeof(globals_fwd_epilogue::token_vec));
+        }
+    }
+    for (int i = tid; i < TOKENS_PER_CTA * topk; i += blockDim.x)
+        weights[i] = g.topk_weights[{first_token_idx + i / topk, i % topk}];
+    __syncthreads();
+
+    #pragma unroll
+    for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
+        const int token_idx = first_token_idx + stage;
+        if (tid == 0)
+            tma::load_async(vecs[stage * num_tokens_per_stage], g.y_shared, {token_idx, col_block_idx}, inputs_arrived[stage]);
+        else if (tid < num_tokens_per_stage)
+            tma::load_async(vecs[stage * num_tokens_per_stage + tid], g.combine_buffer, {token_idx * topk + tid - 1, col_block_idx}, inputs_arrived[stage]);
+    }
+
+    #pragma unroll
+    for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
+        globals_fwd_epilogue::token_vec *stage_vecs = vecs + stage * num_tokens_per_stage;
+        rv_fl<globals_fwd_epilogue::Nb / config_fwd_epilogue::NUM_WARPS> accumulator, term;
+        wait(inputs_arrived[stage], 0);
+        compute_group::load(accumulator, stage_vecs[0]);
+        for (int k = 0; k < topk; ++k) {
+            compute_group::load(term, stage_vecs[1 + k]);
+            compute_group::mul(term, term, weights[stage * topk + k]);
+            compute_group::add(accumulator, accumulator, term);
+        }
+        compute_group::store(stage_vecs[0], accumulator);
+        __syncthreads();
+        if (tid == 0)
+            tma::store_async(g.output, stage_vecs[0], {first_token_idx + stage, col_block_idx});
+    }
+}
+
+static __host__ at::Tensor fwd_epilogue(
+    const at::Tensor &y_shared,
+    const at::Tensor &combine_buffer,
+    const at::Tensor &topk_weights
+) {
+    at::Tensor output = at::empty_like(y_shared);
+    globals_fwd_epilogue g {
+        .y_shared = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(y_shared),
+        .combine_buffer = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(combine_buffer),
+        .topk_weights = kittens::py::tensor_to_gl<globals_fwd_epilogue::weight_gl>(topk_weights),
+        .output = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(output)
+    };
+    kittens::py::launch_kernel<config_fwd_epilogue, globals_fwd_epilogue, fwd_epilogue_kernel>(g);
+    return output;
+}
+
+struct config_bwd_prologue {
+    static constexpr int CLUSTER_SIZE = 1;
+    static constexpr int NUM_THREADS = 256;
+    static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
+};
+
+struct globals_bwd_prologue {
+    static constexpr int Nb = 1024;
+
+    using token_vec = sv_bf<Nb>;
+    using activation_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
+    using weight_gl = gl<float, 1, 1, -1, -1>;
+
+    activation_gl d_output;         // (num_local_tokens, H)
+    weight_gl topk_weights;         // (num_local_tokens, topk)
+    activation_gl d_combine_buffer; // (num_local_tokens * topk, H)
+
+    __host__ inline dim3 grid() const { return dim3(d_output.cols() / Nb, d_output.rows()); }
+    __host__ inline int dynamic_shared_memory() const {
+        return (topk_weights.cols() + 1) * sizeof(token_vec) + topk_weights.cols() * sizeof(float) + 1024;
+    }
+};
+
+static __device__ inline void bwd_prologue_kernel(const globals_bwd_prologue &g) {
+    using compute_group = group<config_bwd_prologue::NUM_WARPS>;
+
+    const int tid = threadIdx.x;
+    const int topk = g.topk_weights.cols();
+    const int token_idx = blockIdx.y;
+    const int col_block_idx = blockIdx.x;
+
+    extern __shared__ int __shm[];
+    auto *vecs = reinterpret_cast<globals_bwd_prologue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
+    float *weights = reinterpret_cast<float*>(vecs + topk + 1); // (topk,)
+
+    __shared__ semaphore inputs_arrived;
+    if (tid == 0) {
+        init_semaphore(inputs_arrived, 0, 1);
+        tma::expect_bytes(inputs_arrived, sizeof(globals_bwd_prologue::token_vec));
+        tma::load_async(vecs[0], g.d_output, {token_idx, col_block_idx}, inputs_arrived);
+    } else if (tid - 1 < topk) {
+        weights[tid - 1] = g.topk_weights[{token_idx, tid - 1}];
+    }
+    __syncthreads();
+
+    rv_fl<globals_bwd_prologue::Nb / config_bwd_prologue::NUM_WARPS> d_output, term;
+    wait(inputs_arrived, 0);
+    compute_group::load(d_output, vecs[0]);
+    for (int k = 0; k < topk; ++k) {
+        compute_group::mul(term, d_output, weights[k]);
+        compute_group::store(vecs[1 + k], term);
+    }
+    __syncthreads();
+    if (tid < topk)
+        tma::store_async(g.d_combine_buffer, vecs[1 + tid], {token_idx * topk + tid, col_block_idx});
+}
+
+static __host__ at::Tensor bwd_prologue(const at::Tensor &d_output, const at::Tensor &topk_weights, const at::Tensor &d_combine_buffer) {
+    globals_bwd_prologue g {
+        .d_output = kittens::py::tensor_to_gl<globals_bwd_prologue::activation_gl>(d_output),
+        .topk_weights = kittens::py::tensor_to_gl<globals_bwd_prologue::weight_gl>(topk_weights),
+        .d_combine_buffer = kittens::py::tensor_to_gl<globals_bwd_prologue::activation_gl>(d_combine_buffer)
+    };
+    kittens::py::launch_kernel<config_bwd_prologue, globals_bwd_prologue, bwd_prologue_kernel>(g);
+    return d_output; // == d_y_shared; d_combine_buffer needs to be symmetric memory, so is updated in-place
+}
+
+struct config_bwd_epilogue {
+    static constexpr int CLUSTER_SIZE = 1;
+    static constexpr int NUM_THREADS = 256;
+    static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
+};
+
+struct globals_bwd_epilogue {
+    static constexpr int Nb = 1024;
+
+    using token_vec = sv_bf<Nb>;
+    using activation_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
+
+    activation_gl d_x_shared;        // (num_local_tokens, H)
+    activation_gl d_x_routed_buffer; // (num_local_tokens * topk, H)
+    activation_gl d_x;               // (num_local_tokens, H)
+
+    __host__ inline dim3 grid() const { return dim3(d_x_shared.cols() / Nb, d_x_shared.rows()); }
+    __host__ inline int dynamic_shared_memory() const { return (d_x_routed_buffer.rows() / d_x_shared.rows() + 1) * sizeof(token_vec) + 1024; }
+};
+
+static __device__ inline void bwd_epilogue_kernel(const globals_bwd_epilogue &g) {
+    using compute_group = group<config_bwd_epilogue::NUM_WARPS>;
+
+    const int tid = threadIdx.x;
+    const int topk = g.d_x_routed_buffer.rows() / g.d_x_shared.rows();
+    const int num_vecs = topk + 1;
+    const int token_idx = blockIdx.y;
+    const int col_block_idx = blockIdx.x;
+
+    extern __shared__ int __shm[];
+    auto *vecs = reinterpret_cast<globals_bwd_epilogue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
+
+    __shared__ semaphore inputs_arrived;
+    if (tid == 0) {
+        init_semaphore(inputs_arrived, 0, 1);
+        tma::expect_bytes(inputs_arrived, num_vecs * sizeof(globals_bwd_epilogue::token_vec));
+    }
+    __syncthreads();
+
+    if (tid == 0)
+        tma::load_async(vecs[0], g.d_x_shared, {token_idx, col_block_idx}, inputs_arrived);
+    else if (tid < num_vecs)
+        tma::load_async(vecs[tid], g.d_x_routed_buffer, {token_idx * topk + tid - 1, col_block_idx}, inputs_arrived);
+
+    rv_fl<globals_bwd_epilogue::Nb / config_bwd_epilogue::NUM_WARPS> acc, term;
+    wait(inputs_arrived, 0);
+    compute_group::load(acc, vecs[0]);
+    for (int k = 0; k < topk; ++k) {
+        compute_group::load(term, vecs[1 + k]);
+        compute_group::add(acc, acc, term);
+    }
+    compute_group::store(vecs[0], acc);
+    __syncthreads();
+    if (tid == 0)
+        tma::store_async(g.d_x, vecs[0], {token_idx, col_block_idx});
+}
+
+static __host__ at::Tensor bwd_epilogue(const at::Tensor &d_x_shared, const at::Tensor &d_x_routed_buffer) {
+    at::Tensor d_x = at::empty_like(d_x_shared);
+    globals_bwd_epilogue g {
+        .d_x_shared = kittens::py::tensor_to_gl<globals_bwd_epilogue::activation_gl>(d_x_shared),
+        .d_x_routed_buffer = kittens::py::tensor_to_gl<globals_bwd_epilogue::activation_gl>(d_x_routed_buffer),
+        .d_x = kittens::py::tensor_to_gl<globals_bwd_epilogue::activation_gl>(d_x)
+    };
+    kittens::py::launch_kernel<config_bwd_epilogue, globals_bwd_epilogue, bwd_epilogue_kernel>(g);
+    return d_x;
+}
+
+}; // struct utilities
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("schedule", &scheduler::schedule, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
@@ -1622,4 +1855,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("num_comm_sms"),
           pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+    m.def("fwd_epilogue", &utilities::fwd_epilogue, "",
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+    m.def("bwd_prologue", &utilities::bwd_prologue, "",
+          pybind11::arg("d_output"), pybind11::arg("topk_weights"), pybind11::arg("d_combine_buffer"));
+    m.def("bwd_epilogue", &utilities::bwd_epilogue, "",
+          pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
 }
