@@ -1007,7 +1007,7 @@ static __device__ inline void fwd_epilogue_kernel(const globals_fwd_epilogue &g)
 
     extern __shared__ int __shm[];
     auto *vecs = reinterpret_cast<globals_fwd_epilogue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
-    float *weights = reinterpret_cast<float*>(vecs + TOKENS_PER_CTA * topk);
+    float *weights = reinterpret_cast<float*>(vecs + TOKENS_PER_CTA * num_tokens_per_stage); // (TOKENS_PER_CTA, topk)
 
     __shared__ semaphore inputs_arrived[TOKENS_PER_CTA];
     if (tid == 0) {
@@ -1035,15 +1035,12 @@ static __device__ inline void fwd_epilogue_kernel(const globals_fwd_epilogue &g)
         globals_fwd_epilogue::token_vec *stage_vecs = vecs + stage * num_tokens_per_stage;
         rv_fl<globals_fwd_epilogue::Nb / config_fwd_epilogue::NUM_WARPS> accumulator, term;
         wait(inputs_arrived[stage], 0);
-        compute_group::load(accumulator, stage_vecs[1]);
-        compute_group::mul(accumulator, accumulator, weights[stage * topk]);
-        for (int k = 1; k < topk; ++k) {
+        compute_group::load(accumulator, stage_vecs[0]);
+        for (int k = 0; k < topk; ++k) {
             compute_group::load(term, stage_vecs[1 + k]);
             compute_group::mul(term, term, weights[stage * topk + k]);
             compute_group::add(accumulator, accumulator, term);
         }
-        compute_group::load(term, stage_vecs[0]);
-        compute_group::add(accumulator, accumulator, term);
         compute_group::store(stage_vecs[0], accumulator);
         __syncthreads();
         if (tid == 0)
@@ -1100,7 +1097,7 @@ static __device__ inline void bwd_prologue_kernel(const globals_bwd_prologue &g)
 
     extern __shared__ int __shm[];
     auto *vecs = reinterpret_cast<globals_bwd_prologue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
-    float *weights = reinterpret_cast<float*>(vecs + topk); // (topk,)
+    float *weights = reinterpret_cast<float*>(vecs + topk + 1); // (topk,)
 
     __shared__ semaphore inputs_arrived;
     if (tid == 0) {
@@ -1180,13 +1177,11 @@ static __device__ inline void bwd_epilogue_kernel(const globals_bwd_epilogue &g)
 
     rv_fl<globals_bwd_epilogue::Nb / config_bwd_epilogue::NUM_WARPS> acc, term;
     wait(inputs_arrived, 0);
-    compute_group::load(acc, vecs[1]);
-    for (int k = 1; k < topk; ++k) {
+    compute_group::load(acc, vecs[0]);
+    for (int k = 0; k < topk; ++k) {
         compute_group::load(term, vecs[1 + k]);
         compute_group::add(acc, acc, term);
     }
-    compute_group::load(term, vecs[0]);
-    compute_group::add(acc, acc, term);
     compute_group::store(vecs[0], acc);
     __syncthreads();
     if (tid == 0)
@@ -1219,4 +1214,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("num_comm_sms"),
           pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+    m.def("fwd_epilogue", &utilities::fwd_epilogue, "",
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+    m.def("bwd_prologue", &utilities::bwd_prologue, "",
+          pybind11::arg("d_output"), pybind11::arg("topk_weights"), pybind11::arg("d_combine_buffer"));
+    m.def("bwd_epilogue", &utilities::bwd_epilogue, "",
+          pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
 }
