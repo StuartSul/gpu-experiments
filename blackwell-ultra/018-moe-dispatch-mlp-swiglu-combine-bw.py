@@ -14,7 +14,14 @@ import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _C import dispatch_mlp_swiglu_combine_fwd, dispatch_mlp_swiglu_combine_bwd, schedule
+from _C import (
+    schedule,
+    dispatch_mlp_swiglu_combine_fwd,
+    dispatch_mlp_swiglu_combine_bwd,
+    fwd_epilogue,
+    bwd_prologue,
+    bwd_epilogue
+)
 
 
 NUM_LOCAL_TOKENS = 7168
@@ -29,29 +36,6 @@ MACROBATCH_SIZE = 32 * MINIBATCH_SIZE
 WARMUP_ITERS = 5
 PROFILE_ITERS = 3
 TIMED_ITERS = 10
-
-
-@torch.compile
-def fwd_epilogue(y_shared, combine_buffer, topk_weights):
-    num_local_tokens, topk = topk_weights.shape
-    y_routed = combine_buffer.view(num_local_tokens, topk, -1).float()
-    return (y_shared.float() + (y_routed * topk_weights.unsqueeze(-1)).sum(dim=1)).to(torch.bfloat16)
-
-
-@torch.compile
-def bwd_prologue(d_output, topk_weights, d_combine_buffer):
-    num_local_tokens, topk = topk_weights.shape
-    # d_combine_buffer must be symmetric memory, so we copy to it
-    d_combine_buffer.view(num_local_tokens, topk, -1).copy_(d_output.float().unsqueeze(1) * topk_weights.unsqueeze(-1))
-    d_y_shared = d_output  # b/c weight = 1
-    return d_y_shared
-
-
-@torch.compile
-def bwd_epilogue(d_x_shared, d_x_routed):
-    num_local_tokens, hidden_dim = d_x_shared.shape
-    d_x_routed = d_x_routed.view(num_local_tokens, -1, hidden_dim).float()
-    return (d_x_shared.float() + d_x_routed.sum(dim=1)).to(torch.bfloat16)
 
 
 def mlp_swiglu_fwd_ref(
