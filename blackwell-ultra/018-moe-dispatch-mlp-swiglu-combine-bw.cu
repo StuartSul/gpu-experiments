@@ -1604,61 +1604,68 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                             d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
                                             0, 0, 0, 0, 0, smem_base_addr);
+        } else if (compute_cluster_idx < shared_tasks - shared_wgrad_tasks) {
+            // Shared wgrad gate: d_w_shared_gate += d_gate_shared^T @ x_shared
+            const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - shared_wgrad_tasks;
+            expert_grouped_gemm<true, true>(g.d_gate_shared, g.x_shared, nullptr, nullptr, g.d_w_shared_gate,
+                                            g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, nullptr,
+                                            d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                            num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
+                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
         } else if (compute_cluster_idx < shared_tasks) {
-            // Shared wgrad gate/up: d_w_shared_gate/up += d_gate/up_shared^T @ x_shared
-            const int idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - shared_wgrad_tasks;
-            const bool is_gate = idx < shared_wgrad_tasks;
-            const int task_idx = idx % shared_wgrad_tasks;
-            expert_grouped_gemm<true, true>(is_gate ? g.d_gate_shared : g.d_up_shared, g.x_shared, nullptr, nullptr,
-                                            is_gate ? g.d_w_shared_gate : g.d_w_shared_up,
+            // Shared wgrad up: d_w_shared_up += d_up_shared^T @ x_shared
+            const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - 2 * shared_wgrad_tasks;
+            expert_grouped_gemm<true, true>(g.d_up_shared, g.x_shared, nullptr, nullptr, g.d_w_shared_up,
                                             g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, nullptr,
                                             d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
                                             0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
         } else {
-            // Routed tasks, one processed macrobatch block at a time
-            const int routed_task_idx = compute_cluster_idx - shared_tasks;
-            const bool replayed = routed_task_idx >= saved_macrobatch_tasks;
-            int macrobatch_idx, num_minibatches, macrobatch_task_idx;
-            if (replayed) {
-                const int replayed_task_idx = routed_task_idx - saved_macrobatch_tasks;
-                macrobatch_idx = replayed_task_idx / replayed_macrobatch_tasks;
-                num_minibatches = minibatches_per_macrobatch;
-                macrobatch_task_idx = replayed_task_idx - macrobatch_idx * replayed_macrobatch_tasks;
-            } else {
-                macrobatch_idx = last_macrobatch_idx;
-                num_minibatches = last_num_minibatches;
-                macrobatch_task_idx = routed_task_idx;
-            }
+            // Routed / replay tasks
+            const int global_routed_task_idx = compute_cluster_idx - shared_tasks;
+            const int macrobatch_idx = global_routed_task_idx < saved_macrobatch_tasks
+                ? last_macrobatch_idx
+                : (global_routed_task_idx - saved_macrobatch_tasks) / replayed_macrobatch_tasks;
+            const bool replayed = macrobatch_idx != last_macrobatch_idx;
+            const int num_minibatches = num_minibatches_of(macrobatch_idx);
+            const int num_replay_tasks = replayed ? num_minibatches * minibatch_routed_replay_tasks : 0;
+            const int num_routed_tasks = num_minibatches * minibatch_routed_bwd_tasks;
+            const int macrobatch_task_idx = replayed
+                ? (global_routed_task_idx - saved_macrobatch_tasks) % replayed_macrobatch_tasks
+                : global_routed_task_idx;
 
-            const int replay_task_end = replayed ? num_minibatches * minibatch_routed_replay_tasks : 0;
-            const int bwd_task_end = replay_task_end + num_minibatches * minibatch_routed_bwd_tasks;
-            if (macrobatch_task_idx < replay_task_end) {
+            if (macrobatch_task_idx < num_replay_tasks) {
                 const int minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;
                 const int minibatch_task_idx = macrobatch_task_idx % minibatch_routed_replay_tasks;
-                if (minibatch_task_idx < 2 * minibatch_routed_gate_up_tasks) {
-                    // Replay gate/up: gate/up_routed = x_routed @ w_routed_gate/up^T
-                    const bool is_gate = minibatch_task_idx < minibatch_routed_gate_up_tasks;
-                    const int task_idx = minibatch_task_idx % minibatch_routed_gate_up_tasks;
-                    expert_grouped_gemm<false>(g.x_routed, is_gate ? g.w_routed_gate : g.w_routed_up, nullptr, nullptr,
-                                               is_gate ? g.gate_routed : g.up_routed,
+                if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
+                    // Replay gate: gate_routed = x_routed @ w_routed_gate^T
+                    const int task_idx = minibatch_task_idx;
+                    expert_grouped_gemm<false>(g.x_routed, g.w_routed_gate, nullptr, nullptr, g.gate_routed,
+                                               g.tokens_per_expert, &g.replayed_x_routed_ready, nullptr, &g.replayed_gate_up_ready, nullptr, nullptr,
+                                               d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                               0, 0, 0, 0, 0, smem_base_addr);
+                } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2) {
+                    // Replay up: up_routed = x_routed @ w_routed_up^T
+                    const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
+                    expert_grouped_gemm<false>(g.x_routed, g.w_routed_up, nullptr, nullptr, g.up_routed,
                                                g.tokens_per_expert, &g.replayed_x_routed_ready, nullptr, &g.replayed_gate_up_ready, nullptr, nullptr,
                                                d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
                                                0, 0, 0, 0, 0, smem_base_addr);
                 } else {
                     // Replay Swiglu: hidden_routed = silu(gate_routed) * up_routed
-                    const int task_idx = minibatch_task_idx - 2 * minibatch_routed_gate_up_tasks;
+                    const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
                     swiglu_fwd<false>(g.gate_routed, g.up_routed, g.hidden_routed, g.replayed_gate_up_ready, g.replayed_hidden_ready,
                                       swiglu_fwd_inputs_arrived, swiglu_fwd_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx,
                                       task_idx, cta_rank, 0, 0, smem_base_addr);
                 }
-            } else if (macrobatch_task_idx < bwd_task_end) {
-                const int minibatch_bwd_task_idx = macrobatch_task_idx - replay_task_end;
-                const int minibatch_idx = minibatch_bwd_task_idx / minibatch_routed_bwd_tasks;
-                const int minibatch_task_idx = minibatch_bwd_task_idx % minibatch_routed_bwd_tasks;
-                if (minibatch_task_idx < minibatch_routed_dgrad_down_tasks) {
+            } else {
+                const int routed_task_idx = macrobatch_task_idx - num_replay_tasks;
+                const int minibatch_idx = routed_task_idx / minibatch_routed_bwd_tasks;
+                const int minibatch_task_idx = routed_task_idx % minibatch_routed_bwd_tasks;
+                if (routed_task_idx < num_routed_tasks && minibatch_task_idx < minibatch_routed_dgrad_down_tasks) {
                     // Dgrad down: d_hidden_routed = d_y_routed @ w_routed_down_T^T
                     const int task_idx = minibatch_task_idx;
                     expert_grouped_gemm<false>(g.d_y_routed, g.w_routed_down_T, nullptr, nullptr, g.d_hidden_routed,
@@ -1666,7 +1673,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
                                                0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
-                } else if (minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
+                } else if (routed_task_idx < num_routed_tasks &&
+                           minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
                     // Swiglu bwd: d_gate_routed, d_up_routed = swiglu_bwd(d_hidden_routed, gate_routed, up_routed)
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks;
                     swiglu_bwd<false>(g.d_hidden_routed, g.gate_routed, g.up_routed, g.d_gate_routed, g.d_up_routed,
@@ -1674,7 +1682,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx,
                                       task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks, macrobatch_idx, smem_base_addr);
-                } else {
+                } else if (routed_task_idx < num_routed_tasks) {
                     // Dgrad gate+up: d_x_routed = d_gate_routed @ w_routed_gate_T^T + d_up_routed @ w_routed_up_T^T
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
                     expert_grouped_gemm<false>(g.d_gate_routed, g.w_routed_gate_T, &g.d_up_routed, &g.w_routed_up_T, g.d_x_routed,
@@ -1682,24 +1690,29 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
                                                0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
-                }
-            } else {
-                const int wgrad_task_idx = macrobatch_task_idx - bwd_task_end;
-                if (wgrad_task_idx < wgrad_matrix_tasks) {
+                } else if (routed_task_idx < num_routed_tasks + wgrad_matrix_tasks) {
                     // Wgrad down: d_w_routed_down += d_y_routed^T @ hidden_routed (per expert)
-                    const int task_idx = wgrad_task_idx;
+                    const int task_idx = routed_task_idx - num_routed_tasks;
                     expert_grouped_gemm<false, true>(g.d_y_routed, g.hidden_routed, nullptr, nullptr, g.d_w_routed_down,
                                                      g.tokens_per_expert, &g.d_y_routed_ready, replayed ? &g.replayed_hidden_ready : nullptr,
                                                      nullptr, nullptr, buffer_done,
                                                      d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), 0, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                } else if (routed_task_idx < num_routed_tasks + 2 * wgrad_matrix_tasks) {
+                    // Wgrad gate: d_w_routed_gate += d_gate_routed^T @ x_routed (per expert)
+                    const int task_idx = routed_task_idx - num_routed_tasks - wgrad_matrix_tasks;
+                    expert_grouped_gemm<false, true>(g.d_gate_routed, g.x_routed, nullptr, nullptr, g.d_w_routed_gate,
+                                                     g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
+                                                     &g.d_gate_up_ready, nullptr, nullptr, buffer_done,
+                                                     d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
+                                                     g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
+                                                     0, macrobatch_idx, smem_base_addr);
                 } else {
-                    // Wgrad gate/up: d_w_routed_gate/up += d_gate/up_routed^T @ x_routed (per expert)
-                    const bool is_gate = wgrad_task_idx < 2 * wgrad_matrix_tasks;
-                    const int task_idx = (wgrad_task_idx - wgrad_matrix_tasks) % wgrad_matrix_tasks;
-                    expert_grouped_gemm<false, true>(is_gate ? g.d_gate_routed : g.d_up_routed, g.x_routed, nullptr, nullptr,
-                                                     is_gate ? g.d_w_routed_gate : g.d_w_routed_up,
+                    // Wgrad up: d_w_routed_up += d_up_routed^T @ x_routed (per expert)
+                    const int task_idx = routed_task_idx - num_routed_tasks - 2 * wgrad_matrix_tasks;
+                    expert_grouped_gemm<false, true>(g.d_up_routed, g.x_routed, nullptr, nullptr, g.d_w_routed_up,
                                                      g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
                                                      &g.d_gate_up_ready, nullptr, nullptr, buffer_done,
                                                      d_tt, gemm_inputs_arrived, gemm_inputs_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
