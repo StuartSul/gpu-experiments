@@ -396,6 +396,86 @@ static __device__ __forceinline__ void barrier_arrive(const index_gl &counter, i
     asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&counter[{index}]), "r"(increment) : "memory");
 }
 
+static __device__ __forceinline__ void dispatch_kernel(
+    const activation_pgl &peer_buf,
+    const activation_gl &local_buf,
+    const index_gl &schedule_peer_rank,
+    const index_gl &schedule_peer_token_idx,
+    const index_gl *transfer_ready,
+    const index_gl *buffer_ready,
+    const index_gl &transfer_done,
+    semaphore &inputs_arrived,
+    uint32_t &bitfield,
+    const int num_tokens,
+    const int macrobatch_size,
+    const int minibatch_size,
+    const int macrobatch_idx,
+    const int task_idx,
+    const int row_divisor,
+    const int buffer_ready_index,
+    const int buffer_ready_required_count,
+    const uint64_t smem_base_addr
+) {
+    auto &token_chunks = *reinterpret_cast<bf16 (*)[config::DISPATCH_Mb][config::DISPATCH_Nb]>(smem_base_addr);
+
+    const int tid = threadIdx.x;
+    const bool is_worker = tid < config::DISPATCH_Mb; // only these threads move tokens, but all threads join the barriers and waits
+
+    const int cols = local_buf.cols();
+    const int col_blocks = (cols + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
+
+    const int macrobatch_offset = macrobatch_idx * macrobatch_size;
+    const int num_macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
+    if (task_idx >= num_macrobatch_tokens / config::DISPATCH_Mb * col_blocks) return;
+
+    const int row_idx = task_idx / col_blocks * config::DISPATCH_Mb;
+    const int col_block_idx = task_idx % col_blocks;
+    const uint32_t chunk_bytes = min(config::DISPATCH_Nb, cols - col_block_idx * config::DISPATCH_Nb) * sizeof(bf16);
+
+    const int peer_rank = is_worker ? schedule_peer_rank[{macrobatch_offset + row_idx + tid}] : -1;
+    const int peer_token_idx = is_worker ? schedule_peer_token_idx[{macrobatch_offset + row_idx + tid}] : -1;
+    const int num_valid = __syncthreads_count(peer_rank >= 0);
+
+    if (tid == 0) {
+        if (transfer_ready != nullptr) {
+            // Dispatch can overwrite rows still read by the previous macrobatch's GEMMs, so wait for down GEMM completion
+            const int prev_macrobatch_offset = (macrobatch_idx - 1) * macrobatch_size;
+            const int global_minibatch_idx = (prev_macrobatch_offset + row_idx) / minibatch_size;
+            const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
+            barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
+        }
+        if (buffer_ready != nullptr)
+            barrier_wait(*buffer_ready, buffer_ready_index, buffer_ready_required_count);
+        tma::expect_bytes(inputs_arrived, num_valid * chunk_bytes);
+    }
+    __syncthreads();
+
+    if (peer_rank >= 0) {
+        tma::load_async(token_chunks[tid],
+                        &peer_buf[peer_rank].raw_ptr[static_cast<size_t>(peer_token_idx / row_divisor) * cols + col_block_idx * config::DISPATCH_Nb],
+                        chunk_bytes, inputs_arrived);
+    } else if (is_worker) { // zero-fill padding rows
+        auto *chunk = reinterpret_cast<float4 *>(token_chunks[tid]);
+        #pragma unroll
+        for (int i = 0; i < config::DISPATCH_Nb * static_cast<int>(sizeof(bf16)) / static_cast<int>(sizeof(float4)); ++i)
+            chunk[i] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+
+    wait(inputs_arrived, get_phasebit<0>(bitfield, 0));
+    update_phasebit<0>(bitfield, 0);
+
+    if (is_worker)
+        tma::store_async(&local_buf.raw_ptr[static_cast<size_t>(row_idx + tid) * cols + col_block_idx * config::DISPATCH_Nb], token_chunks[tid], chunk_bytes);
+
+    tma::store_async_wait();
+    __syncthreads();
+    if (tid == 0) {
+        const int global_minibatch_idx = (macrobatch_offset + row_idx) / minibatch_size;
+        barrier_arrive(transfer_done, global_minibatch_idx);
+    }
+}
+
 static __device__ __forceinline__ void combine_kernel(
     const activation_pgl &peer_buf,
     const activation_gl &local_buf,
@@ -488,86 +568,6 @@ static __device__ __forceinline__ void combine_kernel(
     __syncthreads();
     if (tid == 0 && transfer_done != nullptr)
         barrier_arrive(*transfer_done, macrobatch_idx);
-}
-
-static __device__ __forceinline__ void dispatch_kernel(
-    const activation_pgl &peer_buf,
-    const activation_gl &local_buf,
-    const index_gl &schedule_peer_rank,
-    const index_gl &schedule_peer_token_idx,
-    const index_gl *transfer_ready,
-    const index_gl *buffer_ready,
-    const index_gl &transfer_done,
-    semaphore &inputs_arrived,
-    uint32_t &bitfield,
-    const int num_tokens,
-    const int macrobatch_size,
-    const int minibatch_size,
-    const int macrobatch_idx,
-    const int task_idx,
-    const int row_divisor,
-    const int buffer_ready_index,
-    const int buffer_ready_required_count,
-    const uint64_t smem_base_addr
-) {
-    auto &token_chunks = *reinterpret_cast<bf16 (*)[config::DISPATCH_Mb][config::DISPATCH_Nb]>(smem_base_addr);
-
-    const int tid = threadIdx.x;
-    const bool is_worker = tid < config::DISPATCH_Mb; // only these threads move tokens, but all threads join the barriers and waits
-
-    const int cols = local_buf.cols();
-    const int col_blocks = (cols + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
-
-    const int macrobatch_offset = macrobatch_idx * macrobatch_size;
-    const int num_macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
-    if (task_idx >= num_macrobatch_tokens / config::DISPATCH_Mb * col_blocks) return;
-
-    const int row_idx = task_idx / col_blocks * config::DISPATCH_Mb;
-    const int col_block_idx = task_idx % col_blocks;
-    const uint32_t chunk_bytes = min(config::DISPATCH_Nb, cols - col_block_idx * config::DISPATCH_Nb) * sizeof(bf16);
-
-    const int peer_rank = is_worker ? schedule_peer_rank[{macrobatch_offset + row_idx + tid}] : -1;
-    const int peer_token_idx = is_worker ? schedule_peer_token_idx[{macrobatch_offset + row_idx + tid}] : -1;
-    const int num_valid = __syncthreads_count(peer_rank >= 0);
-
-    if (tid == 0) {
-        if (transfer_ready != nullptr) {
-            // Dispatch can overwrite rows still read by the previous macrobatch's GEMMs, so wait for down GEMM completion
-            const int prev_macrobatch_offset = (macrobatch_idx - 1) * macrobatch_size;
-            const int global_minibatch_idx = (prev_macrobatch_offset + row_idx) / minibatch_size;
-            const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
-            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
-            barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
-        }
-        if (buffer_ready != nullptr)
-            barrier_wait(*buffer_ready, buffer_ready_index, buffer_ready_required_count);
-        tma::expect_bytes(inputs_arrived, num_valid * chunk_bytes);
-    }
-    __syncthreads();
-
-    if (peer_rank >= 0) {
-        tma::load_async(token_chunks[tid],
-                        &peer_buf[peer_rank].raw_ptr[static_cast<size_t>(peer_token_idx / row_divisor) * cols + col_block_idx * config::DISPATCH_Nb],
-                        chunk_bytes, inputs_arrived);
-    } else if (is_worker) { // zero-fill padding rows
-        auto *chunk = reinterpret_cast<float4 *>(token_chunks[tid]);
-        #pragma unroll
-        for (int i = 0; i < config::DISPATCH_Nb * static_cast<int>(sizeof(bf16)) / static_cast<int>(sizeof(float4)); ++i)
-            chunk[i] = float4{0.0f, 0.0f, 0.0f, 0.0f};
-    }
-
-    wait(inputs_arrived, get_phasebit<0>(bitfield, 0));
-    update_phasebit<0>(bitfield, 0);
-
-    if (is_worker)
-        tma::store_async(&local_buf.raw_ptr[static_cast<size_t>(row_idx + tid) * cols + col_block_idx * config::DISPATCH_Nb], token_chunks[tid], chunk_bytes);
-
-    tma::store_async_wait();
-    __syncthreads();
-    if (tid == 0) {
-        const int global_minibatch_idx = (macrobatch_offset + row_idx) / minibatch_size;
-        barrier_arrive(transfer_done, global_minibatch_idx);
-    }
 }
 
 template <bool IS_SHARED>
