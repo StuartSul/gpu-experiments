@@ -204,10 +204,14 @@ struct config {
     static constexpr int SWIGLU_FWD_PIPE_DEPTH = 3; // gate / up
     static constexpr int SWIGLU_BWD_PIPE_DEPTH = 2; // gate / up / d_hidden
 
-    // Dispatch/Combine
-    static constexpr int DISPATCH_COMBINE_Mb = 64;
-    static constexpr int DISPATCH_COMBINE_Nb = 256;
-    static constexpr int DISPATCH_COMBINE_PIPE_DEPTH = 7;
+    // Dispatch / Reverse-combine
+    static constexpr int DISPATCH_Mb = 64;
+    static constexpr int DISPATCH_Nb = 1024;
+
+    // Combine / Reverse-dispatch
+    static constexpr int COMBINE_Mb = 16;
+    static constexpr int COMBINE_Nb = 1024;
+    static constexpr int COMBINE_PIPE_DEPTH = 7;
     
     // Kernel launch
     static constexpr int CLC_PIPE_DEPTH = 1;
@@ -230,11 +234,8 @@ using mlp_d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PI
 // Fused SwiGLU tiles
 using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;
 
-// Dispatch/Combine tiles
-using dispatch_combine_vec = sv_bf<config::DISPATCH_COMBINE_Nb>;
-
 // Global layouts
-using activation_gl = gl<bf16, 1, 1, -1, -1, mlp_a_tile, mlp_a_t_tile, swiglu_tile, dispatch_combine_vec>;
+using activation_gl = gl<bf16, 1, 1, -1, -1, mlp_a_tile, mlp_a_t_tile, swiglu_tile>;
 using activation_pgl = pgl<activation_gl, NUM_DEVICES, false>;
 using weight_gl = gl<bf16, 1, -1, -1, -1, mlp_b_tile>;
 using index_gl = gl<int, 1, 1, 1, -1>;
@@ -395,15 +396,109 @@ static __device__ __forceinline__ void barrier_arrive(const index_gl &counter, i
     asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(&counter[{index}]), "r"(increment) : "memory");
 }
 
-template <bool IS_PULL>
-static __device__ __forceinline__ void dispatch_combine_kernel(
+static __device__ __forceinline__ void combine_kernel(
+    const activation_pgl &peer_buf,
+    const activation_gl &local_buf,
+    const index_gl &schedule_peer_rank,
+    const index_gl &schedule_peer_token_idx,
+    const index_gl &transfer_ready,
+    const index_gl *transfer_done,
+    semaphore (&inputs_arrived)[config::COMBINE_PIPE_DEPTH],
+    uint32_t &bitfield,
+    const int num_tokens,
+    const int macrobatch_size,
+    const int minibatch_size,
+    const int macrobatch_idx,
+    const int task_idx,
+    const uint64_t smem_base_addr
+) {
+    auto &token_chunks = *reinterpret_cast<bf16 (*)[config::COMBINE_PIPE_DEPTH][config::COMBINE_Mb][config::COMBINE_Nb]>(smem_base_addr);
+
+    const int tid = threadIdx.x;
+    const bool is_worker = tid < config::COMBINE_Mb; // only these threads move tokens, but all threads join the barriers and waits
+
+    const int cols = local_buf.cols();
+    const int col_blocks = (cols + config::COMBINE_Nb - 1) / config::COMBINE_Nb;
+    const int first_tile_idx = task_idx * config::COMBINE_PIPE_DEPTH;
+
+    const int macrobatch_offset = macrobatch_idx * macrobatch_size;
+    const int num_macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
+    const int num_valid_tiles = min(config::COMBINE_PIPE_DEPTH, num_macrobatch_tokens / config::COMBINE_Mb * col_blocks - first_tile_idx); // because we pad to 256
+    if (num_valid_tiles <= 0) return;
+
+    const int first_row_idx = first_tile_idx / col_blocks * config::COMBINE_Mb + tid;
+    const int first_col_block_idx = first_tile_idx % col_blocks;
+
+    int row_idx[config::COMBINE_PIPE_DEPTH], col_block_idx[config::COMBINE_PIPE_DEPTH], peer_rank[config::COMBINE_PIPE_DEPTH], 
+        peer_token_idx[config::COMBINE_PIPE_DEPTH], num_valid[config::COMBINE_PIPE_DEPTH];
+    #pragma unroll
+    for (int stage = 0, row = first_row_idx, col = first_col_block_idx; stage < config::COMBINE_PIPE_DEPTH; ++stage) {
+        const bool is_valid_tile = stage < num_valid_tiles;
+        row_idx[stage] = row;
+        col_block_idx[stage] = col;
+        peer_rank[stage] = is_valid_tile && is_worker ? schedule_peer_rank[{macrobatch_offset + row}] : -1;
+        peer_token_idx[stage] = is_valid_tile && is_worker ? schedule_peer_token_idx[{macrobatch_offset + row}] : -1;
+        num_valid[stage] = !is_valid_tile ? 0
+                         : (stage == 0 || col == 0) ? __syncthreads_count(peer_rank[stage] >= 0)
+                         : num_valid[stage - 1];
+        if (++col == col_blocks) { col = 0; row += config::COMBINE_Mb; }
+    }
+
+    auto chunk_bytes = [&](int col_block) {
+        return static_cast<uint32_t>(min(config::COMBINE_Nb, cols - col_block * config::COMBINE_Nb) * sizeof(bf16));
+    };
+
+    if (tid == 0) {
+        // Wait until the GEMMs have fully written every minibatch this task reads
+        const int first_global_minibatch_idx = (macrobatch_offset + first_row_idx) / minibatch_size;
+        const int last_global_minibatch_idx = (macrobatch_offset + (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::COMBINE_Mb) / minibatch_size;
+        for (int global_minibatch_idx = first_global_minibatch_idx; global_minibatch_idx <= last_global_minibatch_idx; ++global_minibatch_idx) {
+            const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (cols / config::MLP_Nb) * config::CLUSTER_SIZE;
+            barrier_wait(transfer_ready, global_minibatch_idx, required_count);
+        }
+        #pragma unroll
+        for (int stage = 0; stage < config::COMBINE_PIPE_DEPTH; ++stage)
+            if (stage < num_valid_tiles)
+                tma::expect_bytes(inputs_arrived[stage], num_valid[stage] * chunk_bytes(col_block_idx[stage]));
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int stage = 0; stage < config::COMBINE_PIPE_DEPTH; ++stage)
+        if (peer_rank[stage] >= 0)
+            tma::load_async(token_chunks[stage][tid],
+                            &local_buf.raw_ptr[static_cast<size_t>(row_idx[stage]) * cols + col_block_idx[stage] * config::COMBINE_Nb],
+                            chunk_bytes(col_block_idx[stage]), inputs_arrived[stage]);
+
+    // Store each tile out as its loads arrive
+    #pragma unroll
+    for (int stage = 0; stage < config::COMBINE_PIPE_DEPTH; ++stage) {
+        if (stage < num_valid_tiles) {
+            wait(inputs_arrived[stage], get_phasebit<0>(bitfield, stage)); // semaphores are reused across tasks
+            update_phasebit<0>(bitfield, stage);
+            if (peer_rank[stage] >= 0)
+                tma::store_async(&peer_buf[peer_rank[stage]].raw_ptr[static_cast<size_t>(peer_token_idx[stage]) * cols + col_block_idx[stage] * config::COMBINE_Nb],
+                                 token_chunks[stage][tid], chunk_bytes(col_block_idx[stage]));
+        }
+    }
+
+    // The next task on this CTA reuses token_chunks; make sure outgoing stores are done reading shared memory
+    tma::store_async_read_wait();
+    __syncthreads();
+    if (tid == 0 && transfer_done != nullptr)
+        barrier_arrive(*transfer_done, macrobatch_idx);
+}
+
+static __device__ __forceinline__ void dispatch_kernel(
     const activation_pgl &peer_buf,
     const activation_gl &local_buf,
     const index_gl &schedule_peer_rank,
     const index_gl &schedule_peer_token_idx,
     const index_gl *transfer_ready,
-    const index_gl *transfer_done,
-    semaphore (&inputs_arrived)[config::DISPATCH_COMBINE_PIPE_DEPTH],
+    const index_gl *buffer_ready,
+    const index_gl &transfer_done,
+    semaphore &inputs_arrived,
     uint32_t &bitfield,
     const int num_tokens,
     const int macrobatch_size,
@@ -411,108 +506,67 @@ static __device__ __forceinline__ void dispatch_combine_kernel(
     const int macrobatch_idx,
     const int task_idx,
     const int row_divisor,
-    const int transfer_ready_index,
-    const int transfer_ready_required_count,
+    const int buffer_ready_index,
+    const int buffer_ready_required_count,
     const uint64_t smem_base_addr
 ) {
-    auto &token_vecs = *reinterpret_cast<dispatch_combine_vec (*)[config::DISPATCH_COMBINE_PIPE_DEPTH][config::DISPATCH_COMBINE_Mb]>(smem_base_addr);
+    auto &token_chunks = *reinterpret_cast<bf16 (*)[config::DISPATCH_Mb][config::DISPATCH_Nb]>(smem_base_addr);
 
     const int tid = threadIdx.x;
-    const bool is_worker = tid < config::DISPATCH_COMBINE_Mb; // only these threads move tokens, but all threads join the barriers and waits
+    const bool is_worker = tid < config::DISPATCH_Mb; // only these threads move tokens, but all threads join the barriers and waits
 
-    const int col_blocks = local_buf.cols() / config::DISPATCH_COMBINE_Nb;
-    const int first_tile_idx = task_idx * config::DISPATCH_COMBINE_PIPE_DEPTH;
+    const int cols = local_buf.cols();
+    const int col_blocks = (cols + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
 
     const int macrobatch_offset = macrobatch_idx * macrobatch_size;
     const int num_macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
-    const int num_valid_tiles = min(config::DISPATCH_COMBINE_PIPE_DEPTH, num_macrobatch_tokens / config::DISPATCH_COMBINE_Mb * col_blocks - first_tile_idx); // because we pad to 256
-    if (num_valid_tiles <= 0) return;
+    if (task_idx >= num_macrobatch_tokens / config::DISPATCH_Mb * col_blocks) return;
 
-    const int first_row_idx = first_tile_idx / col_blocks * config::DISPATCH_COMBINE_Mb + tid;
-    const int first_col_block_idx = first_tile_idx % col_blocks;
+    const int row_idx = task_idx / col_blocks * config::DISPATCH_Mb;
+    const int col_block_idx = task_idx % col_blocks;
+    const uint32_t chunk_bytes = min(config::DISPATCH_Nb, cols - col_block_idx * config::DISPATCH_Nb) * sizeof(bf16);
 
-    int row_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], col_block_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], peer_rank[config::DISPATCH_COMBINE_PIPE_DEPTH], 
-        peer_token_idx[config::DISPATCH_COMBINE_PIPE_DEPTH], num_valid_rows[config::DISPATCH_COMBINE_PIPE_DEPTH];
-    #pragma unroll
-    for (int stage = 0, row = first_row_idx, col = first_col_block_idx; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
-        const bool is_valid_tile = stage < num_valid_tiles;
-        row_idx[stage] = row;
-        col_block_idx[stage] = col;
-        peer_rank[stage] = is_valid_tile && is_worker ? schedule_peer_rank[{macrobatch_offset + row}] : -1;
-        peer_token_idx[stage] = is_valid_tile && is_worker ? schedule_peer_token_idx[{macrobatch_offset + row}] : -1;
-        num_valid_rows[stage] = !is_valid_tile ? 0
-                              : (stage == 0 || col == 0) ? __syncthreads_count(peer_rank[stage] >= 0)
-                              : num_valid_rows[stage - 1];
-        if (++col == col_blocks) { col = 0; row += config::DISPATCH_COMBINE_Mb; }
-    }
+    const int peer_rank = is_worker ? schedule_peer_rank[{macrobatch_offset + row_idx + tid}] : -1;
+    const int peer_token_idx = is_worker ? schedule_peer_token_idx[{macrobatch_offset + row_idx + tid}] : -1;
+    const int num_valid = __syncthreads_count(peer_rank >= 0);
 
     if (tid == 0) {
-        if constexpr (IS_PULL) {
-            if (transfer_ready != nullptr) barrier_wait(*transfer_ready, transfer_ready_index, transfer_ready_required_count);
-        } else {
-            // Wait until the GEMMs have fully written every minibatch this task reads
-            const int first_global_minibatch_idx = (macrobatch_offset + first_row_idx) / minibatch_size;
-            const int last_global_minibatch_idx = (macrobatch_offset + (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::DISPATCH_COMBINE_Mb) / minibatch_size;
-            for (int global_minibatch_idx = first_global_minibatch_idx; global_minibatch_idx <= last_global_minibatch_idx; ++global_minibatch_idx) {
-                const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
-                const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
-                barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
-            }
+        if (transfer_ready != nullptr) {
+            // Dispatch can overwrite rows still read by the previous macrobatch's GEMMs, so wait for down GEMM completion
+            const int prev_macrobatch_offset = (macrobatch_idx - 1) * macrobatch_size;
+            const int global_minibatch_idx = (prev_macrobatch_offset + row_idx) / minibatch_size;
+            const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
+            barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
         }
-        #pragma unroll
-        for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage)
-            if (stage < num_valid_tiles)
-                tma::expect_bytes(inputs_arrived[stage], num_valid_rows[stage] * sizeof(dispatch_combine_vec)); // 0 bytes completes the phase immediately
+        if (buffer_ready != nullptr)
+            barrier_wait(*buffer_ready, buffer_ready_index, buffer_ready_required_count);
+        tma::expect_bytes(inputs_arrived, num_valid * chunk_bytes);
     }
     __syncthreads();
 
-    #pragma unroll
-    for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
-        if (peer_rank[stage] >= 0) {
-            if constexpr (IS_PULL)
-                tma::load_async(token_vecs[stage][tid], peer_buf[peer_rank[stage]], {peer_token_idx[stage] / row_divisor, col_block_idx[stage]}, inputs_arrived[stage]);
-            else
-                tma::load_async(token_vecs[stage][tid], local_buf, {row_idx[stage], col_block_idx[stage]}, inputs_arrived[stage]);
-        } else if (IS_PULL && is_worker && stage < num_valid_tiles) { // zero-fill padding rows
-            auto *vec = reinterpret_cast<float4 *>(&token_vecs[stage][tid]);
-            #pragma unroll
-            for (int i = 0; i < sizeof(dispatch_combine_vec) / sizeof(float4); ++i)
-                vec[i] = float4{0.0f, 0.0f, 0.0f, 0.0f};
-        }
+    if (peer_rank >= 0) {
+        tma::load_async(token_chunks[tid],
+                        &peer_buf[peer_rank].raw_ptr[static_cast<size_t>(peer_token_idx / row_divisor) * cols + col_block_idx * config::DISPATCH_Nb],
+                        chunk_bytes, inputs_arrived);
+    } else if (is_worker) { // zero-fill padding rows
+        auto *chunk = reinterpret_cast<float4 *>(token_chunks[tid]);
+        #pragma unroll
+        for (int i = 0; i < config::DISPATCH_Nb * static_cast<int>(sizeof(bf16)) / static_cast<int>(sizeof(float4)); ++i)
+            chunk[i] = float4{0.0f, 0.0f, 0.0f, 0.0f};
     }
 
-    // Store each tile out as its loads arrive
-    #pragma unroll
-    for (int stage = 0; stage < config::DISPATCH_COMBINE_PIPE_DEPTH; ++stage) {
-        if (stage < num_valid_tiles) {
-            wait(inputs_arrived[stage], get_phasebit<0>(bitfield, stage)); // semaphores are reused across tasks
-            update_phasebit<0>(bitfield, stage);
-            if constexpr (IS_PULL) { // store padding rows too
-                if (is_worker) tma::store_async(local_buf, token_vecs[stage][tid], {row_idx[stage], col_block_idx[stage]});
-            } else if (peer_rank[stage] >= 0) {
-                tma::store_async(peer_buf[peer_rank[stage]], token_vecs[stage][tid], {peer_token_idx[stage] / row_divisor, col_block_idx[stage]});
-            }
-        }
-    }
+    wait(inputs_arrived, get_phasebit<0>(bitfield, 0));
+    update_phasebit<0>(bitfield, 0);
 
-    if constexpr (IS_PULL) {
-        tma::store_async_wait();
-        __syncthreads();
-        if (tid == 0) {
-            const int tiles_per_minibatch = minibatch_size / config::DISPATCH_COMBINE_Mb * col_blocks; // a task straddles at most one minibatch boundary
-            const int global_first_tile_idx = macrobatch_offset / config::DISPATCH_COMBINE_Mb * col_blocks + first_tile_idx;
-            const int global_minibatch_idx = global_first_tile_idx / tiles_per_minibatch;
-            const int first_count = min(num_valid_tiles, (global_minibatch_idx + 1) * tiles_per_minibatch - global_first_tile_idx);
-            barrier_arrive(*transfer_done, global_minibatch_idx, first_count);
-            if (first_count < num_valid_tiles)
-                barrier_arrive(*transfer_done, global_minibatch_idx + 1, num_valid_tiles - first_count);
-        }
-    } else {
-        // The next task on this CTA reuses token_vecs; make sure outgoing stores are done reading shared memory
-        tma::store_async_read_wait();
-        __syncthreads();
-        if (tid == 0 && transfer_done != nullptr)
-            barrier_arrive(*transfer_done, macrobatch_idx);
+    if (is_worker)
+        tma::store_async(&local_buf.raw_ptr[static_cast<size_t>(row_idx + tid) * cols + col_block_idx * config::DISPATCH_Nb], token_chunks[tid], chunk_bytes);
+
+    tma::store_async_wait();
+    __syncthreads();
+    if (tid == 0) {
+        const int global_minibatch_idx = (macrobatch_offset + row_idx) / minibatch_size;
+        barrier_arrive(transfer_done, global_minibatch_idx);
     }
 }
 
@@ -881,7 +935,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                         if (input_minibatch_ready != nullptr) {
                             const int row_minibatch_idx = row / minibatch_size;
                             const int minibatch_rows = min(minibatch_size, num_tokens - row_minibatch_idx * minibatch_size);
-                            const int required_count = ((minibatch_rows + config::DISPATCH_COMBINE_Mb - 1) / config::DISPATCH_COMBINE_Mb) * (input_minibatch_ready_num_cols / config::DISPATCH_COMBINE_Nb);
+                            const int required_count = ((minibatch_rows + config::DISPATCH_Mb - 1) / config::DISPATCH_Mb) * ((input_minibatch_ready_num_cols + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb);
                             barrier_wait(*input_minibatch_ready, row_minibatch_idx, required_count);
                         }
                     }
@@ -898,7 +952,7 @@ static __device__ __forceinline__ void expert_grouped_gemm(
                 if (input_minibatch_ready != nullptr) {
                     const int minibatch_first_row = global_minibatch_idx * minibatch_size;
                     const int minibatch_rows = max(0, min(minibatch_size, num_tokens - minibatch_first_row));
-                    const int required_count = ((minibatch_rows + config::DISPATCH_COMBINE_Mb - 1) / config::DISPATCH_COMBINE_Mb) * (a_gmem.cols() / config::DISPATCH_COMBINE_Nb);
+                    const int required_count = ((minibatch_rows + config::DISPATCH_Mb - 1) / config::DISPATCH_Mb) * ((a_gmem.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb);
                     barrier_wait(*input_minibatch_ready, global_minibatch_idx, required_count);
                 }
                 for (int idx = 0; idx < iters_per_task; ++idx) {
@@ -1000,7 +1054,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
 
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_bitfield = 0xFFFF0000;
-    uint32_t dispatch_combine_bitfield = 0xFFFF0000;
+    uint32_t dispatch_bitfield = 0xFFFF0000;
+    uint32_t combine_bitfield = 0xFFFF0000;
 
     __shared__ clc::handle clc_handle[config::CLC_PIPE_DEPTH];
     __shared__ clc::handle clc_drain_handle[config::CLC_DRAIN_PIPE_DEPTH];
@@ -1010,7 +1065,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     __shared__ semaphore gemm_inputs_arrived[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_finished[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
-    __shared__ semaphore dispatch_combine_inputs_arrived[config::DISPATCH_COMBINE_PIPE_DEPTH];
+    __shared__ semaphore dispatch_inputs_arrived;
+    __shared__ semaphore combine_inputs_arrived[config::COMBINE_PIPE_DEPTH];
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -1033,9 +1089,10 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
         for (int i = 0; i < config::CLC_DRAIN_PIPE_DEPTH; ++i) {
             init_semaphore(drain_schedule_arrived[i], 0, 1);
         }
+        init_semaphore(dispatch_inputs_arrived, 0, 1);
         #pragma unroll
-        for (int i = 0; i < config::DISPATCH_COMBINE_PIPE_DEPTH; ++i) {
-            init_semaphore(dispatch_combine_inputs_arrived[i], 0, 1);
+        for (int i = 0; i < config::COMBINE_PIPE_DEPTH; ++i) {
+            init_semaphore(combine_inputs_arrived[i], 0, 1);
         }
     }
 
@@ -1046,28 +1103,37 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     if (cluster_idx < comm_clusters) {
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
         const int num_macrobatches = (num_tokens + macrobatch_size - 1) / macrobatch_size;
-        auto num_dispatch_combine_tasks = [&](int macrobatch_idx) {
+        auto num_dispatch_tasks = [&](int macrobatch_idx) {
             const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
-            const int dispatch_combine_tiles = (macrobatch_tokens / config::DISPATCH_COMBINE_Mb) * (g.x_routed.cols() / config::DISPATCH_COMBINE_Nb);
-            return (dispatch_combine_tiles + config::DISPATCH_COMBINE_PIPE_DEPTH - 1) / config::DISPATCH_COMBINE_PIPE_DEPTH;
+            const int dispatch_col_blocks = (g.x_routed.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
+            return (macrobatch_tokens / config::DISPATCH_Mb) * dispatch_col_blocks;
+        };
+        auto num_combine_tasks = [&](int macrobatch_idx) {
+            const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
+            const int combine_col_blocks = (g.y_routed.cols() + config::COMBINE_Nb - 1) / config::COMBINE_Nb;
+            const int combine_tiles = (macrobatch_tokens / config::COMBINE_Mb) * combine_col_blocks;
+            return (combine_tiles + config::COMBINE_PIPE_DEPTH - 1) / config::COMBINE_PIPE_DEPTH;
         };
         auto dispatch = [&](int macrobatch_idx, int task_idx) {
-            dispatch_combine_kernel<true>(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                          nullptr, &g.x_routed_ready, dispatch_combine_inputs_arrived, dispatch_combine_bitfield,
-                                          num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk, 0, 0, smem_base_addr);
+            dispatch_kernel(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
+                            macrobatch_idx > 0 ? &g.y_routed_ready : nullptr, nullptr, g.x_routed_ready,
+                            dispatch_inputs_arrived, dispatch_bitfield,
+                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
+                            0, 0, smem_base_addr);
         };
         auto combine = [&](int macrobatch_idx, int task_idx) {
-            dispatch_combine_kernel<false>(g.y_routed_recv_buffer, g.y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                           &g.y_routed_ready, nullptr, dispatch_combine_inputs_arrived, dispatch_combine_bitfield,
-                                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, 1, 0, 0, smem_base_addr);
+            combine_kernel(g.y_routed_recv_buffer, g.y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
+                           g.y_routed_ready, nullptr, combine_inputs_arrived, combine_bitfield,
+                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
         };
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_combine_tasks(0); task_idx += g.num_comm_sms)
+        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks(0); task_idx += g.num_comm_sms)
             dispatch(0, task_idx);
         for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
-            const int combine_tasks = num_dispatch_combine_tasks(macrobatch_idx);
-            const int dispatch_tasks = macrobatch_idx + 1 < num_macrobatches ? num_dispatch_combine_tasks(macrobatch_idx + 1) : 0;
-            for (int task_idx = comm_cta_idx; task_idx < combine_tasks; task_idx += g.num_comm_sms) {
-                combine(macrobatch_idx, task_idx);
+            const int combine_tasks = num_combine_tasks(macrobatch_idx);
+            const int dispatch_tasks = macrobatch_idx + 1 < num_macrobatches ? num_dispatch_tasks(macrobatch_idx + 1) : 0;
+            for (int task_idx = comm_cta_idx; task_idx < max(combine_tasks, dispatch_tasks); task_idx += g.num_comm_sms) {
+                if (task_idx < combine_tasks)
+                    combine(macrobatch_idx, task_idx);
                 if (task_idx < dispatch_tasks)
                     dispatch(macrobatch_idx + 1, task_idx);
             }
@@ -1338,13 +1404,19 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
     auto macrobatch_idx_of = [&](int i) { return i == 0 ? num_macrobatches - 1 : i - 1; }; // TODO: change order
     auto num_minibatches_of = [&](int macrobatch_idx) { return (min(num_tokens - macrobatch_idx * macrobatch_size, macrobatch_size) + g.minibatch_size - 1) / g.minibatch_size; };
-    auto num_dispatch_combine_tasks_of = [&](int macrobatch_idx) {
+    auto num_dispatch_tasks_of = [&](int macrobatch_idx) {
         const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
-        const int tiles = (macrobatch_tokens / config::DISPATCH_COMBINE_Mb) * (g.d_y_shared.cols() / config::DISPATCH_COMBINE_Nb);
-        return (tiles + config::DISPATCH_COMBINE_PIPE_DEPTH - 1) / config::DISPATCH_COMBINE_PIPE_DEPTH;
+        const int col_blocks = (g.d_y_shared.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
+        return (macrobatch_tokens / config::DISPATCH_Mb) * col_blocks;
+    };
+    auto num_combine_tasks_of = [&](int macrobatch_idx) {
+        const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
+        const int col_blocks = (g.d_y_shared.cols() + config::COMBINE_Nb - 1) / config::COMBINE_Nb;
+        const int tiles = (macrobatch_tokens / config::COMBINE_Mb) * col_blocks;
+        return (tiles + config::COMBINE_PIPE_DEPTH - 1) / config::COMBINE_PIPE_DEPTH;
     };
     auto routed_buffers_done_required_count_of = [&](int macrobatch_idx) {
-        return config::CLUSTER_SIZE * (num_minibatches_of(macrobatch_idx) * minibatch_routed_bwd_tasks + wgrad_tasks) + num_dispatch_combine_tasks_of(macrobatch_idx);
+        return config::CLUSTER_SIZE * (num_minibatches_of(macrobatch_idx) * minibatch_routed_bwd_tasks + wgrad_tasks) + num_combine_tasks_of(macrobatch_idx);
     };
 
     const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
@@ -1366,7 +1438,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     uint32_t gemm_bitfield = 0xFFFF0000;
     uint32_t swiglu_fwd_bitfield = 0xFFFF0000;
     uint32_t swiglu_bwd_bitfield = 0xFFFF0000;
-    uint32_t dispatch_combine_bitfield = 0xFFFF0000;
+    uint32_t dispatch_bitfield = 0xFFFF0000;
+    uint32_t combine_bitfield = 0xFFFF0000;
 
     __shared__ clc::handle clc_handle[config::CLC_PIPE_DEPTH];
     __shared__ clc::handle clc_drain_handle[config::CLC_DRAIN_PIPE_DEPTH];
@@ -1377,7 +1450,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     __shared__ semaphore gemm_inputs_arrived[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_finished[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
-    __shared__ semaphore dispatch_combine_inputs_arrived[config::DISPATCH_COMBINE_PIPE_DEPTH];
+    __shared__ semaphore dispatch_inputs_arrived;
+    __shared__ semaphore combine_inputs_arrived[config::COMBINE_PIPE_DEPTH];
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -1404,9 +1478,10 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         for (int i = 0; i < config::CLC_DRAIN_PIPE_DEPTH; ++i) {
             init_semaphore(drain_schedule_arrived[i], 0, 1);
         }
+        init_semaphore(dispatch_inputs_arrived, 0, 1);
         #pragma unroll
-        for (int i = 0; i < config::DISPATCH_COMBINE_PIPE_DEPTH; ++i) {
-            init_semaphore(dispatch_combine_inputs_arrived[i], 0, 1);
+        for (int i = 0; i < config::COMBINE_PIPE_DEPTH; ++i) {
+            init_semaphore(combine_inputs_arrived[i], 0, 1);
         }
     }
 
@@ -1418,36 +1493,35 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
         auto reverse_combine = [&](int i, int task_idx) {
             const int prev_macrobatch_idx = i > 0 ? macrobatch_idx_of(i - 1) : 0;
-            dispatch_combine_kernel<true>(g.d_combine_buffer, g.d_y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                          i > 0 ? &g.routed_buffers_done : nullptr, &g.d_y_routed_ready,
-                                          dispatch_combine_inputs_arrived, dispatch_combine_bitfield,
-                                          num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, 1,
-                                          prev_macrobatch_idx, i > 0 ? routed_buffers_done_required_count_of(prev_macrobatch_idx) : 0, smem_base_addr);
+            dispatch_kernel(g.d_combine_buffer, g.d_y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
+                            nullptr, i > 0 ? &g.routed_buffers_done : nullptr, g.d_y_routed_ready,
+                            dispatch_inputs_arrived, dispatch_bitfield,
+                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, 1,
+                            prev_macrobatch_idx, i > 0 ? routed_buffers_done_required_count_of(prev_macrobatch_idx) : 0, smem_base_addr);
         };
         auto reverse_dispatch = [&](int i, int task_idx) {
-            dispatch_combine_kernel<false>(g.d_x_routed_buffer, g.d_x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                           &g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
-                                           dispatch_combine_inputs_arrived, dispatch_combine_bitfield,
-                                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, 1,
-                                           0, 0, smem_base_addr);
+            combine_kernel(g.d_x_routed_buffer, g.d_x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
+                           g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
+                           combine_inputs_arrived, combine_bitfield,
+                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, smem_base_addr);
         };
         auto replay_dispatch = [&](int i, int task_idx) {
             const int prev_macrobatch_idx = macrobatch_idx_of(i - 1);
-            dispatch_combine_kernel<true>(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                          &g.routed_buffers_done, &g.replayed_x_routed_ready,
-                                          dispatch_combine_inputs_arrived, dispatch_combine_bitfield,
-                                          num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, g.topk,
-                                          prev_macrobatch_idx, routed_buffers_done_required_count_of(prev_macrobatch_idx), smem_base_addr);
+            dispatch_kernel(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
+                            nullptr, &g.routed_buffers_done, g.replayed_x_routed_ready,
+                            dispatch_inputs_arrived, dispatch_bitfield,
+                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, g.topk,
+                            prev_macrobatch_idx, routed_buffers_done_required_count_of(prev_macrobatch_idx), smem_base_addr);
         };
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_combine_tasks_of(macrobatch_idx_of(0)); task_idx += g.num_comm_sms)
+        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx_of(0)); task_idx += g.num_comm_sms)
             reverse_combine(0, task_idx);
         for (int i = 0; i < num_macrobatches; ++i) {
             // All reverse-dispatch tasks must complete before this CTA moves on: the next macrobatch's pulls
             // wait on routed_buffers_done, which counts every rank's reverse-dispatch arrivals (including this CTA's)
-            for (int task_idx = comm_cta_idx; task_idx < num_dispatch_combine_tasks_of(macrobatch_idx_of(i)); task_idx += g.num_comm_sms)
+            for (int task_idx = comm_cta_idx; task_idx < num_combine_tasks_of(macrobatch_idx_of(i)); task_idx += g.num_comm_sms)
                 reverse_dispatch(i, task_idx);
             if (i + 1 < num_macrobatches) {
-                for (int task_idx = comm_cta_idx; task_idx < num_dispatch_combine_tasks_of(macrobatch_idx_of(i + 1)); task_idx += g.num_comm_sms) {
+                for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx_of(i + 1)); task_idx += g.num_comm_sms) {
                     reverse_combine(i + 1, task_idx);
                     replay_dispatch(i + 1, task_idx);
                 }
