@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _C import (
     mxfp8_quantize,
     schedule,
-    dispatch_mlp_swiglu_combine,
+    dispatch_mlp_swiglu_combine_fwd,
     fwd_epilogue
 )
 
@@ -157,7 +157,7 @@ def main():
          gate_shared, gate_fp8_routed, gate_sc_routed,
          up_shared, up_fp8_routed, up_sc_routed,
          hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-         y_shared, y_routed) = dispatch_mlp_swiglu_combine(
+         y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd(
             x_buffer, x_buffer_ptrs, combine_buffer, combine_buffer_ptrs,
             w_shared_gate, w_routed_gate_fp8, w_routed_gate_sc,
             w_shared_up, w_routed_up_fp8, w_routed_up_sc,
@@ -250,16 +250,14 @@ def main():
     hidden_routed_t_dequant_ref = dequant(*mxfp8_quantize_ref(hidden_routed_ref.T.contiguous()))
 
     # Correctness checks for all returned tensors and final output
-    # The routed buffers end up holding the last macrobatch's rows
-    num_macrobatches = max(1, (total_routed_tokens + MACROBATCH_SIZE - 1) // MACROBATCH_SIZE)
-    last_macrobatch_start = (num_macrobatches - 1) * MACROBATCH_SIZE
-    last_macrobatch_rows = total_routed_tokens - last_macrobatch_start
-    last_macrobatch_valid = valid[last_macrobatch_start:total_routed_tokens]
+    # The forward processes macrobatches in reverse, leaving macrobatch 0 resident in the routed buffers
+    macrobatch_rows = min(total_routed_tokens, MACROBATCH_SIZE)
+    macrobatch_valid = valid[:macrobatch_rows]
 
     def get_valid_rows(out, ref):
-        return out[:last_macrobatch_rows][last_macrobatch_valid], ref[last_macrobatch_start:total_routed_tokens][last_macrobatch_valid]
+        return out[:macrobatch_rows][macrobatch_valid], ref[:macrobatch_rows][macrobatch_valid]
     def get_valid_cols(out_t, ref_t):
-        return out_t[:, :last_macrobatch_rows][:, last_macrobatch_valid], ref_t[:, last_macrobatch_start:total_routed_tokens][:, last_macrobatch_valid]
+        return out_t[:, :macrobatch_rows][:, macrobatch_valid], ref_t[:, :macrobatch_rows][:, macrobatch_valid]
 
     difference_stats = []
     for name, out, ref in (
