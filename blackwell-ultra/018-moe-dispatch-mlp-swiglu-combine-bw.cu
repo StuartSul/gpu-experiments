@@ -236,7 +236,7 @@ using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;
 
 // Global layouts
 using activation_gl = gl<bf16, 1, 1, -1, -1, mlp_a_tile, mlp_a_t_tile, swiglu_tile>;
-using activation_pgl = pgl<activation_gl, NUM_DEVICES, false>;
+using activation_pgl = pgl<gl<bf16, 1, 1, -1, -1>, NUM_DEVICES, false>;
 using weight_gl = gl<bf16, 1, -1, -1, -1, mlp_b_tile>;
 using index_gl = gl<int, 1, 1, 1, -1>;
 
