@@ -412,7 +412,7 @@ static __device__ __forceinline__ void dispatch_kernel(
     const int macrobatch_idx,
     const int task_idx,
     const int row_divisor,
-    const int buffer_ready_index,
+    const int previous_macrobatch_idx,
     const int buffer_ready_required_count,
     const uint64_t smem_base_addr
 ) {
@@ -438,15 +438,18 @@ static __device__ __forceinline__ void dispatch_kernel(
 
     if (tid == 0) {
         if (transfer_ready != nullptr) {
-            // Dispatch can overwrite rows still read by the previous macrobatch's GEMMs, so wait for down GEMM completion
-            const int prev_macrobatch_offset = (macrobatch_idx - 1) * macrobatch_size;
-            const int global_minibatch_idx = (prev_macrobatch_offset + row_idx) / minibatch_size;
-            const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
-            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
-            barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
+            // Dispatch can overwrite rows still read by the previously processed macrobatch's GEMMs.
+            const int previous_macrobatch_offset = previous_macrobatch_idx * macrobatch_size;
+            const int previous_macrobatch_tokens = min(macrobatch_size, num_tokens - previous_macrobatch_offset);
+            if (row_idx < previous_macrobatch_tokens) { // otherwise, previous macrobatch was partial & no need to wait
+                const int global_minibatch_idx = (previous_macrobatch_offset + row_idx) / minibatch_size;
+                const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+                const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (local_buf.cols() / config::MLP_Nb) * config::CLUSTER_SIZE;
+                barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
+            }
         }
         if (buffer_ready != nullptr)
-            barrier_wait(*buffer_ready, buffer_ready_index, buffer_ready_required_count);
+            barrier_wait(*buffer_ready, previous_macrobatch_idx, buffer_ready_required_count);
         tma::expect_bytes(inputs_arrived, num_valid * chunk_bytes);
     }
     __syncthreads();
@@ -1043,7 +1046,10 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     const int macrobatch_size = g.macrobatch_size;
 
     const int num_tokens = g.num_tokens[{0}];
+    const int num_macrobatches = (num_tokens + macrobatch_size - 1) / macrobatch_size;
+    const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
     const int true_num_global_minibatches = (num_tokens + g.minibatch_size - 1) / g.minibatch_size;
+    const int last_macrobatch_num_minibatches = true_num_global_minibatches - (num_macrobatches - 1) * minibatches_per_macrobatch;
     const int true_num_clusters = comm_clusters + shared_tasks + true_num_global_minibatches * minibatch_tasks;
     if (cluster_idx >= true_num_clusters) return;
 
@@ -1102,7 +1108,6 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
 
     if (cluster_idx < comm_clusters) {
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
-        const int num_macrobatches = (num_tokens + macrobatch_size - 1) / macrobatch_size;
         auto num_dispatch_tasks = [&](int macrobatch_idx) {
             const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
             const int dispatch_col_blocks = (g.x_routed.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
@@ -1116,26 +1121,27 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
         };
         auto dispatch = [&](int macrobatch_idx, int task_idx) {
             dispatch_kernel(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                            macrobatch_idx > 0 ? &g.y_routed_ready : nullptr, nullptr, g.x_routed_ready,
+                            macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_ready : nullptr, nullptr, g.x_routed_ready,
                             dispatch_inputs_arrived, dispatch_bitfield,
                             num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
-                            0, 0, smem_base_addr);
+                            macrobatch_idx + 1, 0, smem_base_addr);
         };
         auto combine = [&](int macrobatch_idx, int task_idx) {
             combine_kernel(g.y_routed_recv_buffer, g.y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
                            g.y_routed_ready, nullptr, combine_inputs_arrived, combine_bitfield,
                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
         };
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks(0); task_idx += g.num_comm_sms)
-            dispatch(0, task_idx);
-        for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
+        if (num_macrobatches == 0) return;
+        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks(num_macrobatches - 1); task_idx += g.num_comm_sms)
+            dispatch(num_macrobatches - 1, task_idx);
+        for (int macrobatch_idx = num_macrobatches - 1; macrobatch_idx >= 0; --macrobatch_idx) {
             const int combine_tasks = num_combine_tasks(macrobatch_idx);
-            const int dispatch_tasks = macrobatch_idx + 1 < num_macrobatches ? num_dispatch_tasks(macrobatch_idx + 1) : 0;
+            const int dispatch_tasks = macrobatch_idx > 0 ? num_dispatch_tasks(macrobatch_idx - 1) : 0;
             for (int task_idx = comm_cta_idx; task_idx < max(combine_tasks, dispatch_tasks); task_idx += g.num_comm_sms) {
                 if (task_idx < combine_tasks)
                     combine(macrobatch_idx, task_idx);
                 if (task_idx < dispatch_tasks)
-                    dispatch(macrobatch_idx + 1, task_idx);
+                    dispatch(macrobatch_idx - 1, task_idx);
             }
         }
         return;
@@ -1199,11 +1205,17 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                       0, 0, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
         } else {
             // Routed expert with macro/minibatching
-            const int global_minibatch_idx = (compute_cluster_idx - shared_tasks) / minibatch_tasks;
-            const int minibatch_task_idx = (compute_cluster_idx - shared_tasks) - global_minibatch_idx * minibatch_tasks;
-            const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
-            const int macrobatch_idx = global_minibatch_idx / minibatches_per_macrobatch;
-            const int minibatch_idx = global_minibatch_idx - macrobatch_idx * minibatches_per_macrobatch;
+            const int task_ordered_global_minibatch_idx = (compute_cluster_idx - shared_tasks) / minibatch_tasks;
+            const int minibatch_task_idx = (compute_cluster_idx - shared_tasks) - task_ordered_global_minibatch_idx * minibatch_tasks;
+            int macrobatch_idx, minibatch_idx;
+            if (task_ordered_global_minibatch_idx < last_macrobatch_num_minibatches) {
+                macrobatch_idx = num_macrobatches - 1;
+                minibatch_idx = task_ordered_global_minibatch_idx;
+            } else {
+                const int idx = task_ordered_global_minibatch_idx - last_macrobatch_num_minibatches;
+                macrobatch_idx = num_macrobatches - 2 - idx / minibatches_per_macrobatch;
+                minibatch_idx = idx % minibatches_per_macrobatch;
+            }
 
             if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                 // Routed gate
@@ -1401,8 +1413,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     const int macrobatch_size = g.macrobatch_size;
     const int num_tokens = g.num_tokens[{0}];
     const int num_macrobatches = (num_tokens + macrobatch_size - 1) / macrobatch_size;
+    const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
 
-    auto macrobatch_idx_of = [&](int i) { return i == 0 ? num_macrobatches - 1 : i - 1; }; // TODO: change order
     auto num_minibatches_of = [&](int macrobatch_idx) { return (min(num_tokens - macrobatch_idx * macrobatch_size, macrobatch_size) + g.minibatch_size - 1) / g.minibatch_size; };
     auto num_dispatch_tasks_of = [&](int macrobatch_idx) {
         const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_idx * macrobatch_size);
@@ -1419,13 +1431,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         return config::CLUSTER_SIZE * (num_minibatches_of(macrobatch_idx) * minibatch_routed_bwd_tasks + wgrad_tasks) + num_combine_tasks_of(macrobatch_idx);
     };
 
-    const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
-    const int last_macrobatch_idx = num_macrobatches - 1;
-    const int last_num_minibatches = num_minibatches_of(last_macrobatch_idx);
-    const int saved_macrobatch_tasks = last_num_minibatches * minibatch_routed_bwd_tasks + wgrad_tasks;
-    const int replayed_macrobatch_tasks = minibatches_per_macrobatch * (minibatch_routed_replay_tasks + minibatch_routed_bwd_tasks) + wgrad_tasks;
     const int num_minibatches = (num_tokens + g.minibatch_size - 1) / g.minibatch_size;
-    const int num_replay_minibatches = (num_macrobatches - 1) * minibatches_per_macrobatch;
+    const int saved_macrobatch_num_minibatches = num_minibatches_of(0);
+    const int saved_macrobatch_tasks = saved_macrobatch_num_minibatches * minibatch_routed_bwd_tasks + wgrad_tasks;
+    const int replayed_macrobatch_tasks = minibatches_per_macrobatch * (minibatch_routed_replay_tasks + minibatch_routed_bwd_tasks) + wgrad_tasks;
+    const int num_replay_minibatches = num_minibatches - saved_macrobatch_num_minibatches;
     const int true_num_clusters = comm_clusters + shared_tasks + num_minibatches * minibatch_routed_bwd_tasks +
                                   num_replay_minibatches * minibatch_routed_replay_tasks + num_macrobatches * wgrad_tasks;
     if (cluster_idx >= true_num_clusters) return;
@@ -1491,39 +1501,37 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
     if (cluster_idx < comm_clusters) {
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
-        auto reverse_combine = [&](int i, int task_idx) {
-            const int prev_macrobatch_idx = i > 0 ? macrobatch_idx_of(i - 1) : 0;
+        auto reverse_combine = [&](int macrobatch_idx, int task_idx) {
             dispatch_kernel(g.d_combine_buffer, g.d_y_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
-                            nullptr, i > 0 ? &g.routed_buffers_done : nullptr, g.d_y_routed_ready,
+                            nullptr, macrobatch_idx > 0 ? &g.routed_buffers_done : nullptr, g.d_y_routed_ready,
                             dispatch_inputs_arrived, dispatch_bitfield,
-                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, 1,
-                            prev_macrobatch_idx, i > 0 ? routed_buffers_done_required_count_of(prev_macrobatch_idx) : 0, smem_base_addr);
+                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, 1,
+                            macrobatch_idx - 1, macrobatch_idx > 0 ? routed_buffers_done_required_count_of(macrobatch_idx - 1) : 0, smem_base_addr);
         };
-        auto reverse_dispatch = [&](int i, int task_idx) {
+        auto reverse_dispatch = [&](int macrobatch_idx, int task_idx) {
             combine_kernel(g.d_x_routed_buffer, g.d_x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
                            g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
                            combine_inputs_arrived, combine_bitfield,
-                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, smem_base_addr);
+                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
         };
-        auto replay_dispatch = [&](int i, int task_idx) {
-            const int prev_macrobatch_idx = macrobatch_idx_of(i - 1);
+        auto replay_dispatch = [&](int macrobatch_idx, int task_idx) {
             dispatch_kernel(g.x_routed_send_buffer, g.x_routed, g.schedule_peer_rank, g.schedule_peer_token_idx,
                             nullptr, &g.routed_buffers_done, g.replayed_x_routed_ready,
                             dispatch_inputs_arrived, dispatch_bitfield,
-                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx_of(i), task_idx, g.topk,
-                            prev_macrobatch_idx, routed_buffers_done_required_count_of(prev_macrobatch_idx), smem_base_addr);
+                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
+                            macrobatch_idx - 1, routed_buffers_done_required_count_of(macrobatch_idx - 1), smem_base_addr);
         };
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx_of(0)); task_idx += g.num_comm_sms)
+        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(0); task_idx += g.num_comm_sms)
             reverse_combine(0, task_idx);
-        for (int i = 0; i < num_macrobatches; ++i) {
+        for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
             // All reverse-dispatch tasks must complete before this CTA moves on: the next macrobatch's pulls
             // wait on routed_buffers_done, which counts every rank's reverse-dispatch arrivals (including this CTA's)
-            for (int task_idx = comm_cta_idx; task_idx < num_combine_tasks_of(macrobatch_idx_of(i)); task_idx += g.num_comm_sms)
-                reverse_dispatch(i, task_idx);
-            if (i + 1 < num_macrobatches) {
-                for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx_of(i + 1)); task_idx += g.num_comm_sms) {
-                    reverse_combine(i + 1, task_idx);
-                    replay_dispatch(i + 1, task_idx);
+            for (int task_idx = comm_cta_idx; task_idx < num_combine_tasks_of(macrobatch_idx); task_idx += g.num_comm_sms)
+                reverse_dispatch(macrobatch_idx, task_idx);
+            if (macrobatch_idx + 1 < num_macrobatches) {
+                for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx + 1); task_idx += g.num_comm_sms) {
+                    reverse_combine(macrobatch_idx + 1, task_idx);
+                    replay_dispatch(macrobatch_idx + 1, task_idx);
                 }
             }
         }
@@ -1536,21 +1544,23 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         else if (compute_cluster_idx < shared_dgrad_down_tasks) return false; // shared dgrad down
         else if (compute_cluster_idx < shared_dgrad_down_tasks + shared_swiglu_bwd_tasks) return true; // shared swiglu bwd
         else if (compute_cluster_idx < shared_tasks) return false; // shared dgrad/wgrad
+        else if (compute_cluster_idx >= true_num_clusters - comm_clusters) return false;
 
         int idx = compute_cluster_idx - shared_tasks;
-        int num_minibatches, macrobatch_task_idx;
+        int macrobatch_num_minibatches, macrobatch_task_idx;
         if (idx < saved_macrobatch_tasks) {
-            num_minibatches = last_num_minibatches;
+            macrobatch_num_minibatches = saved_macrobatch_num_minibatches;
             macrobatch_task_idx = idx;
         } else {
             idx -= saved_macrobatch_tasks;
-            num_minibatches = minibatches_per_macrobatch;
+            const int macrobatch_idx = 1 + idx / replayed_macrobatch_tasks;
+            macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
             macrobatch_task_idx = idx % replayed_macrobatch_tasks;
-            if (macrobatch_task_idx < num_minibatches * minibatch_routed_replay_tasks)
+            if (macrobatch_task_idx < macrobatch_num_minibatches * minibatch_routed_replay_tasks)
                 return macrobatch_task_idx % minibatch_routed_replay_tasks >= 2 * minibatch_routed_gate_up_tasks; // swiglu fwd replay
-            macrobatch_task_idx -= num_minibatches * minibatch_routed_replay_tasks;
+            macrobatch_task_idx -= macrobatch_num_minibatches * minibatch_routed_replay_tasks;
         }
-        if (macrobatch_task_idx >= num_minibatches * minibatch_routed_bwd_tasks) return false; // wgrad
+        if (macrobatch_task_idx >= macrobatch_num_minibatches * minibatch_routed_bwd_tasks) return false; // wgrad
         const int minibatch_task_idx = macrobatch_task_idx % minibatch_routed_bwd_tasks;
         return minibatch_task_idx >= minibatch_routed_dgrad_down_tasks &&
                minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks; // swiglu bwd
@@ -1623,16 +1633,13 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         } else {
             // Routed / replay tasks
             const int global_routed_task_idx = compute_cluster_idx - shared_tasks;
-            const int macrobatch_idx = global_routed_task_idx < saved_macrobatch_tasks
-                ? last_macrobatch_idx
-                : (global_routed_task_idx - saved_macrobatch_tasks) / replayed_macrobatch_tasks;
-            const bool replayed = macrobatch_idx != last_macrobatch_idx;
-            const int num_minibatches = num_minibatches_of(macrobatch_idx);
-            const int num_replay_tasks = replayed ? num_minibatches * minibatch_routed_replay_tasks : 0;
-            const int num_routed_tasks = num_minibatches * minibatch_routed_bwd_tasks;
-            const int macrobatch_task_idx = replayed
-                ? (global_routed_task_idx - saved_macrobatch_tasks) % replayed_macrobatch_tasks
-                : global_routed_task_idx;
+            const bool replayed = global_routed_task_idx >= saved_macrobatch_tasks;
+            const int replayed_task_idx = global_routed_task_idx - saved_macrobatch_tasks;
+            const int macrobatch_idx = replayed ? 1 + replayed_task_idx / replayed_macrobatch_tasks : 0;
+            const int macrobatch_task_idx = replayed ? replayed_task_idx % replayed_macrobatch_tasks : global_routed_task_idx;
+            const int macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
+            const int num_replay_tasks = replayed ? macrobatch_num_minibatches * minibatch_routed_replay_tasks : 0;
+            const int num_routed_tasks = macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
 
             if (macrobatch_task_idx < num_replay_tasks) {
                 const int minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;

@@ -279,10 +279,11 @@ def main():
         d_x_routed_buffer_ref[schedule_peer_token_idx_all[dst_rank, dst_valid].long()] = d_x_routed_all[dst_rank, dst_valid]
     d_x_ref = bwd_epilogue(mlp_swiglu_bwd_refs[0], d_x_routed_buffer_ref)
 
-    # Correctness checks for all returned tensors and final outputs. The routed buffers hold a single, last-remaining macrobatch
+    # Correctness checks for all returned tensors and final outputs
+    # Forward leaves macrobatch 0 resident; backward leaves the last macrobatch resident.
     num_macrobatches = max(1, (total_routed_tokens + MACROBATCH_SIZE - 1) // MACROBATCH_SIZE)
-    fwd_macrobatch_start = (num_macrobatches - 1) * MACROBATCH_SIZE
-    bwd_macrobatch_start = fwd_macrobatch_start if num_macrobatches == 1 else (num_macrobatches - 2) * MACROBATCH_SIZE
+    fwd_macrobatch_start = 0
+    bwd_macrobatch_start = (num_macrobatches - 1) * MACROBATCH_SIZE
     names = ("gate_shared", "gate_routed", "up_shared", "up_routed", "hidden_shared", "hidden_routed", "y_shared", "y_routed", "combine_buffer", "output",
              "d_x", "d_x_routed", "d_gate_shared", "d_gate_routed", "d_up_shared", "d_up_routed", "d_hidden_shared", "d_hidden_routed", "d_y_routed",
              "d_w_shared_gate", "d_w_routed_gate", "d_w_shared_up", "d_w_routed_up", "d_w_shared_down", "d_w_routed_down")
