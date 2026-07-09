@@ -30,7 +30,8 @@ HIDDEN_DIM = 7168
 INTERMEDIATE_DIM = 2048
 NUM_LOCAL_EXPERTS = 4
 TOPK = 8
-NUM_COMM_SMS = 40
+NUM_FWD_COMM_SMS = int(os.environ.get("FWD_COMM_SMS", "40"))
+NUM_BWD_COMM_SMS = int(os.environ.get("BWD_COMM_SMS", "40"))
 MINIBATCH_SIZE = 16384
 MACROBATCH_SIZE = 8 * MINIBATCH_SIZE
 
@@ -288,7 +289,7 @@ def main():
             w_shared_up, w_routed_up_fp8, w_routed_up_sc,
             w_shared_down, w_routed_down_fp8, w_routed_down_sc,
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
+            TOPK, NUM_FWD_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
         )
         dist.barrier(async_op=True).block_current_stream()
         output = fwd_epilogue(y_shared, combine_buffer, topk_weights)
@@ -318,7 +319,7 @@ def main():
             x_buffer, x_buffer_ptrs,
             w_routed_gate_fp8, w_routed_gate_sc, w_routed_up_fp8, w_routed_up_sc,
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
+            TOPK, NUM_BWD_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
         )
         dist.barrier(async_op=True).block_current_stream()
         d_x = bwd_epilogue(d_x_shared, d_x_routed_buffer)
