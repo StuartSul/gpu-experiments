@@ -18,7 +18,10 @@ from _C import (
     mxfp8_quantize,
     schedule,
     dispatch_mlp_swiglu_combine_fwd,
-    fwd_epilogue
+    dispatch_mlp_swiglu_combine_bwd,
+    fwd_epilogue,
+    bwd_prologue,
+    bwd_epilogue
 )
 
 
@@ -68,7 +71,11 @@ def dequant(x_fp8, sc_unswizzled):
     ).view(*E, M, K).to(torch.bfloat16)
 
 
-def mlp_swiglu_ref(
+def quant_and_dequant(x):
+    return dequant(*mxfp8_quantize_ref(x))
+
+
+def mlp_swiglu_fwd_ref(
     x_shared, x_routed,
     w_shared_gate, w_routed_gate,
     w_shared_up, w_routed_up,
@@ -80,11 +87,13 @@ def mlp_swiglu_ref(
         w_fp8, w_sc = mxfp8_quantize_ref(w)
         return dequant(x_fp8, x_sc) @ dequant(w_fp8, w_sc).T
 
+    # Shared expert
     gate_shared = x_shared @ w_shared_gate.T
     up_shared = x_shared @ w_shared_up.T
     hidden_shared = (F.silu(gate_shared.float()) * up_shared.float()).to(torch.bfloat16)
     y_shared = hidden_shared @ w_shared_down.T
 
+    # Routed expert
     gate_routed = torch.empty(x_routed.size(0), w_routed_gate.size(1), device=x_routed.device, dtype=x_routed.dtype)
     up_routed = torch.empty_like(gate_routed)
     hidden_routed = torch.empty_like(gate_routed)
@@ -102,6 +111,78 @@ def mlp_swiglu_ref(
         offset += num_tokens
 
     return gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed
+
+
+def mlp_swiglu_bwd_ref(
+    d_y_shared, d_y_routed,
+    x_shared, x_routed,
+    gate_shared, gate_routed,
+    up_shared, up_routed,
+    hidden_shared, hidden_routed,
+    w_shared_gate, w_routed_gate,
+    w_shared_up, w_routed_up,
+    w_shared_down, w_routed_down,
+    tokens_per_expert
+):
+    # Shared expert
+    d_hidden_shared = d_y_shared @ w_shared_down
+    _sigmoid = torch.sigmoid(gate_shared.float())
+    _silu = gate_shared.float() * _sigmoid
+    d_gate_shared = (((1.0 - _silu) * _sigmoid + _silu) * (up_shared.float() * d_hidden_shared.float())).to(torch.bfloat16)
+    d_up_shared = (d_hidden_shared.float() * _silu).to(torch.bfloat16)
+    d_x_shared = torch.cat((d_gate_shared, d_up_shared), 1) @ torch.cat((w_shared_gate, w_shared_up), 0)
+    d_w_shared_gate = d_gate_shared.T @ x_shared
+    d_w_shared_up = d_up_shared.T @ x_shared
+    d_w_shared_down = d_y_shared.T @ hidden_shared
+
+    # Routed experts
+    num_valid_tokens = int(tokens_per_expert.sum().item())
+    d_y_routed_dq = quant_and_dequant(d_y_routed)
+    gate_routed_dq = quant_and_dequant(gate_routed)
+    up_routed_dq = quant_and_dequant(up_routed)
+    w_routed_gate_T_dq = torch.stack([quant_and_dequant(w_routed_gate[e].T.contiguous()) for e in range(w_routed_gate.size(0))])
+    w_routed_up_T_dq = torch.stack([quant_and_dequant(w_routed_up[e].T.contiguous()) for e in range(w_routed_up.size(0))])
+    w_routed_down_T_dq = torch.stack([quant_and_dequant(w_routed_down[e].T.contiguous()) for e in range(w_routed_down.size(0))])
+
+    d_hidden_routed = torch.zeros_like(gate_routed)
+    offset = 0
+    for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
+        d_hidden_routed[offset:offset + num_tokens] = d_y_routed_dq[offset:offset + num_tokens] @ w_routed_down_T_dq[expert_idx].T
+        offset += num_tokens
+
+    _sigmoid = torch.sigmoid(gate_routed_dq.float())
+    _silu = gate_routed_dq.float() * _sigmoid
+    d_gate_routed = (((1.0 - _silu) * _sigmoid + _silu) * (up_routed_dq.float() * d_hidden_routed.float())).to(torch.bfloat16)
+    d_up_routed = (d_hidden_routed.float() * _silu).to(torch.bfloat16)
+
+    d_gate_routed_dq = quant_and_dequant(d_gate_routed)
+    d_up_routed_dq = quant_and_dequant(d_up_routed)
+    d_x_routed = torch.zeros_like(x_routed)
+    offset = 0
+    for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
+        d_x_routed[offset:offset + num_tokens] = (d_gate_routed_dq[offset:offset + num_tokens] @ w_routed_gate_T_dq[expert_idx].T +
+                                                  d_up_routed_dq[offset:offset + num_tokens] @ w_routed_up_T_dq[expert_idx].T)
+        offset += num_tokens
+
+    # Wgrads consume the transpose-quantized activations (scale blocks run along the token dim)
+    d_y_t_dq = quant_and_dequant(d_y_routed[:num_valid_tokens].T.contiguous()).float()
+    hidden_t_dq = quant_and_dequant(hidden_routed[:num_valid_tokens].T.contiguous()).float()
+    d_gate_t_dq = quant_and_dequant(d_gate_routed[:num_valid_tokens].T.contiguous()).float()
+    d_up_t_dq = quant_and_dequant(d_up_routed[:num_valid_tokens].T.contiguous()).float()
+    x_t_dq = quant_and_dequant(x_routed[:num_valid_tokens].T.contiguous()).float()
+
+    d_w_routed_gate = torch.empty_like(w_routed_gate)
+    d_w_routed_up = torch.empty_like(w_routed_up)
+    d_w_routed_down = torch.empty_like(w_routed_down)
+    offset = 0
+    for expert_idx, num_tokens in enumerate(tokens_per_expert.tolist()):
+        d_w_routed_gate[expert_idx] = (d_gate_t_dq[:, offset:offset + num_tokens] @ x_t_dq[:, offset:offset + num_tokens].T).to(torch.bfloat16)
+        d_w_routed_up[expert_idx] = (d_up_t_dq[:, offset:offset + num_tokens] @ x_t_dq[:, offset:offset + num_tokens].T).to(torch.bfloat16)
+        d_w_routed_down[expert_idx] = (d_y_t_dq[:, offset:offset + num_tokens] @ hidden_t_dq[:, offset:offset + num_tokens].T).to(torch.bfloat16)
+        offset += num_tokens
+
+    return (d_x_shared, d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed, d_hidden_shared, d_hidden_routed,
+            d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down)
 
 
 def main():
@@ -126,19 +207,34 @@ def main():
     combine_buffer = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     combine_buffer_handle = symm_mem.rendezvous(combine_buffer, dist.group.WORLD.group_name)
     combine_buffer_ptrs = [combine_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
+    d_combine_buffer = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    d_combine_buffer_handle = symm_mem.rendezvous(d_combine_buffer, dist.group.WORLD.group_name)
+    d_combine_buffer_ptrs = [d_combine_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
+    d_x_routed_buffer = symm_mem.empty(NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    d_x_routed_buffer_handle = symm_mem.rendezvous(d_x_routed_buffer, dist.group.WORLD.group_name)
+    d_x_routed_buffer_ptrs = [d_x_routed_buffer_handle.buffer_ptrs[i] for i in range(world_size)]
 
-    # Generate weights
+    # Generate weights and the output gradient
     w_shared_gate   = torch.randn(INTERMEDIATE_DIM, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16) * HIDDEN_DIM ** -0.5
     w_routed_gate   = torch.randn(NUM_LOCAL_EXPERTS, INTERMEDIATE_DIM, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16) * HIDDEN_DIM ** -0.5
     w_shared_up     = torch.randn(INTERMEDIATE_DIM, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16) * HIDDEN_DIM ** -0.5
     w_routed_up     = torch.randn(NUM_LOCAL_EXPERTS, INTERMEDIATE_DIM, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16) * HIDDEN_DIM ** -0.5
     w_shared_down   = torch.randn(HIDDEN_DIM, INTERMEDIATE_DIM, generator=gen, device=device, dtype=torch.bfloat16) * INTERMEDIATE_DIM ** -0.5
     w_routed_down   = torch.randn(NUM_LOCAL_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM, generator=gen, device=device, dtype=torch.bfloat16) * INTERMEDIATE_DIM ** -0.5
+    d_output        = torch.randn(NUM_LOCAL_TOKENS, HIDDEN_DIM, generator=gen, device=device, dtype=torch.bfloat16) * HIDDEN_DIM ** -0.5
 
     # MXFP8-quantize the routed weights
     w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(w_routed_gate, True, False)
     w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(w_routed_up, True, False)
     w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(w_routed_down, True, False)
+
+    # Pre-transpose the weights for the backward
+    w_shared_gate_T = w_shared_gate.transpose(-2, -1).contiguous()
+    w_shared_up_T   = w_shared_up.transpose(-2, -1).contiguous()
+    w_shared_down_T = w_shared_down.transpose(-2, -1).contiguous()
+    w_routed_gate_T_fp8, w_routed_gate_T_sc, _, _ = mxfp8_quantize(w_routed_gate.transpose(-2, -1).contiguous(), True, False)
+    w_routed_up_T_fp8, w_routed_up_T_sc, _, _ = mxfp8_quantize(w_routed_up.transpose(-2, -1).contiguous(), True, False)
+    w_routed_down_T_fp8, w_routed_down_T_sc, _, _ = mxfp8_quantize(w_routed_down.transpose(-2, -1).contiguous(), True, False)
 
     # Router
     topk_vals, topk_ids = torch.topk(router_logits, TOPK, dim=1)
@@ -148,7 +244,7 @@ def main():
     torch.cuda.synchronize()
     dist.barrier()
 
-    def run_once():
+    def run_fwd_once():
         dist.all_gather_into_tensor(topk_ids_all, topk_ids)
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert = schedule(
             topk_ids_all, NUM_LOCAL_EXPERTS, schedule_capacity, rank
@@ -174,24 +270,43 @@ def main():
                 hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
                 y_shared, y_routed, output)
 
-    # Benchmark
-    for _ in range(WARMUP_ITERS):
-        run_once()
-    torch.cuda.synchronize()
-    dist.barrier()
+    def run_bwd_once():
+        d_y_shared = bwd_prologue(d_output, topk_weights, d_combine_buffer)
+        dist.barrier(async_op=True).block_current_stream()
+        (d_x_shared, d_x_routed,
+         d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
+         d_up_shared, d_up_fp8_routed, d_up_sc_routed,
+         d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
+         d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd(
+            d_y_shared, d_combine_buffer, d_combine_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+            w_shared_gate_T, w_routed_gate_T_fp8, w_routed_gate_T_sc,
+            w_shared_up_T, w_routed_up_T_fp8, w_routed_up_T_sc,
+            w_shared_down_T, w_routed_down_T_fp8, w_routed_down_T_sc,
+            x_fp8_t_routed, x_sc_t_routed,
+            gate_shared, gate_fp8_routed, gate_sc_routed,
+            up_shared, up_fp8_routed, up_sc_routed,
+            hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
+            x_buffer, x_buffer_ptrs,
+            w_routed_gate_fp8, w_routed_gate_sc, w_routed_up_fp8, w_routed_up_sc,
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+            TOPK, NUM_COMM_SMS, MACROBATCH_SIZE, MINIBATCH_SIZE
+        )
+        dist.barrier(async_op=True).block_current_stream()
+        d_x = bwd_epilogue(d_x_shared, d_x_routed_buffer)
+        return (d_x, d_x_routed,
+                d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
+                d_up_shared, d_up_fp8_routed, d_up_sc_routed,
+                d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
+                d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down)
 
-    # Trace
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        record_shapes=True,
-    ) as prof:
-        for _ in range(PROFILE_ITERS):
-            run_once()
-        torch.cuda.synchronize()
-    trace_path = f"trace_moe_mxfp8_rank{rank}.json"
-    prof.export_chrome_trace(trace_path)
-    if rank == 0:
-        print(f"[rank {rank}] wrote {trace_path} (open in https://ui.perfetto.dev)", flush=True)
+    # Forward benchmark
+    for _ in range(WARMUP_ITERS):
+        (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+         x_fp8_t_routed, x_sc_t_routed,
+         gate_shared, gate_fp8_routed, gate_sc_routed,
+         up_shared, up_fp8_routed, up_sc_routed,
+         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
+         y_shared, y_routed, output) = run_fwd_once()
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -199,26 +314,52 @@ def main():
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(TIMED_ITERS):
-        (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-         x_fp8_t_routed, x_sc_t_routed,
-         gate_shared, gate_fp8_routed, gate_sc_routed,
-         up_shared, up_fp8_routed, up_sc_routed,
-         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-         y_shared, y_routed, output) = run_once()
+        run_fwd_once()
     end.record()
     torch.cuda.synchronize()
     dist.barrier()
+    fwd_ms = start.elapsed_time(end) / TIMED_ITERS
 
-    end_to_end_ms = start.elapsed_time(end) / TIMED_ITERS
+    # Backward benchmark
+    for _ in range(WARMUP_ITERS):
+        run_bwd_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(TIMED_ITERS):
+        run_bwd_once()
+    end.record()
+    torch.cuda.synchronize()
+    dist.barrier()
+    bwd_ms = start.elapsed_time(end) / TIMED_ITERS
+
+    # A final fwd+bwd for the correctness check
+    (schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+     x_fp8_t_routed, x_sc_t_routed,
+     gate_shared, gate_fp8_routed, gate_sc_routed,
+     up_shared, up_fp8_routed, up_sc_routed,
+     hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
+     y_shared, y_routed, output) = run_fwd_once()
+    (d_x, d_x_routed,
+     d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
+     d_up_shared, d_up_fp8_routed, d_up_sc_routed,
+     d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
+     d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down) = run_bwd_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+
     total_routed_tokens = int(num_tokens.item())
 
-    # Reference implementation
+    # Forward reference
     x_all = torch.empty(world_size, NUM_LOCAL_TOKENS, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     dist.all_gather_into_tensor(x_all, x_buffer)
     valid = schedule_peer_rank >= 0
     x_routed_ref = torch.zeros(schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
     x_routed_ref[valid] = x_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid] // TOPK]
-    mlp_swiglu_refs = mlp_swiglu_ref(
+    mlp_swiglu_fwd_refs = mlp_swiglu_fwd_ref(
         x_buffer, x_routed_ref,
         w_shared_gate, w_routed_gate,
         w_shared_up, w_routed_up,
@@ -226,7 +367,7 @@ def main():
         tokens_per_expert
     )
     (gate_shared_ref, gate_routed_ref, up_shared_ref, up_routed_ref,
-     hidden_shared_ref, hidden_routed_ref, y_shared_ref, y_routed_ref) = mlp_swiglu_refs
+     hidden_shared_ref, hidden_routed_ref, y_shared_ref, y_routed_ref) = mlp_swiglu_fwd_refs
     schedule_peer_rank_all = torch.empty(world_size, schedule_capacity, dtype=torch.int32, device=device)
     schedule_peer_token_idx_all = torch.empty_like(schedule_peer_rank_all)
     y_routed_all = torch.empty(world_size, schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
@@ -239,25 +380,58 @@ def main():
         combine_buffer_ref[schedule_peer_token_idx_all[dst_rank, dst_valid].long()] = y_routed_all[dst_rank, dst_valid]
     output_ref = fwd_epilogue(y_shared_ref, combine_buffer_ref, topk_weights)
 
+    # Backward reference
+    d_combine_buffer_ref = torch.empty_like(combine_buffer)
+    bwd_prologue(d_output, topk_weights, d_combine_buffer_ref)
+    d_combine_buffer_all = torch.empty(world_size, NUM_LOCAL_TOKENS * TOPK, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dist.all_gather_into_tensor(d_combine_buffer_all, d_combine_buffer_ref)
+    d_y_routed_ref = torch.zeros(schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    d_y_routed_ref[valid] = d_combine_buffer_all[schedule_peer_rank[valid], schedule_peer_token_idx[valid]]
+    (d_x_shared_ref, d_x_routed_ref, d_gate_shared_ref, d_gate_routed_ref, d_up_shared_ref, d_up_routed_ref,
+     d_hidden_shared_ref, d_hidden_routed_ref,
+     d_w_shared_gate_ref, d_w_routed_gate_ref, d_w_shared_up_ref, d_w_routed_up_ref, d_w_shared_down_ref, d_w_routed_down_ref) = mlp_swiglu_bwd_ref(
+        d_output, d_y_routed_ref, x_buffer, x_routed_ref,
+        gate_shared_ref, gate_routed_ref, up_shared_ref, up_routed_ref, hidden_shared_ref, hidden_routed_ref,
+        w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, tokens_per_expert
+    )
+    d_x_routed_all = torch.empty(world_size, schedule_capacity, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    dist.all_gather_into_tensor(d_x_routed_all, d_x_routed_ref)
+    d_x_routed_buffer_ref = torch.empty_like(d_x_routed_buffer)
+    for dst_rank in range(world_size):
+        dst_valid = schedule_peer_rank_all[dst_rank] == rank
+        d_x_routed_buffer_ref[schedule_peer_token_idx_all[dst_rank, dst_valid].long()] = d_x_routed_all[dst_rank, dst_valid]
+    d_x_ref = bwd_epilogue(d_x_shared_ref, d_x_routed_buffer_ref)
+
     # Dequantize the fused kernel's quantized outputs and build dequantized references
     x_routed_t_dequant = dequant(x_fp8_t_routed, scale_unswizzle(x_sc_t_routed))
     gate_routed_dequant = dequant(gate_fp8_routed, scale_unswizzle(gate_sc_routed))
     up_routed_dequant = dequant(up_fp8_routed, scale_unswizzle(up_sc_routed))
     hidden_routed_t_dequant = dequant(hidden_fp8_t_routed, scale_unswizzle(hidden_sc_t_routed))
+    d_y_routed_dequant = dequant(d_y_fp8_routed, scale_unswizzle(d_y_sc_routed))
+    d_gate_routed_dequant = dequant(d_gate_fp8_routed, scale_unswizzle(d_gate_sc_routed))
+    d_up_routed_dequant = dequant(d_up_fp8_routed, scale_unswizzle(d_up_sc_routed))
     x_routed_t_dequant_ref = dequant(*mxfp8_quantize_ref(x_routed_ref.T.contiguous()))
     gate_routed_dequant_ref = dequant(*mxfp8_quantize_ref(gate_routed_ref))
     up_routed_dequant_ref = dequant(*mxfp8_quantize_ref(up_routed_ref))
     hidden_routed_t_dequant_ref = dequant(*mxfp8_quantize_ref(hidden_routed_ref.T.contiguous()))
+    d_y_routed_dequant_ref = dequant(*mxfp8_quantize_ref(d_y_routed_ref))
+    d_gate_routed_dequant_ref = dequant(*mxfp8_quantize_ref(d_gate_routed_ref))
+    d_up_routed_dequant_ref = dequant(*mxfp8_quantize_ref(d_up_routed_ref))
 
-    # Correctness checks for all returned tensors and final output
-    # The forward processes macrobatches in reverse, leaving macrobatch 0 resident in the routed buffers
-    macrobatch_rows = min(total_routed_tokens, MACROBATCH_SIZE)
-    macrobatch_valid = valid[:macrobatch_rows]
+    # Correctness checks for all returned tensors and final outputs.
+    # The forward leaves macrobatch 0 resident; the backward's replay leaves the last macrobatch resident
+    num_macrobatches = max(1, (total_routed_tokens + MACROBATCH_SIZE - 1) // MACROBATCH_SIZE)
+    fwd_macrobatch_start = 0
+    bwd_macrobatch_start = (num_macrobatches - 1) * MACROBATCH_SIZE
 
-    def get_valid_rows(out, ref):
-        return out[:macrobatch_rows][macrobatch_valid], ref[:macrobatch_rows][macrobatch_valid]
-    def get_valid_cols(out_t, ref_t):
-        return out_t[:, :macrobatch_rows][:, macrobatch_valid], ref_t[:, :macrobatch_rows][:, macrobatch_valid]
+    def get_valid_rows(out, ref, start=bwd_macrobatch_start):
+        rows = min(total_routed_tokens - start, MACROBATCH_SIZE)
+        macrobatch_valid = valid[start:start + rows]
+        return out[:rows][macrobatch_valid], ref[start:start + rows][macrobatch_valid]
+    def get_valid_cols(out_t, ref_t, start=bwd_macrobatch_start):
+        rows = min(total_routed_tokens - start, MACROBATCH_SIZE)
+        macrobatch_valid = valid[start:start + rows]
+        return out_t[:, :rows][:, macrobatch_valid], ref_t[:, start:start + rows][:, macrobatch_valid]
 
     difference_stats = []
     for name, out, ref in (
@@ -269,9 +443,24 @@ def main():
         ("hidden_shared", hidden_shared, hidden_shared_ref),
         ("hidden_routed_t", *get_valid_cols(hidden_routed_t_dequant, hidden_routed_t_dequant_ref)),
         ("y_shared", y_shared, y_shared_ref),
-        ("y_routed", *get_valid_rows(y_routed, y_routed_ref)),
+        ("y_routed", *get_valid_rows(y_routed, y_routed_ref, fwd_macrobatch_start)),
         ("combine_buffer", combine_buffer, combine_buffer_ref),
         ("output", output, output_ref),
+        ("d_y_routed", *get_valid_rows(d_y_routed_dequant, d_y_routed_dequant_ref)),
+        ("d_hidden_shared", d_hidden_shared, d_hidden_shared_ref),
+        ("d_hidden_routed", *get_valid_rows(d_hidden_routed, d_hidden_routed_ref)),
+        ("d_gate_shared", d_gate_shared, d_gate_shared_ref),
+        ("d_gate_routed", *get_valid_rows(d_gate_routed_dequant, d_gate_routed_dequant_ref)),
+        ("d_up_shared", d_up_shared, d_up_shared_ref),
+        ("d_up_routed", *get_valid_rows(d_up_routed_dequant, d_up_routed_dequant_ref)),
+        ("d_x_routed", *get_valid_rows(d_x_routed, d_x_routed_ref)),
+        ("d_x", d_x, d_x_ref),
+        ("d_w_shared_gate", d_w_shared_gate, d_w_shared_gate_ref),
+        ("d_w_routed_gate", d_w_routed_gate, d_w_routed_gate_ref),
+        ("d_w_shared_up", d_w_shared_up, d_w_shared_up_ref),
+        ("d_w_routed_up", d_w_routed_up, d_w_routed_up_ref),
+        ("d_w_shared_down", d_w_shared_down, d_w_shared_down_ref),
+        ("d_w_routed_down", d_w_routed_down, d_w_routed_down_ref),
     ):
         diff = (out.float() - ref.float()).abs()
         diff_sum = diff.sum()
@@ -282,28 +471,31 @@ def main():
         dist.all_reduce(diff_max, op=dist.ReduceOp.MAX)
         difference_stats.append((name, (diff_sum / diff_count).item(), diff_max.item()))
 
-    flops = 6 * (NUM_LOCAL_TOKENS + total_routed_tokens) * HIDDEN_DIM * INTERMEDIATE_DIM
-    stats = torch.tensor([total_routed_tokens, end_to_end_ms, flops / 1e9 / end_to_end_ms], dtype=torch.float64, device=device)
+    fwd_flops = 6 * (NUM_LOCAL_TOKENS + total_routed_tokens) * HIDDEN_DIM * INTERMEDIATE_DIM
+    bwd_flops = 2 * fwd_flops
+    stats = torch.tensor([total_routed_tokens, fwd_ms, bwd_ms, fwd_flops / 1e9 / fwd_ms, bwd_flops / 1e9 / bwd_ms], dtype=torch.float64, device=device)
     stats_all = [torch.zeros_like(stats) for _ in range(world_size)]
     dist.all_gather(stats_all, stats)
 
     if rank == 0:
-        print("\nMoE Dispatch + MLP SwiGLU + Combine")
-        print("====================================")
+        print("\nMoE Dispatch + MLP SwiGLU + Combine (MXFP8, forward + backward)")
+        print("=================================================================")
         print(f"tokens/rank: {NUM_LOCAL_TOKENS}   experts: {num_experts} ({NUM_LOCAL_EXPERTS}/rank)   "
-              f"topk: {TOPK}   H: {HIDDEN_DIM}   I: {INTERMEDIATE_DIM}")
+              f"topk: {TOPK}   H: {HIDDEN_DIM}   I: {INTERMEDIATE_DIM}   minibatch: {MINIBATCH_SIZE}   macrobatch: {MACROBATCH_SIZE}")
         print(f"iters: warmup {WARMUP_ITERS}, timed {TIMED_ITERS}\n", flush=True)
         for name, diff_mean, diff_max in difference_stats:
             print(f"{name:<16} diff mean {diff_mean:.6f}   diff max {diff_max:.6f}")
-        print("\nrank  routed tokens  end-to-end(ms)  MLP TFLOP/s")
-        print("----  -------------  --------------  -----------")
+        print("\nrank  routed tokens  fwd(ms)  bwd(ms)  fwd(TFLOP/s)  bwd(TFLOP/s)")
+        print("----  -------------  -------  -------  ------------  ------------")
         for rank_idx, rank_stats in enumerate(stats_all):
-            routed_tokens, rank_end_to_end_ms, rank_tflops = rank_stats.tolist()
-            print(f"{rank_idx:>4}  {int(routed_tokens):>13}  {rank_end_to_end_ms:>14.3f}  {rank_tflops:>11.1f}")
+            routed_tokens, rank_fwd_ms, rank_bwd_ms, rank_fwd_tflops, rank_bwd_tflops = rank_stats.tolist()
+            print(f"{rank_idx:>4}  {int(routed_tokens):>13}  {rank_fwd_ms:>7.3f}  {rank_bwd_ms:>7.3f}  {rank_fwd_tflops:>13.1f}  {rank_bwd_tflops:>13.1f}")
 
     dist.barrier()
     del x_buffer_handle
     del combine_buffer_handle
+    del d_combine_buffer_handle
+    del d_x_routed_buffer_handle
     gc.collect()
     dist.destroy_process_group()
 
