@@ -266,22 +266,24 @@ static __device__ __forceinline__ void mxfp8_dequantize_single_block(
     }
 }
 
-template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, int SRC_ROW_STRIDE = 128>
+template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, int SRC_ROW_STRIDE = 128, bool SPLIT_PASSES = false>
 static __device__ __forceinline__ void mxfp8_quantize_tile(
     const globals::x_bf16_tile &x_bf16_tile,
     const globals::x_fp8_tile &x_fp8_tile,
     const globals::x_sc_tile &x_sc_tile,
     const globals::x_fp8_tile &x_fp8_t_tile,
     const globals::x_sc_tile &x_sc_t_tile,
-    const int tid,
+    const int _tid,
     const int barrier_id
 ) {
     constexpr int TILE_SIZE = 128;
     constexpr int K_BLOCK_SIZE = 32;
     static_assert(RETURN_NORMAL || RETURN_TRANSPOSED, "At least one output pair must be requested");
+    static_assert(!SPLIT_PASSES || (RETURN_NORMAL && RETURN_TRANSPOSED), "SPLIT_PASSES requires both outputs");
 
-    // Excess threads have no tile rows to handle. Caller must ensure that this is called by threads 0-127
-    if (tid >= TILE_SIZE) return;
+    // Excess threads have no tile rows to handle. Caller must ensure that this is called by threads 0-127, or 0-255 with SPLIT_PASSES
+    const int tid = SPLIT_PASSES ? _tid % TILE_SIZE : _tid;
+    if (!SPLIT_PASSES && tid >= TILE_SIZE) return;
 
     constexpr int ROWS_PER_THREAD = TILE_SIZE / TILE_SIZE;
     constexpr int NUM_K_BLOCKS = TILE_SIZE / K_BLOCK_SIZE; // 4
@@ -293,6 +295,7 @@ static __device__ __forceinline__ void mxfp8_quantize_tile(
     for (int pass = 0; pass < 2; pass++) {
         const bool transposed = pass == 0;
         if ((transposed && !RETURN_TRANSPOSED) || (!transposed && !RETURN_NORMAL)) continue;
+        if (SPLIT_PASSES && transposed != (_tid < TILE_SIZE)) continue;
         const uint32_t fp8_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_fp8_t_tile : &x_fp8_tile));
         const uint32_t sc_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_sc_t_tile : &x_sc_tile));
         bf16_2 x_bf16_reg[ROWS_PER_THREAD][NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
@@ -796,7 +799,7 @@ static __device__ __forceinline__ void dispatch_quantize_kernel(
 
             if (tid == 0) tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
             __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
-            mxfp8_quantize::mxfp8_quantize_tile<true, true, config::DISPATCH_Nb>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], tid, 1);
+            mxfp8_quantize::mxfp8_quantize_tile<true, true, config::DISPATCH_Nb, true>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], tid, 1);
             __syncthreads(); // quantized tiles must be complete before TMA reads them
 
             if (tid == 0) {
@@ -1327,9 +1330,11 @@ static __device__ __forceinline__ void swiglu_bwd(
                     tma::store_async(*d_up_sc_gmem, up_sc_smem[stage], {row - macrobatch_row_block_offset, col, 0, 0});
                 }
 
-                // Transpose-quantize both gradients (d_gate was staged in the d_hidden tile, d_up in the shared staging buffer)
-                mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], threadIdx.x, 1);
-                mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], threadIdx.x, 1);
+                // Transpose-quantize both gradients, one per warpgroup; d_gate was staged in the d_hidden tile, d_up in the shared staging buffer
+                if (threadIdx.x < config::QUANT_Mb)
+                    mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], threadIdx.x, 1);
+                else
+                    mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], threadIdx.x - config::QUANT_Mb, 2);
                 __syncthreads(); // quantized tiles must be complete before TMA reads them
 
                 if (threadIdx.x == 0) {
@@ -2401,7 +2406,6 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
             const int macrobatch_task_idx = replayed ? replayed_task_idx % replayed_macrobatch_tasks : global_routed_task_idx;
             const int macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
             const int num_replay_tasks = replayed ? macrobatch_num_minibatches * minibatch_routed_replay_tasks : 0;
-            const int num_routed_tasks = macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
 
             if (macrobatch_task_idx < num_replay_tasks) {
                 const int minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;
@@ -2437,6 +2441,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       task_idx, cta_rank, 0, 0, smem_base_addr);
                 }
             } else {
+                const int num_routed_tasks = macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
                 const int routed_task_idx = macrobatch_task_idx - num_replay_tasks;
                 const int minibatch_idx = routed_task_idx / minibatch_routed_bwd_tasks;
                 const int minibatch_task_idx = routed_task_idx % minibatch_routed_bwd_tasks;
