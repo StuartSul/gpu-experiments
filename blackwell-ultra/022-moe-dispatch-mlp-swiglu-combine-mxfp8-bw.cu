@@ -285,7 +285,6 @@ static __device__ __forceinline__ void mxfp8_quantize_tile(
     const int tid = SPLIT_PASSES ? _tid % TILE_SIZE : _tid;
     if (!SPLIT_PASSES && tid >= TILE_SIZE) return;
 
-    constexpr int ROWS_PER_THREAD = TILE_SIZE / TILE_SIZE;
     constexpr int NUM_K_BLOCKS = TILE_SIZE / K_BLOCK_SIZE; // 4
     constexpr int PACKED_PER_K_BLOCK = K_BLOCK_SIZE / 2;   // 16
 
@@ -298,57 +297,59 @@ static __device__ __forceinline__ void mxfp8_quantize_tile(
         if (SPLIT_PASSES && transposed != (_tid < TILE_SIZE)) continue;
         const uint32_t fp8_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_fp8_t_tile : &x_fp8_tile));
         const uint32_t sc_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_sc_t_tile : &x_sc_tile));
-        bf16_2 x_bf16_reg[ROWS_PER_THREAD][NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
+        const int row = transposed ? (tid % 64) * 2 + tid / 64 : tid;
 
-        // Load input matrix from shared memory w/ custom swizzling
-        #pragma unroll
-        for (int i = 0; i < ROWS_PER_THREAD; i++) {
-            int row = transposed ? (tid % 64) * 2 + tid / 64 + i * (TILE_SIZE / 64) : tid + i * TILE_SIZE;
+        auto load_k_block = [&](int k_block_idx, bf16_2 (&dst)[PACKED_PER_K_BLOCK]) {
+            // Load one 32-element block of this thread's row from shared memory w/ custom swizzling
             #pragma unroll
-            for (int j = 0; j < NUM_K_BLOCKS; j++) {
-                int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
-                #pragma unroll
-                for (int k = 0; k < PACKED_PER_K_BLOCK; k++) {
-                    int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*2) % K_BLOCK_SIZE;
-                    if (transposed) {
-                        move<bf16>::lds(x_bf16_reg[i][j][k].x, bf16_src_addr + (col*SRC_ROW_STRIDE + row) * sizeof(bf16));
-                        move<bf16>::lds(x_bf16_reg[i][j][k].y, bf16_src_addr + ((col+1)*SRC_ROW_STRIDE + row) * sizeof(bf16));
-                    } else {
-                        move<bf16_2>::lds(x_bf16_reg[i][j][k], bf16_src_addr + (row*SRC_ROW_STRIDE + col) * sizeof(bf16));
-                    }
+            for (int k = 0; k < PACKED_PER_K_BLOCK; k++) {
+                const int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*2) % K_BLOCK_SIZE;
+                if (transposed) {
+                    move<bf16>::lds(dst[k].x, bf16_src_addr + (col*SRC_ROW_STRIDE + row) * sizeof(bf16));
+                    move<bf16>::lds(dst[k].y, bf16_src_addr + ((col+1)*SRC_ROW_STRIDE + row) * sizeof(bf16));
+                } else {
+                    move<bf16_2>::lds(dst[k], bf16_src_addr + (row*SRC_ROW_STRIDE + col) * sizeof(bf16));
                 }
             }
-        }
+        };
+        auto quantize_k_block = [&](int k_block_idx, const bf16_2 (&src)[PACKED_PER_K_BLOCK], uint32_t &scale_word) {
+            // Quantize one 32-element block and store the FP8 output to shared memory
+            uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
+            uint32_t scale_byte;
+            mxfp8_quantize_single_block(src, x_fp8_reg, scale_byte);
+            scale_word |= scale_byte << (k_block_idx * 8);
+            #pragma unroll
+            for (int k = 0; k < PACKED_PER_K_BLOCK / 2; k++) {
+                const int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*4) % K_BLOCK_SIZE;
+                move<int>::sts(fp8_dst_addr + row*TILE_SIZE + col, std::bit_cast<int>(x_fp8_reg[k]));
+            }
+        };
 
-        if (!transposed)
+        uint32_t scale_word = 0;
+        if (!transposed) {
+            // This writes FP8 output in place over the BF16 source, so it must load the whole tile up front
+            bf16_2 x_bf16_reg[NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
+            #pragma unroll
+            for (int j = 0; j < NUM_K_BLOCKS; j++)
+                load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j]);
             group<TILE_SIZE / WARP_THREADS>::sync(barrier_id); // in-place writes may begin
-
-        // Perform MXFP8 quantization
-        #pragma unroll
-        for (int i = 0; i < ROWS_PER_THREAD; i++) {
-            int row = transposed ? (tid % 64) * 2 + tid / 64 + i * (TILE_SIZE / 64) : tid + i * TILE_SIZE;
-            uint32_t scale_word = 0;
             #pragma unroll
+            for (int j = 0; j < NUM_K_BLOCKS; j++)
+                quantize_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j], scale_word);
+        } else {
+            #pragma unroll 1 // otherwise we get hundreds of register spills
             for (int j = 0; j < NUM_K_BLOCKS; j++) {
-                int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
-
-                uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
-                uint32_t scale_byte;
-                mxfp8_quantize_single_block(x_bf16_reg[i][j], x_fp8_reg, scale_byte);
-                scale_word |= scale_byte << (k_block_idx * 8);
-
-                #pragma unroll
-                for (int k = 0; k < PACKED_PER_K_BLOCK / 2; k++) {
-                    int col = k_block_idx*K_BLOCK_SIZE + (tid*4 + k*4) % K_BLOCK_SIZE;
-                    move<int>::sts(fp8_dst_addr + row*TILE_SIZE + col, std::bit_cast<int>(x_fp8_reg[k]));
-                }
+                const int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
+                bf16_2 x_bf16_reg[PACKED_PER_K_BLOCK];
+                load_k_block(k_block_idx, x_bf16_reg);
+                quantize_k_block(k_block_idx, x_bf16_reg, scale_word);
             }
-
-            // Store the scales to shared memory. Each thread will access 1 bank, so no need to swizzle,
-            // but we do have to follow this complicated layout pattern made by NVIDIA:
-            // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
-            move<int>::sts(sc_dst_addr + (row % 32) * 16 + (row / 32) * 4, std::bit_cast<int>(scale_word));
         }
+
+        // Store the scales to shared memory. Each thread will access 1 bank, so no need to swizzle,
+        // but we do have to follow this complicated layout pattern made by NVIDIA:
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
+        move<int>::sts(sc_dst_addr + (row % 32) * 16 + (row / 32) * 4, std::bit_cast<int>(scale_word));
     }
 }
 
