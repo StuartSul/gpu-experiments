@@ -510,33 +510,38 @@ using quant_sc_tile = mxfp8_quantize::globals::x_sc_tile;     // st_fp8e8m0<32, 
 using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;
 
 // Global layouts
-using activation_bf16_gl = gl<bf16, 1, 1, -1, -1, quant_bf16_tile, mlp_bf16_d_tile, swiglu_tile, mlp_bf16_tile, mlp_bf16_t_tile>;
+using mlp_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile, swiglu_tile>;
+using epi_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_d_tile, swiglu_tile, quant_bf16_tile>;
+using swiglu_bf16_gl = gl<bf16, 1, 1, -1, -1, swiglu_tile>;
+using wgrad_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_t_tile>;
+using mlp_fp8_gl = gl<fp8e4m3, 1, 1, -1, -1, mlp_fp8_tile, quant_fp8_tile>;
+using gate_up_fp8_gl = gl<fp8e4m3, 1, 1, -1, -1, mlp_fp8_d_tile, quant_fp8_tile>;
 using activation_bf16_pgl = pgl<gl<bf16, 1, 1, -1, -1>, NUM_DEVICES, false>;
-using activation_fp8_gl = gl<fp8e4m3, 1, 1, -1, -1, mlp_fp8_tile, quant_fp8_tile, mlp_fp8_d_tile>;
-using weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_tile, mlp_bf16_d_tile>;
+using weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_tile>;
+using d_weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_d_tile>;
 using weight_fp8_gl = gl<fp8e4m3, 1, -1, -1, -1, mlp_fp8_tile>;
 using sc_gl = gl<fp8e8m0, -1, -1, 32, 16, mlp_sc_tile>;
 using index_gl = gl<int, 1, 1, 1, -1>;
 
 struct globals_fwd {
-    activation_bf16_gl x_shared;              // (num_local_tokens, H)
-    activation_fp8_gl x_fp8_routed;           // (macrobatch_size, H)
+    mlp_bf16_gl x_shared;                     // (num_local_tokens, H) gate/up GEMM A
+    mlp_fp8_gl x_fp8_routed;                  // (macrobatch_size, H) gate/up GEMM A + dispatch out
     sc_gl x_sc_routed;                        // (macrobatch_size / 128, H / 128, 32, 16)
-    activation_fp8_gl x_fp8_t_routed;         // (H, macrobatch_size)
+    mlp_fp8_gl x_fp8_t_routed;                // (H, macrobatch_size) dispatch out
     sc_gl x_sc_t_routed;                      // (H / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl gate_shared;           // (num_local_tokens, I)
-    activation_fp8_gl gate_fp8_routed;        // (macrobatch_size, I)
+    epi_bf16_gl gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
+    gate_up_fp8_gl gate_fp8_routed;           // (macrobatch_size, I) gate GEMM D + swiglu in
     sc_gl gate_sc_routed;                     // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_bf16_gl up_shared;             // (num_local_tokens, I)
-    activation_fp8_gl up_fp8_routed;          // (macrobatch_size, I)
+    epi_bf16_gl up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
+    gate_up_fp8_gl up_fp8_routed;             // (macrobatch_size, I) up GEMM D + swiglu in
     sc_gl up_sc_routed;                       // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_bf16_gl hidden_shared;         // (num_local_tokens, I)
-    activation_fp8_gl hidden_fp8_routed;      // (macrobatch_size, I)
+    mlp_bf16_gl hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
+    mlp_fp8_gl hidden_fp8_routed;             // (macrobatch_size, I) swiglu out + down GEMM A
     sc_gl hidden_sc_routed;                   // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_fp8_gl hidden_fp8_t_routed;    // (I, macrobatch_size)
+    mlp_fp8_gl hidden_fp8_t_routed;           // (I, macrobatch_size) swiglu out
     sc_gl hidden_sc_t_routed;                 // (I / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl y_shared;              // (num_local_tokens, H)
-    activation_bf16_gl y_routed;              // (macrobatch_size, H)
+    epi_bf16_gl y_shared;                     // (num_local_tokens, H) down GEMM D
+    epi_bf16_gl y_routed;                     // (macrobatch_size, H) down GEMM D + combine
 
     activation_bf16_pgl x_routed_send_buffer; // (num_local_tokens, H)
     activation_bf16_pgl y_routed_recv_buffer; // (num_local_tokens * topk, H)
@@ -586,71 +591,71 @@ struct globals_fwd {
 
 struct globals_bwd {
     // Saved/replayed forward activations
-    activation_bf16_gl x_shared;               // (num_local_tokens, H)
-    activation_fp8_gl x_fp8_routed;            // (macrobatch_size, H)
-    sc_gl x_sc_routed;                         // (macrobatch_size / 128, H / 128, 32, 16)
-    activation_fp8_gl x_fp8_t_routed;          // (H, macrobatch_size)
-    sc_gl x_sc_t_routed;                       // (H / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl gate_shared;            // (num_local_tokens, I)
-    activation_fp8_gl gate_fp8_routed;         // (macrobatch_size, I)
-    sc_gl gate_sc_routed;                      // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_bf16_gl up_shared;              // (num_local_tokens, I)
-    activation_fp8_gl up_fp8_routed;           // (macrobatch_size, I)
-    sc_gl up_sc_routed;                        // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_bf16_gl hidden_shared;          // (num_local_tokens, I)
-    activation_fp8_gl hidden_fp8_routed;       // (macrobatch_size, I)
-    sc_gl hidden_sc_routed;                    // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_fp8_gl hidden_fp8_t_routed;     // (I, macrobatch_size)
-    sc_gl hidden_sc_t_routed;                  // (I / 128, macrobatch_size / 128, 32, 16)
+    wgrad_bf16_gl x_shared;                   // (num_local_tokens, H) wgrad gate/up B
+    mlp_fp8_gl x_fp8_routed;                  // (macrobatch_size, H) replay gate/up A + replay-dispatch out
+    sc_gl x_sc_routed;                        // (macrobatch_size / 128, H / 128, 32, 16)
+    mlp_fp8_gl x_fp8_t_routed;                // (H, macrobatch_size) wgrad gate/up B + replay-dispatch out
+    sc_gl x_sc_t_routed;                      // (H / 128, macrobatch_size / 128, 32, 16)
+    swiglu_bf16_gl gate_shared;               // (num_local_tokens, I) swiglu bwd in
+    gate_up_fp8_gl gate_fp8_routed;           // (macrobatch_size, I) replay gate D + swiglu (fwd/bwd) in
+    sc_gl gate_sc_routed;                     // (macrobatch_size / 128, I / 128, 32, 16)
+    swiglu_bf16_gl up_shared;                 // (num_local_tokens, I) swiglu bwd in
+    gate_up_fp8_gl up_fp8_routed;             // (macrobatch_size, I) replay up D + swiglu (fwd/bwd) in
+    sc_gl up_sc_routed;                       // (macrobatch_size / 128, I / 128, 32, 16)
+    wgrad_bf16_gl hidden_shared;              // (num_local_tokens, I) wgrad down B
+    mlp_fp8_gl hidden_fp8_routed;             // (macrobatch_size, I) replay swiglu out
+    sc_gl hidden_sc_routed;                   // (macrobatch_size / 128, I / 128, 32, 16)
+    mlp_fp8_gl hidden_fp8_t_routed;           // (I, macrobatch_size) replay swiglu out + wgrad down B
+    sc_gl hidden_sc_t_routed;                 // (I / 128, macrobatch_size / 128, 32, 16)
 
     // Activation gradients
-    activation_bf16_gl d_y_shared;             // (num_local_tokens, H)
-    activation_fp8_gl d_y_fp8_routed;          // (macrobatch_size, H) dgrad down A operand
-    sc_gl d_y_sc_routed;                       // (macrobatch_size / 128, H / 128, 32, 16)
-    activation_fp8_gl d_y_fp8_t_routed;        // (H, macrobatch_size) wgrad down A operand
-    sc_gl d_y_sc_t_routed;                     // (H / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl d_hidden_shared;        // (num_local_tokens, I)
-    activation_bf16_gl d_hidden_routed;        // (macrobatch_size, I) dgrad down out, swiglu bwd in
-    activation_bf16_gl d_gate_shared;          // (num_local_tokens, I)
-    activation_fp8_gl d_gate_fp8_routed;       // (macrobatch_size, I) dgrad gate/up A operand
-    sc_gl d_gate_sc_routed;                    // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_fp8_gl d_gate_fp8_t_routed;     // (I, macrobatch_size) wgrad gate A operand
-    sc_gl d_gate_sc_t_routed;                  // (I / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl d_up_shared;            // (num_local_tokens, I)
-    activation_fp8_gl d_up_fp8_routed;         // (macrobatch_size, I)
-    sc_gl d_up_sc_routed;                      // (macrobatch_size / 128, I / 128, 32, 16)
-    activation_fp8_gl d_up_fp8_t_routed;       // (I, macrobatch_size) wgrad up A operand
-    sc_gl d_up_sc_t_routed;                    // (I / 128, macrobatch_size / 128, 32, 16)
-    activation_bf16_gl d_x_shared;             // (num_local_tokens, H)
-    activation_bf16_gl d_x_routed;             // (macrobatch_size, H)
+    mlp_bf16_gl d_y_shared;                   // (num_local_tokens, H) dgrad down A + wgrad down A
+    mlp_fp8_gl d_y_fp8_routed;                // (macrobatch_size, H) dgrad down A + reverse-combine out
+    sc_gl d_y_sc_routed;                      // (macrobatch_size / 128, H / 128, 32, 16)
+    mlp_fp8_gl d_y_fp8_t_routed;              // (H, macrobatch_size) wgrad down A + reverse-combine out
+    sc_gl d_y_sc_t_routed;                    // (H / 128, macrobatch_size / 128, 32, 16)
+    epi_bf16_gl d_hidden_shared;              // (num_local_tokens, I) dgrad down out + swiglu bwd in
+    epi_bf16_gl d_hidden_routed;              // (macrobatch_size, I) dgrad down out + swiglu bwd in
+    mlp_bf16_gl d_gate_shared;                // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad gate A
+    mlp_fp8_gl d_gate_fp8_routed;             // (macrobatch_size, I) swiglu bwd out + dgrad gate/up A
+    sc_gl d_gate_sc_routed;                   // (macrobatch_size / 128, I / 128, 32, 16)
+    mlp_fp8_gl d_gate_fp8_t_routed;           // (I, macrobatch_size) swiglu bwd out + wgrad gate A
+    sc_gl d_gate_sc_t_routed;                 // (I / 128, macrobatch_size / 128, 32, 16)
+    mlp_bf16_gl d_up_shared;                  // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad up A
+    mlp_fp8_gl d_up_fp8_routed;               // (macrobatch_size, I) swiglu bwd out + dgrad gate/up A
+    sc_gl d_up_sc_routed;                     // (macrobatch_size / 128, I / 128, 32, 16)
+    mlp_fp8_gl d_up_fp8_t_routed;             // (I, macrobatch_size) swiglu bwd out + wgrad up A
+    sc_gl d_up_sc_t_routed;                   // (I / 128, macrobatch_size / 128, 32, 16)
+    epi_bf16_gl d_x_shared;                   // (num_local_tokens, H) dgrad gate/up out
+    epi_bf16_gl d_x_routed;                   // (macrobatch_size, H) dgrad gate/up out + reverse-dispatch in
 
     // Symmetric buffers
-    activation_bf16_pgl x_routed_send_buffer;  // (num_local_tokens, H)
-    activation_bf16_pgl d_combine_buffer;      // (num_local_tokens * topk, H)
-    activation_bf16_pgl d_x_routed_buffer;     // (num_local_tokens * topk, H)
+    activation_bf16_pgl x_routed_send_buffer; // (num_local_tokens, H)
+    activation_bf16_pgl d_combine_buffer;     // (num_local_tokens * topk, H)
+    activation_bf16_pgl d_x_routed_buffer;    // (num_local_tokens * topk, H)
 
     // Weights
-    weight_fp8_gl w_routed_gate;               // (num_local_experts, I, H) replay
-    sc_gl w_routed_gate_sc;                    // (num_local_experts * I / 128, H / 128, 32, 16)
-    weight_fp8_gl w_routed_up;                 // (num_local_experts, I, H) replay
-    sc_gl w_routed_up_sc;                      // (num_local_experts * I / 128, H / 128, 32, 16)
-    weight_bf16_gl w_shared_gate_T;            // (H, I)
-    weight_fp8_gl w_routed_gate_T;             // (num_local_experts, H, I)
-    sc_gl w_routed_gate_T_sc;                  // (num_local_experts * H / 128, I / 128, 32, 16)
-    weight_bf16_gl w_shared_up_T;              // (H, I)
-    weight_fp8_gl w_routed_up_T;               // (num_local_experts, H, I)
-    sc_gl w_routed_up_T_sc;                    // (num_local_experts * H / 128, I / 128, 32, 16)
-    weight_bf16_gl w_shared_down_T;            // (I, H)
-    weight_fp8_gl w_routed_down_T;             // (num_local_experts, I, H)
-    sc_gl w_routed_down_T_sc;                  // (num_local_experts * I / 128, H / 128, 32, 16)
+    weight_fp8_gl w_routed_gate;              // (num_local_experts, I, H) replay
+    sc_gl w_routed_gate_sc;                   // (num_local_experts * I / 128, H / 128, 32, 16)
+    weight_fp8_gl w_routed_up;                // (num_local_experts, I, H) replay
+    sc_gl w_routed_up_sc;                     // (num_local_experts * I / 128, H / 128, 32, 16)
+    weight_bf16_gl w_shared_gate_T;           // (H, I)
+    weight_fp8_gl w_routed_gate_T;            // (num_local_experts, H, I)
+    sc_gl w_routed_gate_T_sc;                 // (num_local_experts * H / 128, I / 128, 32, 16)
+    weight_bf16_gl w_shared_up_T;             // (H, I)
+    weight_fp8_gl w_routed_up_T;              // (num_local_experts, H, I)
+    sc_gl w_routed_up_T_sc;                   // (num_local_experts * H / 128, I / 128, 32, 16)
+    weight_bf16_gl w_shared_down_T;           // (I, H)
+    weight_fp8_gl w_routed_down_T;            // (num_local_experts, I, H)
+    sc_gl w_routed_down_T_sc;                 // (num_local_experts * I / 128, H / 128, 32, 16)
 
     // Weight gradients
-    weight_bf16_gl d_w_shared_gate;            // (I, H)
-    weight_bf16_gl d_w_routed_gate;            // (num_local_experts, I, H)
-    weight_bf16_gl d_w_shared_up;              // (I, H)
-    weight_bf16_gl d_w_routed_up;              // (num_local_experts, I, H)
-    weight_bf16_gl d_w_shared_down;            // (H, I)
-    weight_bf16_gl d_w_routed_down;            // (num_local_experts, H, I)
+    d_weight_bf16_gl d_w_shared_gate;          // (I, H)
+    d_weight_bf16_gl d_w_routed_gate;          // (num_local_experts, I, H)
+    d_weight_bf16_gl d_w_shared_up;            // (I, H)
+    d_weight_bf16_gl d_w_routed_up;            // (num_local_experts, I, H)
+    d_weight_bf16_gl d_w_shared_down;          // (H, I)
+    d_weight_bf16_gl d_w_routed_down;          // (num_local_experts, H, I)
 
     // Schedules
     index_gl schedule_peer_rank;               // (schedule_capacity,)
@@ -711,9 +716,9 @@ static __device__ __forceinline__ void barrier_arrive(const index_gl &counter, i
 
 static __device__ __forceinline__ void dispatch_quantize_kernel(
     const activation_bf16_pgl &peer_buf,
-    const activation_fp8_gl &x_fp8_gmem,
+    const mlp_fp8_gl &x_fp8_gmem,
     const sc_gl &x_sc_gmem,
-    const activation_fp8_gl &x_fp8_t_gmem,
+    const mlp_fp8_gl &x_fp8_t_gmem,
     const sc_gl &x_sc_t_gmem,
     const index_gl &schedule_peer_rank,
     const index_gl &schedule_peer_token_idx,
@@ -824,7 +829,7 @@ static __device__ __forceinline__ void dispatch_quantize_kernel(
 
 static __device__ __forceinline__ void combine_kernel(
     const activation_bf16_pgl &peer_buf,
-    const activation_bf16_gl &local_buf,
+    const epi_bf16_gl &local_buf,
     const index_gl &schedule_peer_rank,
     const index_gl &schedule_peer_token_idx,
     const index_gl &transfer_ready,
@@ -918,13 +923,13 @@ static __device__ __forceinline__ void combine_kernel(
 
 template <bool IS_SHARED>
 static __device__ __forceinline__ void swiglu_fwd(
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &gate_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &up_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &hidden_gmem,
+    const std::conditional_t<IS_SHARED, epi_bf16_gl, gate_up_fp8_gl> &gate_gmem,
+    const std::conditional_t<IS_SHARED, epi_bf16_gl, gate_up_fp8_gl> &up_gmem,
+    const std::conditional_t<IS_SHARED, mlp_bf16_gl, mlp_fp8_gl> &hidden_gmem,
     const sc_gl *gate_sc_gmem,                  // routed (MXFP8) only
     const sc_gl *up_sc_gmem,                    // routed (MXFP8) only
     const sc_gl *hidden_sc_gmem,                // routed (MXFP8) only
-    const activation_fp8_gl *hidden_fp8_t_gmem, // routed (MXFP8) only
+    const mlp_fp8_gl *hidden_fp8_t_gmem,         // routed (MXFP8) only
     const sc_gl *hidden_sc_t_gmem,              // routed (MXFP8) only
     const index_gl &gate_up_tile_ready,
     const index_gl &hidden_row_block_ready,
@@ -1125,18 +1130,18 @@ static __device__ __forceinline__ void swiglu_fwd(
 
 template <bool IS_SHARED>
 static __device__ __forceinline__ void swiglu_bwd(
-    const activation_bf16_gl &d_hidden_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &gate_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &up_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &d_gate_gmem,
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &d_up_gmem,
+    const epi_bf16_gl &d_hidden_gmem,
+    const std::conditional_t<IS_SHARED, swiglu_bf16_gl, gate_up_fp8_gl> &gate_gmem,
+    const std::conditional_t<IS_SHARED, swiglu_bf16_gl, gate_up_fp8_gl> &up_gmem,
+    const std::conditional_t<IS_SHARED, mlp_bf16_gl, mlp_fp8_gl> &d_gate_gmem,
+    const std::conditional_t<IS_SHARED, mlp_bf16_gl, mlp_fp8_gl> &d_up_gmem,
     const sc_gl *gate_sc_gmem,                  // routed (MXFP8) only
     const sc_gl *up_sc_gmem,                    // routed (MXFP8) only
     const sc_gl *d_gate_sc_gmem,                // routed (MXFP8) only
     const sc_gl *d_up_sc_gmem,                  // routed (MXFP8) only
-    const activation_fp8_gl *d_gate_fp8_t_gmem, // routed (MXFP8) only
+    const mlp_fp8_gl *d_gate_fp8_t_gmem,         // routed (MXFP8) only
     const sc_gl *d_gate_sc_t_gmem,              // routed (MXFP8) only
-    const activation_fp8_gl *d_up_fp8_t_gmem,   // routed (MXFP8) only
+    const mlp_fp8_gl *d_up_fp8_t_gmem,           // routed (MXFP8) only
     const sc_gl *d_up_sc_t_gmem,                // routed (MXFP8) only
     const index_gl &d_hidden_tile_ready,
     const index_gl *replayed_gate_up_tile_ready,
@@ -1393,17 +1398,17 @@ static __device__ __forceinline__ void swiglu_bwd(
 
 template <bool IS_SHARED, bool IS_WGRAD = false>
 static __device__ __forceinline__ void expert_grouped_gemm(
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> &a_gmem,
-    const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl>,
+    const std::conditional_t<IS_SHARED, mlp_bf16_gl, mlp_fp8_gl> &a_gmem,
+    const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, wgrad_bf16_gl, mlp_fp8_gl>,
                                        std::conditional_t<IS_SHARED, weight_bf16_gl, weight_fp8_gl>> &b_gmem,
     const sc_gl *a_sc_gmem,                 // routed (MXFP8) only
     const sc_gl *b_sc_gmem,                 // routed (MXFP8) only
-    const std::conditional_t<IS_SHARED, activation_bf16_gl, activation_fp8_gl> *a2_gmem, // accumulated second GEMM
+    const std::conditional_t<IS_SHARED, mlp_bf16_gl, mlp_fp8_gl> *a2_gmem, // accumulated second GEMM
     const std::conditional_t<IS_SHARED, weight_bf16_gl, weight_fp8_gl> *b2_gmem,
     const sc_gl *a2_sc_gmem,                // routed (MXFP8) only
     const sc_gl *b2_sc_gmem,                // routed (MXFP8) only
-    const std::conditional_t<IS_WGRAD, weight_bf16_gl, activation_bf16_gl> &d_gmem,
-    const activation_fp8_gl *d_fp8_gmem,    // routed gate/up only: fused-quantize epilogue
+    const std::conditional_t<IS_WGRAD, d_weight_bf16_gl, epi_bf16_gl> &d_gmem,
+    const gate_up_fp8_gl *d_fp8_gmem,       // routed gate/up only: fused-quantize epilogue
     const sc_gl *d_sc_gmem,                 // routed gate/up only: fused-quantize epilogue
     const index_gl &tokens_per_expert,
     const index_gl *input_minibatch_ready,  // comms -> GEMM
@@ -2078,24 +2083,24 @@ dispatch_mlp_swiglu_combine_fwd(
     at::Tensor y_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
 
     globals_fwd g {
-        .x_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(x),
-        .x_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(x_fp8_routed),
+        .x_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(x),
+        .x_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_routed),
         .x_sc_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_routed),
-        .x_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(x_fp8_t_routed),
+        .x_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_t_routed),
         .x_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_t_routed),
-        .gate_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(gate_shared),
-        .gate_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(gate_fp8_routed),
+        .gate_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(gate_shared),
+        .gate_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(gate_fp8_routed),
         .gate_sc_routed = kittens::py::tensor_to_gl<sc_gl>(gate_sc_routed),
-        .up_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(up_shared),
-        .up_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(up_fp8_routed),
+        .up_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(up_shared),
+        .up_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(up_fp8_routed),
         .up_sc_routed = kittens::py::tensor_to_gl<sc_gl>(up_sc_routed),
-        .hidden_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(hidden_shared),
-        .hidden_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(hidden_fp8_routed),
+        .hidden_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(hidden_shared),
+        .hidden_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_routed),
         .hidden_sc_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_routed),
-        .hidden_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(hidden_fp8_t_routed),
+        .hidden_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_t_routed),
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
-        .y_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(y_shared),
-        .y_routed = kittens::py::tensor_to_gl<activation_bf16_gl>(y_routed),
+        .y_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(y_shared),
+        .y_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(y_routed),
         .x_routed_send_buffer = activation_bf16_pgl{x_routed_send_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens), static_cast<size_t>(hidden_dim)},
         .y_routed_recv_buffer = activation_bf16_pgl{y_routed_recv_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens * topk), static_cast<size_t>(hidden_dim)},
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
@@ -2668,41 +2673,41 @@ dispatch_mlp_swiglu_combine_bwd(
     at::Tensor routed_buffers_done = at::zeros({num_macrobatches}, tokens_per_expert.options());
 
     globals_bwd g {
-        .x_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(x),
-        .x_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(x_fp8_routed),
+        .x_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(x),
+        .x_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_routed),
         .x_sc_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_routed),
-        .x_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(x_fp8_t_routed),
+        .x_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_t_routed),
         .x_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_t_routed),
-        .gate_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(gate_shared),
-        .gate_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(gate_fp8_routed),
+        .gate_shared = kittens::py::tensor_to_gl<swiglu_bf16_gl>(gate_shared),
+        .gate_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(gate_fp8_routed),
         .gate_sc_routed = kittens::py::tensor_to_gl<sc_gl>(gate_sc_routed),
-        .up_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(up_shared),
-        .up_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(up_fp8_routed),
+        .up_shared = kittens::py::tensor_to_gl<swiglu_bf16_gl>(up_shared),
+        .up_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(up_fp8_routed),
         .up_sc_routed = kittens::py::tensor_to_gl<sc_gl>(up_sc_routed),
-        .hidden_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(hidden_shared),
-        .hidden_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(hidden_fp8_routed),
+        .hidden_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(hidden_shared),
+        .hidden_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_routed),
         .hidden_sc_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_routed),
-        .hidden_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(hidden_fp8_t_routed),
+        .hidden_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_t_routed),
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
-        .d_y_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(d_y_shared),
-        .d_y_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_y_fp8_routed),
+        .d_y_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_y_shared),
+        .d_y_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_y_fp8_routed),
         .d_y_sc_routed = kittens::py::tensor_to_gl<sc_gl>(d_y_sc_routed),
-        .d_y_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_y_fp8_t_routed),
+        .d_y_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_y_fp8_t_routed),
         .d_y_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(d_y_sc_t_routed),
-        .d_hidden_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(d_hidden_shared),
-        .d_hidden_routed = kittens::py::tensor_to_gl<activation_bf16_gl>(d_hidden_routed),
-        .d_gate_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(d_gate_shared),
-        .d_gate_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_gate_fp8_routed),
+        .d_hidden_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(d_hidden_shared),
+        .d_hidden_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(d_hidden_routed),
+        .d_gate_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_gate_shared),
+        .d_gate_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_gate_fp8_routed),
         .d_gate_sc_routed = kittens::py::tensor_to_gl<sc_gl>(d_gate_sc_routed),
-        .d_gate_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_gate_fp8_t_routed),
+        .d_gate_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_gate_fp8_t_routed),
         .d_gate_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(d_gate_sc_t_routed),
-        .d_up_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(d_up_shared),
-        .d_up_fp8_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_up_fp8_routed),
+        .d_up_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_up_shared),
+        .d_up_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_up_fp8_routed),
         .d_up_sc_routed = kittens::py::tensor_to_gl<sc_gl>(d_up_sc_routed),
-        .d_up_fp8_t_routed = kittens::py::tensor_to_gl<activation_fp8_gl>(d_up_fp8_t_routed),
+        .d_up_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_up_fp8_t_routed),
         .d_up_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(d_up_sc_t_routed),
-        .d_x_shared = kittens::py::tensor_to_gl<activation_bf16_gl>(d_x_shared),
-        .d_x_routed = kittens::py::tensor_to_gl<activation_bf16_gl>(d_x_routed),
+        .d_x_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(d_x_shared),
+        .d_x_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(d_x_routed),
         .x_routed_send_buffer = activation_bf16_pgl{x_routed_send_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens), static_cast<size_t>(hidden_dim)},
         .d_combine_buffer = activation_bf16_pgl{d_combine_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens * topk), static_cast<size_t>(hidden_dim)},
         .d_x_routed_buffer = activation_bf16_pgl{d_x_routed_buffer_data, nullptr, nullptr, static_cast<size_t>(num_local_tokens * topk), static_cast<size_t>(hidden_dim)},
@@ -2719,12 +2724,12 @@ dispatch_mlp_swiglu_combine_bwd(
         .w_shared_down_T = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down_T),
         .w_routed_down_T = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_down_T),
         .w_routed_down_T_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_down_T_sc),
-        .d_w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_shared_gate),
-        .d_w_routed_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_routed_gate),
-        .d_w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_shared_up),
-        .d_w_routed_up = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_routed_up),
-        .d_w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_shared_down),
-        .d_w_routed_down = kittens::py::tensor_to_gl<weight_bf16_gl>(d_w_routed_down),
+        .d_w_shared_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_gate),
+        .d_w_routed_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_gate),
+        .d_w_shared_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_up),
+        .d_w_routed_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_up),
+        .d_w_shared_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_down),
+        .d_w_routed_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_down),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
