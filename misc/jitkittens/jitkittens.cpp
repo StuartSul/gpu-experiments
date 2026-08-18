@@ -288,6 +288,103 @@ CUtensorMap create_tma_descriptor(CUtensorMapDataType data_type, void *global_ad
     return descriptor;
 }
 
+constexpr std::size_t align_up(std::size_t value, std::size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+class KernelArgs {
+public:
+    explicit KernelArgs(std::vector<std::vector<CUtensorMap>> values) // CUtensormap used for 128B alignment
+        : arguments(std::move(values)), argument_pointers(arguments.size()) {
+        for (std::size_t i = 0; i < arguments.size(); ++i)
+            argument_pointers[i] = arguments[i].data();
+    }
+
+    KernelArgs(const KernelArgs &) = delete;
+    KernelArgs &operator=(const KernelArgs &) = delete;
+    KernelArgs(KernelArgs &&) = default;
+    KernelArgs &operator=(KernelArgs &&) = default;
+
+    std::uintptr_t data_ptr() const {
+        return reinterpret_cast<std::uintptr_t>(argument_pointers.data());
+    }
+
+    std::size_t size() const {
+        return argument_pointers.size();
+    }
+
+private:
+    std::vector<std::vector<CUtensorMap>> arguments;
+    std::vector<void *> argument_pointers;
+};
+
+std::vector<CUtensorMap> create_gl_argument(CUtensorMapDataType data_type, std::uintptr_t global_address,
+                                            const std::vector<cuuint64_t> &runtime_shape,
+                                            const std::vector<int> &compile_shape,
+                                            const std::vector<std::vector<cuuint32_t>> &tma_shapes,
+                                            const std::vector<cuuint32_t> &swizzle_bytes,
+                                            const std::vector<int> &swizzle_axes) {
+    if (runtime_shape.size() != 4 || compile_shape.size() != 4)
+        throw std::invalid_argument("GL runtime and compile shapes must contain four values");
+    if (tma_shapes.size() != swizzle_bytes.size() || tma_shapes.size() != swizzle_axes.size())
+        throw std::invalid_argument("GL TMA descriptor fields must have equal lengths");
+
+    std::array<std::size_t, 4> dimension_offsets{};
+    std::size_t field_offset = sizeof(std::uintptr_t); // to store the global addr
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (compile_shape[i] == -1) {
+            field_offset = align_up(field_offset, alignof(std::size_t));
+            dimension_offsets[i] = field_offset;
+            field_offset += sizeof(std::size_t);
+        } else {
+            if (compile_shape[i] <= 0 || static_cast<cuuint64_t>(compile_shape[i]) != runtime_shape[i])
+                throw std::invalid_argument("Compile-time GL dimension does not match runtime shape");
+            field_offset += 1;
+        }
+    }
+
+    const std::size_t descriptor_count = tma_shapes.size();
+    const std::size_t descriptor_base = descriptor_count == 0 ? 0 : align_up(field_offset, alignof(CUtensorMap));
+    const std::size_t argument_size = descriptor_count == 0 ? align_up(field_offset + 1, alignof(std::uintptr_t))
+                                                            : descriptor_base + (descriptor_count + 1) * sizeof(CUtensorMap);
+
+    std::vector<CUtensorMap> argument((argument_size + sizeof(CUtensorMap) - 1) / sizeof(CUtensorMap));
+    std::byte *packed = reinterpret_cast<std::byte *>(argument.data());
+    std::memcpy(packed, &global_address, sizeof(global_address));
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (compile_shape[i] == -1)
+            std::memcpy(packed + dimension_offsets[i], &runtime_shape[i], sizeof(runtime_shape[i]));
+    }
+
+    for (std::size_t i = 0; i < descriptor_count; ++i) {
+        CUtensorMap descriptor = create_tma_descriptor(data_type, reinterpret_cast<void *>(global_address),
+                                                       runtime_shape, tma_shapes[i], swizzle_bytes[i], swizzle_axes[i]);
+        std::memcpy(packed + descriptor_base + i * sizeof(CUtensorMap), &descriptor, sizeof(descriptor));
+    }
+    return argument;
+}
+
+KernelArgs create_gl_arguments(const std::vector<CUtensorMapDataType> &data_types,
+                               const std::vector<std::uintptr_t> &global_addresses,
+                               const std::vector<std::vector<cuuint64_t>> &runtime_shapes,
+                               const std::vector<std::vector<int>> &compile_shapes,
+                               const std::vector<std::vector<std::vector<cuuint32_t>>> &tma_shapes,
+                               const std::vector<std::vector<cuuint32_t>> &swizzle_bytes,
+                               const std::vector<std::vector<int>> &swizzle_axes) {
+    const std::size_t count = global_addresses.size();
+    if (count == 0 || data_types.size() != count || runtime_shapes.size() != count ||
+        compile_shapes.size() != count || tma_shapes.size() != count ||
+        swizzle_bytes.size() != count || swizzle_axes.size() != count)
+        throw std::invalid_argument("GL argument fields must have equal nonzero lengths");
+
+    std::vector<std::vector<CUtensorMap>> arguments;
+    arguments.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+        arguments.push_back(create_gl_argument(data_types[i], global_addresses[i], runtime_shapes[i],
+                                               compile_shapes[i], tma_shapes[i], swizzle_bytes[i], swizzle_axes[i]));
+    return KernelArgs(std::move(arguments));
+}
+
 CUlaunchConfig create_launch_config(dim3 grid, dim3 block, unsigned int dynamic_smem_bytes, CUstream stream,
                                     std::vector<CUlaunchAttribute> &attributes,
                                     std::optional<dim3> cluster = std::nullopt, bool pdl = false) {
