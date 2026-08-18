@@ -2,8 +2,10 @@
 #include <nvrtc.h>
 #include <vector_types.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -156,6 +158,131 @@ void unload_cubin_module(CUmodule module) {
 
 void set_kernel_dynamic_smem(CUfunction function, int dynamic_smem_bytes) {
     CHECK_CUDA(cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_smem_bytes));
+}
+
+CUtensorMap create_tma_descriptor(CUtensorMapDataType data_type, void *global_address,
+                                  const std::vector<cuuint64_t> &gmem_shape, const std::vector<cuuint32_t> &smem_shape, 
+                                  cuuint32_t swizzle_bytes, int swizzle_axis) {
+    if (global_address == nullptr || (reinterpret_cast<std::uintptr_t>(global_address) & 0xf) != 0)
+        throw std::invalid_argument("TMA global address must be 16-byte aligned");
+    if (gmem_shape.size() != 4 || (smem_shape.size() != 1 && smem_shape.size() != 2))
+        throw std::invalid_argument("TMA shapes must be 4D global and 1D or 2D shared");
+    for (cuuint64_t dimension : gmem_shape)
+        if (dimension == 0) throw std::invalid_argument("TMA global dimensions must be nonzero");
+    for (cuuint32_t dimension : smem_shape)
+        if (dimension == 0) throw std::invalid_argument("TMA shared dimensions must be nonzero");
+
+    cuuint32_t dtype_bytes = 0;
+    switch (data_type) {
+        case CU_TENSOR_MAP_DATA_TYPE_UINT8:
+            dtype_bytes = 1;
+            break;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT16:
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT16:
+        case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16:
+            dtype_bytes = 2;
+            break;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT32:
+        case CU_TENSOR_MAP_DATA_TYPE_INT32:
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32:
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ:
+        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32:
+        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ:
+            dtype_bytes = 4;
+            break;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT64:
+        case CU_TENSOR_MAP_DATA_TYPE_INT64:
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT64:
+            dtype_bytes = 8;
+            break;
+        default:
+            throw std::invalid_argument("Packed TMA data types are unsupported; use their packed storage type");
+    }
+
+    CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
+    switch (swizzle_bytes) {
+    case 0:
+        break;
+    case 32:
+        swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
+        break;
+    case 64:
+        swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+        break;
+    case 128:
+        swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+        break;
+    default:
+        throw std::invalid_argument("TMA swizzle must be 0, 32, 64, or 128 bytes");
+    }
+
+    std::array<cuuint64_t, 5> encoded_gmem_shape{};
+    std::array<cuuint64_t, 4> encoded_gmem_strides{};
+    std::array<cuuint32_t, 5> encoded_smem_shape{1, 1, 1, 1, 1};
+    std::array<cuuint32_t, 5> encoded_smem_strides{1, 1, 1, 1, 1};
+    cuuint32_t rank = 0;
+
+    if (smem_shape.size() == 1) {
+        if (swizzle_bytes != 0 || swizzle_axis != -1)
+            throw std::invalid_argument("Vector TMA requires no swizzle and axis -1");
+        const cuuint32_t length = smem_shape[0];
+        if (length % 16 != 0 || (length > 256 && (static_cast<cuuint64_t>(length) * dtype_bytes) % 128 != 0))
+            throw std::invalid_argument("Invalid vector length for TMA");
+        cuuint32_t inner_length = 16;
+        for (int divider = 16; divider >= 2; --divider) {
+            const cuuint32_t candidate = 16 * divider;
+            if (length % candidate == 0 && (length < 256 || (static_cast<cuuint64_t>(candidate) * dtype_bytes) % 128 == 0)) {
+                inner_length = candidate;
+                break;
+            }
+        }
+        rank = 4;
+        encoded_gmem_shape = {gmem_shape[3], gmem_shape[2], gmem_shape[1], gmem_shape[0], 0};
+        encoded_gmem_strides = {gmem_shape[3] * dtype_bytes, gmem_shape[2] * gmem_shape[3] * dtype_bytes,
+                                gmem_shape[1] * gmem_shape[2] * gmem_shape[3] * dtype_bytes, 0};
+        encoded_smem_shape = {inner_length, 1, 1, 1, 1};
+    } else if (swizzle_bytes == 0) {
+        if (swizzle_axis != 2) throw std::invalid_argument("Non-swizzled tile TMA requires axis 2");
+        rank = 4;
+        encoded_gmem_shape = {gmem_shape[3], gmem_shape[2], gmem_shape[1], gmem_shape[0], 0};
+        encoded_gmem_strides = {gmem_shape[3] * dtype_bytes, gmem_shape[2] * gmem_shape[3] * dtype_bytes,
+                                gmem_shape[1] * gmem_shape[2] * gmem_shape[3] * dtype_bytes, 0};
+        encoded_smem_shape = {smem_shape[1], smem_shape[0], 1, 1, 1};
+    } else {
+        if (swizzle_axis < 0 || swizzle_axis > 2 || swizzle_bytes % dtype_bytes != 0)
+            throw std::invalid_argument("Invalid tile TMA swizzle");
+        const cuuint32_t swizzle_elements = swizzle_bytes / dtype_bytes;
+        if (smem_shape[1] % swizzle_elements != 0)
+            throw std::invalid_argument("Shared tile width must be divisible by the swizzle width");
+        rank = 5;
+        if (swizzle_axis == 2) {
+            encoded_gmem_shape = {swizzle_elements, gmem_shape[2], (gmem_shape[3] + swizzle_elements - 1) / swizzle_elements, gmem_shape[1], gmem_shape[0]};
+            encoded_gmem_strides = {gmem_shape[3] * dtype_bytes, swizzle_bytes, gmem_shape[2] * gmem_shape[3] * dtype_bytes,
+                                    gmem_shape[1] * gmem_shape[2] * gmem_shape[3] * dtype_bytes};
+        } else if (swizzle_axis == 1) {
+            encoded_gmem_shape = {swizzle_elements, gmem_shape[1], (gmem_shape[3] + swizzle_elements - 1) / swizzle_elements, gmem_shape[2], gmem_shape[0]};
+            encoded_gmem_strides = {gmem_shape[2] * gmem_shape[3] * dtype_bytes, swizzle_bytes, gmem_shape[3] * dtype_bytes,
+                                    gmem_shape[1] * gmem_shape[2] * gmem_shape[3] * dtype_bytes};
+        } else {
+            encoded_gmem_shape = {swizzle_elements, gmem_shape[0], (gmem_shape[3] + swizzle_elements - 1) / swizzle_elements, gmem_shape[2], gmem_shape[1]};
+            encoded_gmem_strides = {gmem_shape[1] * gmem_shape[2] * gmem_shape[3] * dtype_bytes, swizzle_bytes,
+                                    gmem_shape[3] * dtype_bytes, gmem_shape[2] * gmem_shape[3] * dtype_bytes};
+        }
+        encoded_smem_shape = {swizzle_elements, smem_shape[0], smem_shape[1] / swizzle_elements, 1, 1};
+    }
+
+    for (cuuint32_t i = 0; i + 1 < rank; ++i)
+        if (encoded_gmem_strides[i] % 16 != 0) throw std::invalid_argument("TMA global strides must be 16-byte aligned");
+    for (cuuint32_t i = 0; i < rank; ++i)
+        if (encoded_smem_shape[i] == 0 || encoded_smem_shape[i] > 256) throw std::invalid_argument("TMA shared dimensions must be between 1 and 256");
+    if ((static_cast<cuuint64_t>(encoded_smem_shape[0]) * dtype_bytes) % 16 != 0)
+        throw std::invalid_argument("TMA innermost shared dimension must span a multiple of 16 bytes");
+
+    CUtensorMap descriptor{};
+    CHECK_CUDA(cuTensorMapEncodeTiled(&descriptor, data_type, rank, global_address, encoded_gmem_shape.data(), encoded_gmem_strides.data(), 
+                                      encoded_smem_shape.data(), encoded_smem_strides.data(), 
+                                      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return descriptor;
 }
 
 CUlaunchConfig create_launch_config(dim3 grid, dim3 block, unsigned int dynamic_smem_bytes, CUstream stream,
