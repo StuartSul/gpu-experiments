@@ -22,6 +22,7 @@ NvrtcResult compile_source_to_cubin(const std::string &source,
                                                const std::vector<std::string> &kernel_symbols, 
                                                int major, int minor,
                                                const std::vector<std::string> &include_directories,
+                                               const std::vector<std::string> &additional_nvrtc_options,
                                                bool verbose = true) {
     // 1. Create the NVRTC program.
     nvrtcProgram nvrtc_program = nullptr;
@@ -33,9 +34,9 @@ NvrtcResult compile_source_to_cubin(const std::string &source,
 
     // 3. Prepare compiler flags and compile.
     std::vector<std::string> options = {"-DNDEBUG", "-lineinfo", "--std=c++20", "--use_fast_math", 
-                                        "-Xptxas=--verbose", "-Xptxas=--warn-on-spills", "-DKITTENS_NO_HOST"};
+                                        "-Xptxas=--verbose", "-Xptxas=--warn-on-spills"};
     for (const std::string &include_directory : include_directories) options.push_back("-I" + include_directory);
-    options.emplace_back("-DKITTENS_SM" + std::to_string(major) + std::to_string(minor));
+    options.insert(options.end(), additional_nvrtc_options.begin(), additional_nvrtc_options.end());
     options.push_back("--gpu-architecture=sm_" + std::to_string(major) + std::to_string(minor) + (major >= 9 ? "a" : ""));
 
     std::vector<const char *> option_pointers;
@@ -76,5 +77,3 @@ NvrtcResult compile_source_to_cubin(const std::string &source,
 
     return result;
 }
-
-#undef CHECK_NVRTC
