@@ -1,10 +1,15 @@
 #include <cuda.h>
 #include <nvrtc.h>
+#include <vector_types.h>
 
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #define CHECK_NVRTC(call)                                                \
