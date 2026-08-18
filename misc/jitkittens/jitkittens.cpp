@@ -1,3 +1,4 @@
+#include <cuda.h>
 #include <nvrtc.h>
 
 #include <cstddef>
@@ -11,6 +12,16 @@
         const nvrtcResult nvrtc_result = (call);                         \
         if (nvrtc_result != NVRTC_SUCCESS)                               \
             throw std::runtime_error(nvrtcGetErrorString(nvrtc_result)); \
+    } while (0)
+
+#define CHECK_CUDA(call)                                                      \
+    do {                                                                      \
+        const CUresult cuda_result = (call);                                  \
+        if (cuda_result != CUDA_SUCCESS) {                                    \
+            const char *cuda_error = nullptr;                                 \
+            cuGetErrorString(cuda_result, &cuda_error);                       \
+            throw std::runtime_error(cuda_error ? cuda_error : "CUDA error"); \
+        }                                                                     \
     } while (0)
 
 struct NvrtcResult {
@@ -76,4 +87,118 @@ NvrtcResult compile_source_to_cubin(const std::string &source,
     CHECK_NVRTC(nvrtcDestroyProgram(&nvrtc_program));
 
     return result;
+}
+
+std::vector<std::string> cuda_include_dirs() {
+    const auto check_cuda_root = [](const std::filesystem::path &root) -> std::optional<std::filesystem::path> {
+        const std::filesystem::path include = root / "include";
+        if (std::filesystem::exists(include / "cuda_bf16.h")) return include;
+        else return std::nullopt;
+    };
+
+    std::optional<std::filesystem::path> cuda_include;
+    for (const char *env_var : {"CUDA_HOME", "CUDA_PATH"}) {
+        const char *value = std::getenv(env_var);
+        if (value != nullptr && *value != '\0') {
+            cuda_include = check_cuda_root(value);
+            if (cuda_include) break;
+        }
+    }
+    for (const char *env_var : {"PATH", "LD_LIBRARY_PATH"}) {
+        if (cuda_include) break;
+        const char *value = std::getenv(env_var);
+        std::string_view remaining = value == nullptr ? std::string_view{} : std::string_view{value};
+        while (!remaining.empty()) {
+            const std::size_t separator = remaining.find(':');
+            const std::string_view entry = remaining.substr(0, separator);
+            if (!entry.empty()) {
+                cuda_include = check_cuda_root(std::filesystem::path(entry).parent_path());
+                if (cuda_include) break;
+            }
+            if (separator == std::string_view::npos) break;
+            remaining.remove_prefix(separator + 1);
+        }
+    }
+    for (const std::filesystem::path &root : {std::filesystem::path("/usr/local/cuda"), std::filesystem::path("/usr/cuda")}) {
+        if (cuda_include) break;
+        cuda_include = check_cuda_root(root);
+    }
+    if (!cuda_include)
+        throw std::runtime_error("Cannot find CUDA include directory.");
+
+    const std::filesystem::path cccl = *cuda_include / "cccl";
+    if (std::filesystem::exists(cccl)) // CUDA 13
+        return {cuda_include->string(), cccl.string(), (cccl / "cuda" / "std").string()};
+    else // CUDA 12
+        return {cuda_include->string(), (*cuda_include / "cuda" / "std").string()};
+}
+
+CUmodule load_cubin_module(const std::vector<char> &cubin) {
+    CUmodule module = nullptr;
+    CHECK_CUDA(cuModuleLoadData(&module, cubin.data()));
+    return module;
+}
+
+CUfunction get_kernel_from_cubin_module(CUmodule module, const std::string &kernel_name) {
+    CUfunction function = nullptr;
+    CHECK_CUDA(cuModuleGetFunction(&function, module, kernel_name.c_str()));
+    return function;
+}
+
+void unload_cubin_module(CUmodule module) {
+    CHECK_CUDA(cuModuleUnload(module));
+}
+
+void set_kernel_dynamic_smem(CUfunction function, int dynamic_smem_bytes) {
+    CHECK_CUDA(cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_smem_bytes));
+}
+
+CUlaunchConfig create_launch_config(dim3 grid, dim3 block, unsigned int dynamic_smem_bytes, CUstream stream,
+                                    std::vector<CUlaunchAttribute> &attributes,
+                                    std::optional<dim3> cluster = std::nullopt, bool pdl = false) {
+    CUlaunchConfig config{
+        .gridDimX = grid.x,
+        .gridDimY = grid.y,
+        .gridDimZ = grid.z,
+        .blockDimX = block.x,
+        .blockDimY = block.y,
+        .blockDimZ = block.z,
+        .sharedMemBytes = dynamic_smem_bytes,
+        .hStream = stream,
+        .attrs = nullptr,
+        .numAttrs = 0,
+    };
+    attributes.clear();
+    attributes.reserve(3);
+
+    if (cluster) {
+        CUlaunchAttribute preferred_cluster{};
+        preferred_cluster.id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
+        preferred_cluster.value.preferredClusterDim.x = cluster->x;
+        preferred_cluster.value.preferredClusterDim.y = cluster->y;
+        preferred_cluster.value.preferredClusterDim.z = cluster->z;
+        attributes.push_back(preferred_cluster);
+
+        CUlaunchAttribute required_cluster{};
+        required_cluster.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        required_cluster.value.clusterDim.x = cluster->x;
+        required_cluster.value.clusterDim.y = cluster->y;
+        required_cluster.value.clusterDim.z = cluster->z;
+        attributes.push_back(required_cluster);
+    }
+
+    if (pdl) {
+        CUlaunchAttribute pdl_attribute{};
+        pdl_attribute.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        pdl_attribute.value.programmaticStreamSerializationAllowed = 1;
+        attributes.push_back(pdl_attribute);
+    }
+
+    config.attrs = attributes.empty() ? nullptr : attributes.data();
+    config.numAttrs = static_cast<unsigned int>(attributes.size());
+    return config;
+}
+
+void launch_kernel(const CUlaunchConfig &config, const CUfunction function, void **args) {
+    CHECK_CUDA(cuLaunchKernelEx(&config, function, args, nullptr));
 }
