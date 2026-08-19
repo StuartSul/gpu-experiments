@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -435,4 +436,104 @@ CUlaunchConfig create_launch_config(dim3 grid, dim3 block, unsigned int dynamic_
 
 void launch_kernel(const CUlaunchConfig &config, const CUfunction function, void **args) {
     CHECK_CUDA(cuLaunchKernelEx(&config, function, args, nullptr));
+}
+
+dim3 as_dim3(const std::vector<unsigned int> &dimensions, const char *name) {
+    if (dimensions.empty() || dimensions.size() > 3)
+        throw std::invalid_argument(std::string(name) + " must contain one to three dimensions");
+    return dim3(dimensions[0], dimensions.size() > 1 ? dimensions[1] : 1, dimensions.size() > 2 ? dimensions[2] : 1);
+}
+
+class PyLaunchConfig {
+public:
+    PyLaunchConfig(dim3 grid, dim3 block, unsigned int dynamic_smem_bytes, CUstream stream, std::optional<dim3> cluster, bool pdl)
+        : config(create_launch_config(grid, block, dynamic_smem_bytes, stream, attributes, cluster, pdl)) {}
+
+    const CUlaunchConfig &get() const { return config; }
+
+private:
+    std::vector<CUlaunchAttribute> attributes;
+    CUlaunchConfig config;
+};
+
+PYBIND11_MODULE(_C, m) {
+    pybind11::enum_<CUtensorMapDataType>(m, "TensorMapDataType")
+        .value("UINT8", CU_TENSOR_MAP_DATA_TYPE_UINT8)
+        .value("UINT16", CU_TENSOR_MAP_DATA_TYPE_UINT16)
+        .value("UINT32", CU_TENSOR_MAP_DATA_TYPE_UINT32)
+        .value("INT32", CU_TENSOR_MAP_DATA_TYPE_INT32)
+        .value("UINT64", CU_TENSOR_MAP_DATA_TYPE_UINT64)
+        .value("INT64", CU_TENSOR_MAP_DATA_TYPE_INT64)
+        .value("FLOAT16", CU_TENSOR_MAP_DATA_TYPE_FLOAT16)
+        .value("FLOAT32", CU_TENSOR_MAP_DATA_TYPE_FLOAT32)
+        .value("FLOAT64", CU_TENSOR_MAP_DATA_TYPE_FLOAT64)
+        .value("BFLOAT16", CU_TENSOR_MAP_DATA_TYPE_BFLOAT16)
+        .value("FLOAT32_FTZ", CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ)
+        .value("TFLOAT32", CU_TENSOR_MAP_DATA_TYPE_TFLOAT32)
+        .value("TFLOAT32_FTZ", CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ);
+    pybind11::class_<CUtensorMap>(m, "TMADesc")
+        .def_property_readonly("data_ptr", [](CUtensorMap &descriptor) {
+            return reinterpret_cast<std::uintptr_t>(&descriptor);
+        })
+        .def("__bytes__", [](const CUtensorMap &descriptor) {
+            return pybind11::bytes(reinterpret_cast<const char *>(&descriptor), sizeof(descriptor));
+        });
+    pybind11::class_<KernelArgs>(m, "KernelArgs")
+        .def_property_readonly("data_ptr", &KernelArgs::data_ptr)
+        .def("__len__", &KernelArgs::size);
+    pybind11::class_<PyLaunchConfig>(m, "LaunchConfig");
+    m.def("create_gl_arguments", &create_gl_arguments,
+          pybind11::arg("data_types"), pybind11::arg("global_addresses"), pybind11::arg("runtime_shapes"),
+          pybind11::arg("compile_shapes"), pybind11::arg("tma_shapes"), pybind11::arg("swizzle_bytes"),
+          pybind11::arg("swizzle_axes"));
+    m.def("compile_source_to_cubin", [](const std::string &source, const std::vector<std::string> &kernel_symbols,
+                                        int major, int minor,
+                                        const std::vector<std::string> &include_directories,
+                                        const std::vector<std::string> &additional_nvrtc_options, bool verbose) {
+            NvrtcResult result = compile_source_to_cubin(source, kernel_symbols, major, minor, include_directories, additional_nvrtc_options, verbose);
+            return pybind11::make_tuple(pybind11::bytes(result.cubin.data(), result.cubin.size()), result.mangled_names);
+        },
+        pybind11::arg("source"), pybind11::arg("kernel_symbols"), pybind11::arg("major"), pybind11::arg("minor"),
+        pybind11::arg("include_directories") = std::vector<std::string>{},
+        pybind11::arg("additional_nvrtc_options") = std::vector<std::string>{}, pybind11::arg("verbose") = true);
+    m.def("cuda_include_dirs", &cuda_include_dirs);
+    m.def("load_cubin_module", [](pybind11::bytes cubin) {
+        const std::string cubin_data = cubin;
+        const std::vector<char> cubin_bytes(cubin_data.begin(), cubin_data.end());
+        return reinterpret_cast<std::uintptr_t>(load_cubin_module(cubin_bytes));
+    });
+    m.def("get_kernel_from_cubin_module", [](std::uintptr_t module, const std::string &kernel_name) {
+        return reinterpret_cast<std::uintptr_t>(get_kernel_from_cubin_module(reinterpret_cast<CUmodule>(module), kernel_name));
+    });
+    m.def("unload_cubin_module", [](std::uintptr_t module) {
+        unload_cubin_module(reinterpret_cast<CUmodule>(module));
+    });
+    m.def("set_kernel_dynamic_smem", [](std::uintptr_t function, int dynamic_smem_bytes) {
+        set_kernel_dynamic_smem(reinterpret_cast<CUfunction>(function), dynamic_smem_bytes);
+    });
+    m.def(
+        "create_tma_descriptor",
+        [](CUtensorMapDataType data_type, std::uintptr_t global_address, 
+           const std::vector<cuuint64_t> &gmem_shape, const std::vector<cuuint32_t> &smem_shape,
+           cuuint32_t swizzle_bytes, int swizzle_axis) {
+            return create_tma_descriptor(data_type, reinterpret_cast<void *>(global_address), gmem_shape, smem_shape, swizzle_bytes, swizzle_axis);
+        },
+        pybind11::arg("data_type"), pybind11::arg("global_address"), pybind11::arg("gmem_shape"),
+        pybind11::arg("smem_shape"), pybind11::arg("swizzle_bytes"), pybind11::arg("swizzle_axis"));
+
+    m.def("create_launch_config",[](const std::vector<unsigned int> &grid, const std::vector<unsigned int> &block,
+                                    unsigned int dynamic_smem_bytes, std::uintptr_t stream,
+                                    const std::optional<std::vector<unsigned int>> &cluster, bool pdl) {
+              std::optional<dim3> cluster_dim;
+              if (cluster) cluster_dim = as_dim3(*cluster, "cluster");
+              return std::make_unique<PyLaunchConfig>(as_dim3(grid, "grid"), as_dim3(block, "block"), dynamic_smem_bytes,
+                                                      reinterpret_cast<CUstream>(stream), cluster_dim, pdl);
+          },
+          pybind11::arg("grid"), pybind11::arg("block"), pybind11::arg("dynamic_smem_bytes") = 0,
+          pybind11::arg("stream") = 0, pybind11::arg("cluster") = pybind11::none(),
+          pybind11::arg("pdl") = false);
+    m.def("launch_kernel", [](const PyLaunchConfig &config, std::uintptr_t function, std::uintptr_t args) {
+              launch_kernel(config.get(), reinterpret_cast<CUfunction>(function), reinterpret_cast<void **>(args));
+          },
+          pybind11::arg("config"), pybind11::arg("function"), pybind11::arg("args"));
 }
