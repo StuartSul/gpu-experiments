@@ -45,9 +45,7 @@ def main():
         dynamic_smem_bytes = 222208
         jitkittens.set_kernel_dynamic_smem(function, dynamic_smem_bytes)
         stream = torch.cuda.current_stream(device)
-        jitkittens.launch_kernel(
-            function,
-            args.data_ptr,
+        config = jitkittens.create_launch_config(
             [128],
             [256],
             dynamic_smem_bytes,
@@ -55,6 +53,7 @@ def main():
             [2],
             True,
         )
+        jitkittens.launch_kernel(config, function, args.data_ptr)
         torch.cuda.synchronize(device)
         torch.testing.assert_close(d, a @ b.T)
         print("GEMM passed")
