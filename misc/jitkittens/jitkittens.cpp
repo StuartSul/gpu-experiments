@@ -9,12 +9,14 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #define CHECK_NVRTC(call)                                                \
